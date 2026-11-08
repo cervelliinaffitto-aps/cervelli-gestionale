@@ -1,0 +1,16 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "cervelli-gestionale",
+  "main": "src/index.js",
+  "compatibility_date": "2024-11-01",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "cervelli-gestionale-db",
+      "database_id": "49774aa7-12a0-41e3-a493-01d2771b0db9"
+    }
+  ]
+}
