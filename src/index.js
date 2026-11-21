@@ -101,6 +101,7 @@ async function getCorsiAttivi(env) {
    ========================================================================= */
 async function handleIscrizionePost(request, env, ctx) {
   try {
+        const url = new URL(request.url);
     const formData = await request.formData();
 
     // Protezione Anti-Spam Honeypot
