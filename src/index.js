@@ -1,6 +1,6 @@
 /**
  * Cervelli in Affitto APS - Piattaforma Gestionale
- * Modulo Ufficiale Iscrizione Corsi Minori & Ammissione Socio
+ * Modulo Ufficiale Iscrizione Corsi Minori & Ammissione Socio (Wizard Multi-Step)
  * Affiliato UILT - Unione Italiana Libero Teatro
  */
 
@@ -27,12 +27,12 @@ export default {
       }
     }
 
-    // Assicura l'esistenza del corso predefinito in D1 se la tabella e vuota
+    // Assicura l'esistenza del corso predefinito in D1
     await seedDefaultCourseIfNeeded(env);
 
     // 2. Ricezione dati del modulo (POST)
     if (request.method === "POST" && (url.pathname === "/iscrizione-minori" || url.pathname === "/")) {
-      return handleIscrizionePost(request, env);
+      return handleIscrizionePost(request, env, ctx);
     }
 
     // 3. Pagina di conferma avvenuta iscrizione
@@ -42,7 +42,7 @@ export default {
       return renderSuccessPage(nomeMinore, email);
     }
 
-    // 4. Pagina principale del Modulo Iscrizione (GET)
+    // 4. Pagina principale del Modulo Iscrizione (GET - Wizard a passaggi)
     const corsi = await getCorsiAttivi(env);
     return renderFormPage(corsi);
   }
@@ -99,18 +99,18 @@ async function getCorsiAttivi(env) {
 /* =========================================================================
    ELABORAZIONE DATI INVIATI (POST)
    ========================================================================= */
-async function handleIscrizionePost(request, env) {
+async function handleIscrizionePost(request, env, ctx) {
   try {
     const formData = await request.formData();
 
-    // Protezione Anti-Spam Honeypot (campo invisibile che solo i bot compilano)
+    // Protezione Anti-Spam Honeypot
     const honey = formData.get("codice_sicurezza_robot") || formData.get("website") || "";
     if (honey.trim() !== "") {
       console.warn("Spam intercettato via honeypot:", honey);
       return new Response("Invio non valido.", { status: 400 });
     }
 
-    // Dati Genitore / Tutore (richiedente ammissione socio)
+    // Dati Genitore / Tutore
     const gNome = (formData.get("genitore_nome") || "").trim();
     const gCognome = (formData.get("genitore_cognome") || "").trim();
     const gCF = (formData.get("genitore_cf") || "").trim().toUpperCase();
@@ -135,7 +135,7 @@ async function handleIscrizionePost(request, env) {
     // Corso
     const corsoId = formData.get("corso_id") || "corso-teatro-ragazzi-2024-25";
 
-    // Validazione campi obbligatori minimi
+    // Validazione campi obbligatori
     if (!gNome || !gCognome || !gCF || !gEmail || !gTelefono || !mNome || !mCognome || !mCF || !mDataNascita) {
       return new Response(
         renderErrorPage("Dati incompleti: assicurati di compilare tutti i campi contrassegnati con l'asterisco (*) per genitore e allievo."),
@@ -162,7 +162,7 @@ async function handleIscrizionePost(request, env) {
     const socioMinoreId = "soc-m-" + crypto.randomUUID().slice(0, 12);
     const iscrizioneId = "isc-" + crypto.randomUUID().slice(0, 12);
 
-    // Esecuzione inserimenti nel database D1
+    // Esecuzione inserimenti su database D1
     const statements = [
       // 1. Inserimento Tutore
       env.DB.prepare(`
@@ -170,7 +170,7 @@ async function handleIscrizionePost(request, env) {
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).bind(tutoreId, gNome, gCognome, gCF, gTelefono, gEmail, gParentela, gIndirizzo, gCitta, gCap, gProv),
 
-      // 2. Inserimento Domanda Socio Genitore (Ordinario, in attesa di delibera)
+      // 2. Inserimento Socio Genitore (Ordinario, in attesa di delibera)
       env.DB.prepare(`
         INSERT INTO soci (id, is_minore, tutore_id, nome, cognome, codice_fiscale, data_nascita, luogo_nascita, residenza_indirizzo, residenza_citta, residenza_cap, residenza_provincia, telefono, email, tipologia_socio, stato_richiesta)
         VALUES (?, 0, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ordinario', 'in_attesa')
@@ -181,7 +181,7 @@ async function handleIscrizionePost(request, env) {
           updated_at = datetime('now')
       `).bind(socioGenitoreId, gNome, gCognome, gCF, gDataNascita || "Non indicata", gLuogoNascita || "Non indicato", gIndirizzo, gCitta, gCap, gProv, gTelefono, gEmail),
 
-      // 3. Inserimento Domanda Socio Minore (Ordinario minore, collegato a tutore)
+      // 3. Inserimento Socio Minore (Ordinario minore, collegato al tutore)
       env.DB.prepare(`
         INSERT INTO soci (id, is_minore, tutore_id, nome, cognome, codice_fiscale, data_nascita, luogo_nascita, residenza_indirizzo, residenza_citta, residenza_cap, residenza_provincia, telefono, email, tipologia_socio, stato_richiesta)
         VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ordinario', 'in_attesa')
@@ -203,7 +203,7 @@ async function handleIscrizionePost(request, env) {
       `).bind("cons-" + crypto.randomUUID().slice(0, 12), socioMinoreId, tutoreId, consStatuto, consPrivacy, consFoto, consNews, clientIP)
     ];
 
-    // 6. Inserimento Deleghe al Ritiro (se presenti)
+    // 6. Inserimento Deleghe al Ritiro
     const delegheNomi = formData.getAll("delega_nome[]");
     const delegheCognomi = formData.getAll("delega_cognome[]");
     const delegheTelefoni = formData.getAll("delega_telefono[]");
@@ -229,19 +229,23 @@ async function handleIscrizionePost(request, env) {
       }
     }
 
-    // Esecuzione di tutti gli inserimenti in un'unica transazione sicura
+    // Esegui la scrittura atomica su D1
     await env.DB.batch(statements);
 
-    // Invio Email di notifica tramite Resend se configurato
+    // Invio Email con Resend (con gestione sicura di ctx)
     if (env.RESEND_API_KEY) {
-      ctx.waitUntil(
-        sendConfirmationEmails(env.RESEND_API_KEY, {
-          genitoreNome: `${gNome} ${gCognome}`,
-          genitoreEmail: gEmail,
-          minoreNome: `${mNome} ${mCognome}`,
-          telefono: gTelefono
-        })
-      );
+      const emailPromise = sendConfirmationEmails(env.RESEND_API_KEY, {
+        genitoreNome: `${gNome} ${gCognome}`,
+        genitoreEmail: gEmail,
+        minoreNome: `${mNome} ${mCognome}`,
+        telefono: gTelefono
+      });
+
+      if (ctx && typeof ctx.waitUntil === "function") {
+        ctx.waitUntil(emailPromise);
+      } else {
+        await emailPromise;
+      }
     }
 
     // Reindirizzamento a pagina di conferma
@@ -312,7 +316,7 @@ async function sendConfirmationEmails(apiKey, data) {
 }
 
 /* =========================================================================
-   PAGINE HTML: MODULO ISCRIZIONE E CONFERMA
+   PAGINE HTML: WIZARD MULTI-STEP E CONFERMA
    ========================================================================= */
 function renderFormPage(corsi) {
   const opzioniCorsi = corsi.map((c) =>
@@ -350,7 +354,7 @@ function renderFormPage(corsi) {
     header {
       background-color: var(--bg-dark);
       color: #FFFFFF;
-      padding: 24px 20px;
+      padding: 22px 20px;
       border-bottom: 3px solid var(--brand-rose);
       box-shadow: 0 4px 12px rgba(0,0,0,0.15);
     }
@@ -362,8 +366,8 @@ function renderFormPage(corsi) {
       gap: 16px;
     }
     .badge-icon {
-      width: 52px;
-      height: 52px;
+      width: 50px;
+      height: 50px;
       border-radius: 50%;
       background: linear-gradient(135deg, var(--brand-rose-dark), var(--brand-rose));
       display: flex;
@@ -391,10 +395,11 @@ function renderFormPage(corsi) {
       padding: 0 16px;
     }
 
+    /* Stepper visivo a step reali */
     .stepper {
       display: flex;
       justify-content: space-between;
-      margin-bottom: 24px;
+      margin-bottom: 12px;
       background: var(--card-bg);
       border: 1px solid var(--border-color);
       border-radius: 10px;
@@ -410,6 +415,7 @@ function renderFormPage(corsi) {
       font-weight: 600;
       color: var(--text-muted);
       white-space: nowrap;
+      transition: color 0.2s ease;
     }
     .step-num {
       width: 24px;
@@ -421,11 +427,44 @@ function renderFormPage(corsi) {
       align-items: center;
       justify-content: center;
       font-size: 11px;
+      transition: all 0.2s ease;
     }
     .step-item.active { color: var(--brand-rose-dark); }
     .step-item.active .step-num {
       background: var(--brand-rose);
       color: #FFFFFF;
+    }
+    .step-item.completed { color: #059669; }
+    .step-item.completed .step-num {
+      background: #059669;
+      color: #FFFFFF;
+    }
+
+    /* Barra di avanzamento percentuale fluida */
+    .progress-bar-container {
+      width: 100%;
+      height: 6px;
+      background: #E4E4E7;
+      border-radius: 3px;
+      margin-bottom: 24px;
+      overflow: hidden;
+    }
+    .progress-bar-fill {
+      height: 100%;
+      width: 20%;
+      background: linear-gradient(90deg, var(--brand-rose), var(--brand-rose-dark));
+      transition: width 0.3s ease;
+    }
+
+    /* Pagine del Wizard */
+    .wizard-step { display: none; }
+    .wizard-step.active {
+      display: block;
+      animation: fadeIn 0.25s ease-in-out;
+    }
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(4px); }
+      to { opacity: 1; transform: translateY(0); }
     }
 
     .form-card {
@@ -433,7 +472,7 @@ function renderFormPage(corsi) {
       border: 1px solid var(--border-color);
       border-radius: 12px;
       padding: 28px;
-      margin-bottom: 24px;
+      margin-bottom: 20px;
       box-shadow: 0 2px 8px rgba(0,0,0,0.04);
     }
     .section-title {
@@ -489,7 +528,7 @@ function renderFormPage(corsi) {
     .form-group label .req { color: #E11D48; margin-left: 2px; }
     .form-control {
       width: 100%;
-      padding: 10px 12px;
+      padding: 11px 13px;
       border: 1px solid var(--border-color);
       border-radius: 8px;
       font-size: 14px;
@@ -550,6 +589,40 @@ function renderFormPage(corsi) {
     }
     .btn-secondary:hover { background: var(--brand-rose-soft); }
 
+    .wizard-actions {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-top: 24px;
+      gap: 12px;
+    }
+    .btn-prev {
+      background: #FFFFFF;
+      color: #3F3F46;
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      padding: 12px 20px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    .btn-prev:hover { background: #F4F4F5; }
+    .btn-next {
+      background: linear-gradient(135deg, var(--brand-rose), var(--brand-rose-dark));
+      color: #FFFFFF;
+      border: none;
+      border-radius: 8px;
+      padding: 12px 24px;
+      font-size: 14px;
+      font-weight: 700;
+      cursor: pointer;
+      box-shadow: 0 2px 8px rgba(217, 130, 149, 0.4);
+      margin-left: auto;
+      transition: transform 0.15s ease;
+    }
+    .btn-next:hover { transform: translateY(-1px); }
+
     .checkbox-label {
       display: flex;
       align-items: flex-start;
@@ -579,13 +652,10 @@ function renderFormPage(corsi) {
       width: 100%;
       cursor: pointer;
       box-shadow: 0 4px 14px rgba(217, 130, 149, 0.4);
-      transition: transform 0.15s ease, box-shadow 0.15s ease;
       letter-spacing: 0.3px;
+      margin-top: 10px;
     }
-    .btn-submit:hover {
-      transform: translateY(-1px);
-      box-shadow: 0 6px 18px rgba(217, 130, 149, 0.5);
-    }
+    .btn-submit:hover { transform: translateY(-1px); }
 
     .robot-trap {
       opacity: 0;
@@ -608,7 +678,6 @@ function renderFormPage(corsi) {
     }
     footer strong { color: #FFFFFF; }
     footer a { color: var(--brand-rose-light); text-decoration: none; }
-    footer a:hover { text-decoration: underline; }
   </style>
 </head>
 <body>
@@ -624,212 +693,268 @@ function renderFormPage(corsi) {
   </header>
 
   <main>
+    <!-- Stepper 5 Passaggi Interattivo -->
     <div class="stepper">
-      <div class="step-item active"><span class="step-num">1</span> Genitore/Tutore</div>
-      <div class="step-item active"><span class="step-num">2</span> Allievo Minore</div>
-      <div class="step-item active"><span class="step-num">3</span> Laboratorio</div>
-      <div class="step-item active"><span class="step-num">4</span> Deleghe Ritiro</div>
-      <div class="step-item active"><span class="step-num">5</span> Consensi & Invio</div>
+      <div class="step-item active" id="badge_step_1"><span class="step-num">1</span> Genitore/Tutore</div>
+      <div class="step-item" id="badge_step_2"><span class="step-num">2</span> Allievo Minore</div>
+      <div class="step-item" id="badge_step_3"><span class="step-num">3</span> Laboratorio</div>
+      <div class="step-item" id="badge_step_4"><span class="step-num">4</span> Deleghe Ritiro</div>
+      <div class="step-item" id="badge_step_5"><span class="step-num">5</span> Consensi & Invio</div>
+    </div>
+
+    <!-- Barra di avanzamento percentuale -->
+    <div class="progress-bar-container">
+      <div class="progress-bar-fill" id="progressBar"></div>
     </div>
 
     <form method="POST" action="/iscrizione-minori" id="iscrizioneForm">
 
+      <!-- Honeypot Anti-Spam invisibile -->
       <div class="robot-trap">
         <label for="website">Non compilare questo campo:</label>
         <input type="text" id="website" name="website" tabindex="-1" autocomplete="off">
         <input type="text" name="codice_sicurezza_robot" tabindex="-1" autocomplete="off">
       </div>
 
-      <!-- STEP 1: DATI GENITORE / TUTORE -->
-      <div class="form-card">
-        <div class="section-title">
-          <span>1. Dati Genitore / Tutore Legale</span>
-          <span class="section-tag">Ammissione Socio APS</span>
-        </div>
-        <p class="section-desc">
-          Per iscrivere un allievo minore ai laboratori dell'APS, il genitore o tutore legale richiede l'ammissione in qualita di Socio Ordinario.
-        </p>
+      <!-- ========================================== -->
+      <!-- PAGINA 1: DATI GENITORE / TUTORE LEGALE -->
+      <!-- ========================================== -->
+      <div class="wizard-step active" id="step_1">
+        <div class="form-card">
+          <div class="section-title">
+            <span>Passaggio 1: Dati Genitore / Tutore Legale</span>
+            <span class="section-tag">Ammissione Socio APS</span>
+          </div>
+          <p class="section-desc">
+            Per iscrivere un allievo minore ai laboratori dell'APS, il genitore o tutore legale richiede l'ammissione in qualita di Socio Ordinario.
+          </p>
 
-        <div class="grid-2">
-          <div class="form-group">
-            <label>Nome genitore/tutore <span class="req">*</span></label>
-            <input type="text" name="genitore_nome" class="form-control" required placeholder="Es. Marco">
+          <div class="grid-2">
+            <div class="form-group">
+              <label>Nome genitore/tutore <span class="req">*</span></label>
+              <input type="text" name="genitore_nome" id="genitore_nome" class="form-control" required placeholder="Es. Marco">
+            </div>
+            <div class="form-group">
+              <label>Cognome genitore/tutore <span class="req">*</span></label>
+              <input type="text" name="genitore_cognome" id="genitore_cognome" class="form-control" required placeholder="Es. Rossi">
+            </div>
           </div>
+
+          <div class="grid-2">
+            <div class="form-group">
+              <label>Codice Fiscale genitore <span class="req">*</span></label>
+              <input type="text" name="genitore_cf" id="genitore_cf" class="form-control" maxlength="16" required placeholder="Es. RSSMRC80A01H501U" style="text-transform: uppercase;">
+            </div>
+            <div class="form-group">
+              <label>Ruolo / Grado parentela <span class="req">*</span></label>
+              <select name="genitore_ruolo" class="form-control" required>
+                <option value="genitore">Genitore (Madre / Padre)</option>
+                <option value="tutore_legale">Tutore Legale / Esercente potesta</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="grid-2">
+            <div class="form-group">
+              <label>Telefono / Cellulare per comunicazioni <span class="req">*</span></label>
+              <input type="tel" name="genitore_telefono" id="genitore_telefono" class="form-control" required placeholder="Es. 333 1234567">
+            </div>
+            <div class="form-group">
+              <label>Email per conferme e delibera <span class="req">*</span></label>
+              <input type="email" name="genitore_email" id="genitore_email" class="form-control" required placeholder="Es. marco.rossi@email.it">
+            </div>
+          </div>
+
           <div class="form-group">
-            <label>Cognome genitore/tutore <span class="req">*</span></label>
-            <input type="text" name="genitore_cognome" class="form-control" required placeholder="Es. Rossi">
+            <label>Indirizzo di residenza (Via/Piazza e civico) <span class="req">*</span></label>
+            <input type="text" name="genitore_indirizzo" id="genitore_indirizzo" class="form-control" required placeholder="Es. Via Roma 10">
+          </div>
+
+          <div class="grid-3">
+            <div class="form-group">
+              <label>Comune di residenza <span class="req">*</span></label>
+              <input type="text" name="genitore_citta" id="genitore_citta" class="form-control" required placeholder="Es. Bologna">
+            </div>
+            <div class="form-group">
+              <label>CAP <span class="req">*</span></label>
+              <input type="text" name="genitore_cap" id="genitore_cap" class="form-control" maxlength="5" required placeholder="40100">
+            </div>
+            <div class="form-group">
+              <label>Provincia <span class="req">*</span></label>
+              <input type="text" name="genitore_provincia" id="genitore_provincia" class="form-control" maxlength="2" required placeholder="BO" style="text-transform: uppercase;">
+            </div>
+          </div>
+
+          <div class="wizard-actions">
+            <div></div>
+            <button type="button" class="btn-next" onclick="goToStep(2)">
+              Avanti: Dati Allievo &rarr;
+            </button>
           </div>
         </div>
+      </div>
 
-        <div class="grid-2">
-          <div class="form-group">
-            <label>Codice Fiscale genitore <span class="req">*</span></label>
-            <input type="text" name="genitore_cf" class="form-control" maxlength="16" required placeholder="Es. RSSMRC80A01H501U" style="text-transform: uppercase;">
+      <!-- ========================================== -->
+      <!-- PAGINA 2: DATI ALLIEVO MINORE -->
+      <!-- ========================================== -->
+      <div class="wizard-step" id="step_2">
+        <div class="form-card">
+          <div class="section-title">
+            <span>Passaggio 2: Dati dell'Allievo/a (Minore)</span>
+            <span class="section-tag">Socio Minore</span>
           </div>
+          <p class="section-desc">
+            I minori iscritti ai corsi vengono associati all'APS e tesserati UILT per la necessaria copertura assicurativa infortuni e RC.
+          </p>
+
+          <div class="grid-2">
+            <div class="form-group">
+              <label>Nome allievo/a <span class="req">*</span></label>
+              <input type="text" name="minore_nome" id="minore_nome" class="form-control" required placeholder="Es. Sofia">
+            </div>
+            <div class="form-group">
+              <label>Cognome allievo/a <span class="req">*</span></label>
+              <input type="text" name="minore_cognome" id="minore_cognome" class="form-control" required placeholder="Es. Rossi">
+            </div>
+          </div>
+
+          <div class="grid-2">
+            <div class="form-group">
+              <label>Codice Fiscale allievo/a <span class="req">*</span></label>
+              <input type="text" name="minore_cf" id="minore_cf" class="form-control" maxlength="16" required placeholder="Es. RSSFSO15M41H501Z" style="text-transform: uppercase;">
+            </div>
+            <div class="form-group">
+              <label>Data di nascita <span class="req">*</span></label>
+              <input type="date" name="minore_data_nascita" id="minore_data_nascita" class="form-control" required>
+            </div>
+          </div>
+
           <div class="form-group">
-            <label>Ruolo / Grado parentela <span class="req">*</span></label>
-            <select name="genitore_ruolo" class="form-control" required>
-              <option value="genitore">Genitore (Madre / Padre)</option>
-              <option value="tutore_legale">Tutore Legale / Esercente potesta</option>
+            <label>Luogo di nascita (Comune o Stato estero)</label>
+            <input type="text" name="minore_luogo_nascita" class="form-control" placeholder="Es. Bologna">
+          </div>
+
+          <div class="form-group">
+            <label>Note utili per gli insegnanti (allergie, esigenze particolari o bisogni educativi)</label>
+            <textarea name="minore_note" class="form-control" placeholder="Segnala eventuali aspetti importanti per il benessere del bambino/a durante l'attivita"></textarea>
+          </div>
+
+          <div class="wizard-actions">
+            <button type="button" class="btn-prev" onclick="goToStep(1)">&larr; Indietro</button>
+            <button type="button" class="btn-next" onclick="goToStep(3)">Avanti: Laboratorio &rarr;</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- ========================================== -->
+      <!-- PAGINA 3: SELEZIONE LABORATORIO -->
+      <!-- ========================================== -->
+      <div class="wizard-step" id="step_3">
+        <div class="form-card">
+          <div class="section-title">
+            <span>Passaggio 3: Laboratorio Teatrale</span>
+            <span class="section-tag">Attivita APS</span>
+          </div>
+          <p class="section-desc">Seleziona il gruppo o laboratorio a cui intendi iscrivere l'allievo/a.</p>
+
+          <div class="form-group">
+            <label>Corso prescelto <span class="req">*</span></label>
+            <select name="corso_id" class="form-control" required>
+              ${opzioniCorsi}
             </select>
           </div>
-        </div>
 
-        <div class="grid-2">
-          <div class="form-group">
-            <label>Telefono / Cellulare per comunicazioni <span class="req">*</span></label>
-            <input type="tel" name="genitore_telefono" class="form-control" required placeholder="Es. 333 1234567">
+          <div class="info-callout">
+            <strong>Copertura Federale Inclusa:</strong> La frequenza ai laboratori teatrali di Cervelli in Affitto APS comprende il tesseramento UILT per l'anno solare, con copertura assicurativa infortuni e responsabilita civile per l'allievo/a.
           </div>
-          <div class="form-group">
-            <label>Email per conferme e delibera <span class="req">*</span></label>
-            <input type="email" name="genitore_email" class="form-control" required placeholder="Es. marco.rossi@email.it">
-          </div>
-        </div>
 
-        <div class="form-group">
-          <label>Indirizzo di residenza (Via/Piazza e civico) <span class="req">*</span></label>
-          <input type="text" name="genitore_indirizzo" class="form-control" required placeholder="Es. Via Roma 10">
-        </div>
-
-        <div class="grid-3">
-          <div class="form-group">
-            <label>Comune di residenza <span class="req">*</span></label>
-            <input type="text" name="genitore_citta" class="form-control" required placeholder="Es. Bologna">
-          </div>
-          <div class="form-group">
-            <label>CAP <span class="req">*</span></label>
-            <input type="text" name="genitore_cap" class="form-control" maxlength="5" required placeholder="40100">
-          </div>
-          <div class="form-group">
-            <label>Provincia <span class="req">*</span></label>
-            <input type="text" name="genitore_provincia" class="form-control" maxlength="2" required placeholder="BO" style="text-transform: uppercase;">
+          <div class="wizard-actions">
+            <button type="button" class="btn-prev" onclick="goToStep(2)">&larr; Indietro</button>
+            <button type="button" class="btn-next" onclick="goToStep(4)">Avanti: Deleghe Ritiro &rarr;</button>
           </div>
         </div>
       </div>
 
-      <!-- STEP 2: DATI ALLIEVO MINORE -->
-      <div class="form-card">
-        <div class="section-title">
-          <span>2. Dati dell'Allievo/a (Minore)</span>
-          <span class="section-tag">Socio Minore</span>
-        </div>
-        <p class="section-desc">
-          I minori iscritti ai corsi vengono associati all'APS e tesserati UILT per la necessaria copertura assicurativa infortuni e RC.
-        </p>
-
-        <div class="grid-2">
-          <div class="form-group">
-            <label>Nome allievo/a <span class="req">*</span></label>
-            <input type="text" name="minore_nome" class="form-control" required placeholder="Es. Sofia">
+      <!-- ========================================== -->
+      <!-- PAGINA 4: DELEGHE AL RITIRO (FACOLTATIVE) -->
+      <!-- ========================================== -->
+      <div class="wizard-step" id="step_4">
+        <div class="form-card">
+          <div class="section-title">
+            <span>Passaggio 4: Deleghe al Ritiro dell'Allievo/a</span>
+            <span class="section-tag">Sicurezza Minori</span>
           </div>
-          <div class="form-group">
-            <label>Cognome allievo/a <span class="req">*</span></label>
-            <input type="text" name="minore_cognome" class="form-control" required placeholder="Es. Rossi">
-          </div>
-        </div>
+          <p class="section-desc">
+            Indica le persone maggiorenni autorizzate a ritirare il minore al termine delle lezioni oltre ai genitori (es. nonni, zii, amici di famiglia). Se non hai deleghe da aggiungere, puoi procedere subito al passaggio successivo.
+          </p>
 
-        <div class="grid-2">
-          <div class="form-group">
-            <label>Codice Fiscale allievo/a <span class="req">*</span></label>
-            <input type="text" name="minore_cf" class="form-control" maxlength="16" required placeholder="Es. RSSFSO15M41H501Z" style="text-transform: uppercase;">
-          </div>
-          <div class="form-group">
-            <label>Data di nascita <span class="req">*</span></label>
-            <input type="date" name="minore_data_nascita" class="form-control" required>
-          </div>
-        </div>
+          <div id="delegheContainer"></div>
 
-        <div class="form-group">
-          <label>Luogo di nascita (Comune o Stato estero)</label>
-          <input type="text" name="minore_luogo_nascita" class="form-control" placeholder="Es. Bologna">
-        </div>
-
-        <div class="form-group">
-          <label>Note utili per gli insegnanti (allergie, esigenze particolari o bisogni educativi)</label>
-          <textarea name="minore_note" class="form-control" placeholder="Segnala eventuali aspetti importanti per il benessere del bambino/a durante l'attivita"></textarea>
-        </div>
-      </div>
-
-      <!-- STEP 3: SELEZIONE LABORATORIO -->
-      <div class="form-card">
-        <div class="section-title">
-          <span>3. Laboratorio Teatrale</span>
-          <span class="section-tag">Attivita APS</span>
-        </div>
-        <p class="section-desc">Seleziona il gruppo o laboratorio a cui intendi iscrivere l'allievo/a.</p>
-
-        <div class="form-group">
-          <label>Corso prescelto <span class="req">*</span></label>
-          <select name="corso_id" class="form-control" required>
-            ${opzioniCorsi}
-          </select>
-        </div>
-      </div>
-
-      <!-- STEP 4: DELEGHE AL RITIRO -->
-      <div class="form-card">
-        <div class="section-title">
-          <span>4. Deleghe al Ritiro dell'Allievo/a</span>
-          <span class="section-tag">Sicurezza Minori</span>
-        </div>
-        <p class="section-desc">
-          Indica le persone maggiorenni autorizzate a ritirare il minore al termine delle lezioni oltre ai genitori (es. nonni, zii, amici di famiglia).
-        </p>
-
-        <div id="delegheContainer"></div>
-
-        <button type="button" class="btn-secondary" id="btnAddDelega" onclick="addDelegaBlock()">
-          + Aggiungi una persona delegata al ritiro
-        </button>
-      </div>
-
-      <!-- STEP 5: STATUTO, PRIVACY & CONSENSI -->
-      <div class="form-card">
-        <div class="section-title">
-          <span>5. Statuto dell'APS, Privacy & Consensi</span>
-          <span class="section-tag">Conformita di Legge</span>
-        </div>
-
-        <div class="info-callout">
-          <strong>Trasparenza Associativa:</strong> Con l'invio del presente modulo richiedi formalmente l'ammissione all'Associazione di Promozione Sociale "Cervelli in Affitto APS" per l'anno sociale in corso, dichiarando di condividerne le finalita educative, culturali e teatrali.
-        </div>
-
-        <label class="checkbox-label">
-          <input type="checkbox" name="consenso_statuto" value="1" required checked>
-          <span>
-            <strong>Adesione allo Statuto dell'APS <span class="req">*</span>:</strong>
-            Dichiaro di aver preso visione dello Statuto di Cervelli in Affitto APS, di accettarne le norme e i regolamenti interni e di richiedere l'ammissione a socio per me e per il minore rappresentato.
-          </span>
-        </label>
-
-        <label class="checkbox-label">
-          <input type="checkbox" name="consenso_privacy" value="1" required checked>
-          <span>
-            <strong>Informativa Privacy GDPR <span class="req">*</span>:</strong>
-            Acconsento al trattamento dei dati personali forniti per le finalita connesse alla gestione associativa, all'affiliazione e assicurazione UILT e alla partecipazione al laboratorio teatrale.
-          </span>
-        </label>
-
-        <label class="checkbox-label">
-          <input type="checkbox" name="consenso_foto" value="1" checked>
-          <span>
-            <strong>Liberatoria Foto e Video Teatrali (consigliato):</strong>
-            Autorizzo l'APS a effettuare riprese fotografiche e video esclusivamente a scopo documentativo interno e per saggi teatrali di fine corso.
-          </span>
-        </label>
-
-        <label class="checkbox-label">
-          <input type="checkbox" name="consenso_news" value="1">
-          <span>
-            <strong>Comunicazioni su spettacoli ed eventi:</strong>
-            Desidero ricevere via email gli inviti e le date degli spettacoli teatrali dell'APS.
-          </span>
-        </label>
-
-        <div style="margin-top: 24px;">
-          <button type="submit" class="btn-submit">
-            Invia Domanda di Iscrizione & Ammissione Socio
+          <button type="button" class="btn-secondary" id="btnAddDelega" onclick="addDelegaBlock()">
+            + Aggiungi una persona delegata al ritiro
           </button>
+
+          <div class="wizard-actions">
+            <button type="button" class="btn-prev" onclick="goToStep(3)">&larr; Indietro</button>
+            <button type="button" class="btn-next" onclick="goToStep(5)">Avanti: Consensi & Invio &rarr;</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- ========================================== -->
+      <!-- PAGINA 5: CONSENSI E CONFERMA FINALE -->
+      <!-- ========================================== -->
+      <div class="wizard-step" id="step_5">
+        <div class="form-card">
+          <div class="section-title">
+            <span>Passaggio 5: Statuto dell'APS, Privacy & Consensi</span>
+            <span class="section-tag">Conformita di Legge</span>
+          </div>
+
+          <div class="info-callout">
+            <strong>Trasparenza Associativa:</strong> Con l'invio del presente modulo richiedi formalmente l'ammissione all'Associazione di Promozione Sociale "Cervelli in Affitto APS" per l'anno sociale in corso, dichiarando di condividerne le finalita educative, culturali e teatrali.
+          </div>
+
+          <label class="checkbox-label">
+            <input type="checkbox" name="consenso_statuto" id="consenso_statuto" value="1" required checked>
+            <span>
+              <strong>Adesione allo Statuto dell'APS <span class="req">*</span>:</strong>
+              Dichiaro di aver preso visione dello Statuto di Cervelli in Affitto APS, di accettarne le norme e i regolamenti interni e di richiedere l'ammissione a socio per me e per il minore rappresentato.
+            </span>
+          </label>
+
+          <label class="checkbox-label">
+            <input type="checkbox" name="consenso_privacy" id="consenso_privacy" value="1" required checked>
+            <span>
+              <strong>Informativa Privacy GDPR <span class="req">*</span>:</strong>
+              Acconsento al trattamento dei dati personali forniti per le finalita connesse alla gestione associativa, all'affiliazione e assicurazione UILT e alla partecipazione al laboratorio teatrale.
+            </span>
+          </label>
+
+          <label class="checkbox-label">
+            <input type="checkbox" name="consenso_foto" value="1" checked>
+            <span>
+              <strong>Liberatoria Foto e Video Teatrali (consigliato):</strong>
+              Autorizzo l'APS a effettuare riprese fotografiche e video esclusivamente a scopo documentativo interno e per saggi teatrali di fine corso.
+            </span>
+          </label>
+
+          <label class="checkbox-label">
+            <input type="checkbox" name="consenso_news" value="1">
+            <span>
+              <strong>Comunicazioni su spettacoli ed eventi:</strong>
+              Desidero ricevere via email gli inviti e le date degli spettacoli teatrali dell'APS.
+            </span>
+          </label>
+
+          <div class="wizard-actions" style="margin-top: 24px;">
+            <button type="button" class="btn-prev" onclick="goToStep(4)">&larr; Indietro</button>
+            <div style="flex: 1; max-width: 380px;">
+              <button type="submit" class="btn-submit" id="btnSubmitForm">
+                Invia Domanda di Iscrizione & Ammissione Socio
+              </button>
+            </div>
+          </div>
         </div>
       </div>
 
@@ -845,6 +970,57 @@ function renderFormPage(corsi) {
   </footer>
 
   <script>
+    let currentStep = 1;
+    const totalSteps = 5;
+
+    function goToStep(step) {
+      if (step > currentStep) {
+        if (!validateStep(currentStep)) return;
+      }
+
+      document.querySelectorAll('.wizard-step').forEach(el => el.classList.remove('active'));
+      document.getElementById('step_' + step).classList.add('active');
+
+      for (let i = 1; i <= totalSteps; i++) {
+        const badge = document.getElementById('badge_step_' + i);
+        badge.classList.remove('active', 'completed');
+        if (i < step) badge.classList.add('completed');
+        else if (i === step) badge.classList.add('active');
+      }
+
+      const progress = (step / totalSteps) * 100;
+      document.getElementById('progressBar').style.width = progress + '%';
+
+      currentStep = step;
+      window.scrollTo({ top: 100, behavior: 'smooth' });
+    }
+
+    function validateStep(step) {
+      if (step === 1) {
+        const reqFields = ['genitore_nome', 'genitore_cognome', 'genitore_cf', 'genitore_telefono', 'genitore_email', 'genitore_indirizzo', 'genitore_citta', 'genitore_cap', 'genitore_provincia'];
+        for (const id of reqFields) {
+          const el = document.getElementById(id);
+          if (!el || !el.value.trim()) {
+            alert('Compila tutti i campi obbligatori del Genitore/Tutore prima di proseguire.');
+            if (el) el.focus();
+            return false;
+          }
+        }
+      }
+      if (step === 2) {
+        const reqFields = ['minore_nome', 'minore_cognome', 'minore_cf', 'minore_data_nascita'];
+        for (const id of reqFields) {
+          const el = document.getElementById(id);
+          if (!el || !el.value.trim()) {
+            alert("Compila tutti i campi obbligatori dell'Allievo Minore prima di proseguire.");
+            if (el) el.focus();
+            return false;
+          }
+        }
+      }
+      return true;
+    }
+
     let delegaCount = 0;
     function addDelegaBlock() {
       delegaCount++;
@@ -883,6 +1059,14 @@ function renderFormPage(corsi) {
       const el = document.getElementById(id);
       if (el) el.remove();
     }
+
+    document.getElementById('iscrizioneForm').addEventListener('submit', function() {
+      const btn = document.getElementById('btnSubmitForm');
+      if (btn) {
+        btn.disabled = true;
+        btn.innerText = 'Invio e registrazione in corso...';
+      }
+    });
   </script>
 
 </body>
