@@ -1,598 +1,995 @@
 /**
- * Cervelli in Affitto APS - Gestionale
- * Modulo Iscrizioni Corsi Minori & Domanda Socio
+ * Cervelli in Affitto APS - Piattaforma Gestionale
+ * Modulo Ufficiale Iscrizione Corsi Minori & Ammissione Socio
+ * Affiliato UILT - Unione Italiana Libero Teatro
  */
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // 1. Endpoint diagnostico D1
+    // 1. Endpoint diagnostico database D1
     if (url.pathname === "/api/test-db") {
       try {
-        const { results } = await env.DB.prepare("SELECT name FROM sqlite_master WHERE type='table'").all();
-        return Response.json({ status: "ok", tabelle_attive: results.map(r => r.name) });
+        const { results } = await env.DB.prepare(
+          "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+        ).all();
+        const tables = results.map((r) => r.name);
+        return Response.json({
+          status: "ok",
+          database: "cervelli-gestionale-db",
+          tabelle_attive: tables,
+          deleghe_pronte: tables.includes("deleghe_ritiro"),
+          timestamp: new Date().toISOString()
+        });
       } catch (err) {
         return Response.json({ status: "error", message: err.message }, { status: 500 });
       }
     }
 
-    // Assicuriamo l'esistenza del corso predefinito nel database D1
+    // Assicura l'esistenza del corso predefinito in D1 se la tabella e vuota
     await seedDefaultCourseIfNeeded(env);
 
-    // 2. Ricezione dati inviati dal modulo (POST)
+    // 2. Ricezione dati del modulo (POST)
     if (request.method === "POST" && (url.pathname === "/iscrizione-minori" || url.pathname === "/")) {
       return handleIscrizionePost(request, env);
     }
 
-    // 3. Pagina di successo
+    // 3. Pagina di conferma avvenuta iscrizione
     if (url.pathname === "/iscrizione-confermata") {
-      return renderSuccessPage(url.searchParams.get("nome_minore") || "allievo");
+      const nomeMinore = url.searchParams.get("minore") || "allievo/a";
+      const email = url.searchParams.get("email") || "";
+      return renderSuccessPage(nomeMinore, email);
     }
 
-    // 4. Pagina del Modulo Iscrizione (GET)
+    // 4. Pagina principale del Modulo Iscrizione (GET)
     const corsi = await getCorsiAttivi(env);
     return renderFormPage(corsi);
   }
 };
 
 /* =========================================================================
-   RECUPERO E SEED DEI CORSI
+   GESTIONE DEI CORSI IN DATABASE
    ========================================================================= */
 async function seedDefaultCourseIfNeeded(env) {
   try {
-    const check = await env.DB.prepare("SELECT COUNT(*) as tot FROM attivita_eventi WHERE tipo = 'corso_teatro_minori'").first();
+    const check = await env.DB.prepare(
+      "SELECT COUNT(*) as tot FROM attivita_eventi WHERE tipo = 'corso_teatro_minori'"
+    ).first();
     if (check && check.tot === 0) {
       await env.DB.prepare(`
-        INSERT INTO attivita_eventi (id, titolo, tipo, descrizione, luogo, quota_o_prezzo, capienza_massima, stato)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      `).bind(
-        "corso-teatro-ragazzi-2026",
-        "Laboratorio Teatrale Bambini e Ragazzi",
-        "corso_teatro_minori",
-        "Percorso annuale di recitazione, espressione corporea ed educazione alla voce dedicato a bambini e ragazzi.",
-        "Sede Cervelli in Affitto APS",
-        0,
-        25,
-        "aperto"
-      ).run();
+        INSERT INTO attivita_eventi (id, titolo, tipo, descrizione, data_evento, luogo, quota_o_prezzo, capienza_massima, stato)
+        VALUES (
+          'corso-teatro-ragazzi-2024-25',
+          'Laboratorio Teatrale Bambini e Ragazzi (Anno 2024/2025)',
+          'corso_teatro_minori',
+          'Percorso propedeutico di espressione corporea, voce, improvvisazione teatrale e messa in scena finale. Include tesseramento UILT e copertura assicurativa.',
+          'Settimanale (Ottobre - Maggio)',
+          'Sede Cervelli in Affitto APS',
+          0,
+          25,
+          'aperto'
+        )
+      `).run();
     }
   } catch (e) {
-    console.error("Errore verifica corso base:", e);
+    console.error("Errore verifica corso default:", e);
   }
 }
 
 async function getCorsiAttivi(env) {
   try {
     const { results } = await env.DB.prepare(
-      "SELECT id, titolo, descrizione, quota_o_prezzo FROM attivita_eventi WHERE tipo = 'corso_teatro_minori' AND stato = 'aperto' ORDER BY created_at DESC"
+      "SELECT id, titolo, descrizione, luogo, quota_o_prezzo FROM attivita_eventi WHERE tipo = 'corso_teatro_minori' AND stato = 'aperto'"
     ).all();
-    return results || [];
+    if (results && results.length > 0) return results;
   } catch (e) {
-    return [{ id: "corso-teatro-ragazzi-2026", titolo: "Laboratorio Teatrale Bambini e Ragazzi" }];
+    console.error("Errore lettura corsi:", e);
   }
+  return [
+    {
+      id: "corso-teatro-ragazzi-2024-25",
+      titolo: "Laboratorio Teatrale Bambini e Ragazzi",
+      descrizione: "Laboratorio annuale di teatro ragazzi con copertura UILT",
+      luogo: "Sede Cervelli in Affitto APS"
+    }
+  ];
 }
 
 /* =========================================================================
-   SALVATAGGIO ISCRIZIONE & DOMANDA SOCIO (POST)
+   ELABORAZIONE DATI INVIATI (POST)
    ========================================================================= */
 async function handleIscrizionePost(request, env) {
   try {
     const formData = await request.formData();
-    
-    // Dati Tutore
-    const tutore_nome = (formData.get("tutore_nome") || "").trim();
-    const tutore_cognome = (formData.get("tutore_cognome") || "").trim();
-    const tutore_cf = (formData.get("tutore_cf") || "").trim().toUpperCase();
-    const tutore_telefono = (formData.get("tutore_telefono") || "").trim();
-    const tutore_email = (formData.get("tutore_email") || "").trim().toLowerCase();
-    const tutore_ruolo = formData.get("tutore_ruolo") || "genitore";
-    const tutore_indirizzo = (formData.get("tutore_indirizzo") || "").trim();
-    const tutore_citta = (formData.get("tutore_citta") || "").trim();
-    const tutore_cap = (formData.get("tutore_cap") || "").trim();
-    const tutore_provincia = (formData.get("tutore_provincia") || "").trim().toUpperCase();
+
+    // Protezione Anti-Spam Honeypot (campo invisibile che solo i bot compilano)
+    const honey = formData.get("codice_sicurezza_robot") || formData.get("website") || "";
+    if (honey.trim() !== "") {
+      console.warn("Spam intercettato via honeypot:", honey);
+      return new Response("Invio non valido.", { status: 400 });
+    }
+
+    // Dati Genitore / Tutore (richiedente ammissione socio)
+    const gNome = (formData.get("genitore_nome") || "").trim();
+    const gCognome = (formData.get("genitore_cognome") || "").trim();
+    const gCF = (formData.get("genitore_cf") || "").trim().toUpperCase();
+    const gTelefono = (formData.get("genitore_telefono") || "").trim();
+    const gEmail = (formData.get("genitore_email") || "").trim().toLowerCase();
+    const gParentela = (formData.get("genitore_ruolo") || "genitore").trim();
+    const gIndirizzo = (formData.get("genitore_indirizzo") || "").trim();
+    const gCitta = (formData.get("genitore_citta") || "").trim();
+    const gCap = (formData.get("genitore_cap") || "").trim();
+    const gProv = (formData.get("genitore_provincia") || "").trim().toUpperCase();
+    const gDataNascita = (formData.get("genitore_data_nascita") || "").trim();
+    const gLuogoNascita = (formData.get("genitore_luogo_nascita") || "").trim();
 
     // Dati Minore
-    const minore_nome = (formData.get("minore_nome") || "").trim();
-    const minore_cognome = (formData.get("minore_cognome") || "").trim();
-    const minore_cf = (formData.get("minore_cf") || "").trim().toUpperCase();
-    const minore_data_nascita = (formData.get("minore_data_nascita") || "").trim();
-    const minore_luogo_nascita = (formData.get("minore_luogo_nascita") || "").trim();
-    const corso_id = formData.get("corso_id") || "corso-teatro-ragazzi-2026";
-    const note_socio = (formData.get("note") || "").trim();
+    const mNome = (formData.get("minore_nome") || "").trim();
+    const mCognome = (formData.get("minore_cognome") || "").trim();
+    const mCF = (formData.get("minore_cf") || "").trim().toUpperCase();
+    const mDataNascita = (formData.get("minore_data_nascita") || "").trim();
+    const mLuogoNascita = (formData.get("minore_luogo_nascita") || "").trim();
+    const mNote = (formData.get("minore_note") || "").trim();
+
+    // Corso
+    const corsoId = formData.get("corso_id") || "corso-teatro-ragazzi-2024-25";
+
+    // Validazione campi obbligatori minimi
+    if (!gNome || !gCognome || !gCF || !gEmail || !gTelefono || !mNome || !mCognome || !mCF || !mDataNascita) {
+      return new Response(
+        renderErrorPage("Dati incompleti: assicurati di compilare tutti i campi contrassegnati con l'asterisco (*) per genitore e allievo."),
+        { status: 400, headers: { "Content-Type": "text/html; charset=utf-8" } }
+      );
+    }
 
     // Consensi
-    const accetta_statuto = formData.get("accetta_statuto") ? 1 : 0;
-    const privacy_dati = formData.get("privacy_dati") ? 1 : 0;
-    const privacy_foto = formData.get("privacy_foto") ? 1 : 0;
-    const client_ip = request.headers.get("CF-Connecting-IP") || "0.0.0.0";
+    const consStatuto = formData.get("consenso_statuto") ? 1 : 0;
+    const consPrivacy = formData.get("consenso_privacy") ? 1 : 0;
+    const consFoto = formData.get("consenso_foto") ? 1 : 0;
+    const consNews = formData.get("consenso_news") ? 1 : 0;
 
-    // Validazione essenziale
-    if (!tutore_nome || !tutore_cognome || !tutore_cf || !tutore_email || !tutore_telefono ||
-        !minore_nome || !minore_cognome || !minore_cf || !minore_data_nascita) {
-      return new Response("Compilare tutti i campi obbligatori contrassegnati da asterisco.", { status: 400 });
+    if (!consStatuto || !consPrivacy) {
+      return new Response(
+        renderErrorPage("L'accettazione dello Statuto dell'APS e l'informativa Privacy sono obbligatori per legge."),
+        { status: 400, headers: { "Content-Type": "text/html; charset=utf-8" } }
+      );
     }
 
-    if (!accetta_statuto || !privacy_dati) {
-      return new Response("È obbligatorio accettare lo Statuto Sociale e l'Informativa Privacy.", { status: 400 });
-    }
+    const clientIP = request.headers.get("cf-connecting-ip") || "unknown";
+    const tutoreId = "tut-" + crypto.randomUUID().slice(0, 12);
+    const socioGenitoreId = "soc-g-" + crypto.randomUUID().slice(0, 12);
+    const socioMinoreId = "soc-m-" + crypto.randomUUID().slice(0, 12);
+    const iscrizioneId = "isc-" + crypto.randomUUID().slice(0, 12);
 
-    // Identificativi univoci
-    const tutore_id = "tut_" + crypto.randomUUID().slice(0, 8);
-    const socio_id = "soc_" + crypto.randomUUID().slice(0, 8);
-    const consenso_id = "prv_" + crypto.randomUUID().slice(0, 8);
-    const quota_id = "qta_" + crypto.randomUUID().slice(0, 8);
-    const iscrizione_id = "isc_" + crypto.randomUUID().slice(0, 8);
-    const anno_sociale = "2026/2027";
-
-    // Salvataggio nel Database Cloudflare D1
-    await env.DB.batch([
-      // 1. Tabella Tutori
+    // Esecuzione inserimenti nel database D1
+    const statements = [
+      // 1. Inserimento Tutore
       env.DB.prepare(`
         INSERT INTO tutori (id, nome, cognome, codice_fiscale, telefono, email, grado_parentela, residenza_indirizzo, residenza_citta, residenza_cap, residenza_provincia)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).bind(
-        tutore_id, tutore_nome, tutore_cognome, tutore_cf, tutore_telefono, tutore_email,
-        tutore_ruolo, tutore_indirizzo, tutore_citta, tutore_cap, tutore_provincia
-      ),
+      `).bind(tutoreId, gNome, gCognome, gCF, gTelefono, gEmail, gParentela, gIndirizzo, gCitta, gCap, gProv),
 
-      // 2. Tabella Soci (Minore con tipologia 'ordinario' e stato 'in_attesa' di delibera)
+      // 2. Inserimento Domanda Socio Genitore (Ordinario, in attesa di delibera)
       env.DB.prepare(`
-        INSERT INTO soci (id, is_minore, tutore_id, nome, cognome, codice_fiscale, data_nascita, luogo_nascita, residenza_indirizzo, residenza_citta, residenza_cap, residenza_provincia, email, telefono, tipologia_socio, stato_richiesta)
+        INSERT INTO soci (id, is_minore, tutore_id, nome, cognome, codice_fiscale, data_nascita, luogo_nascita, residenza_indirizzo, residenza_citta, residenza_cap, residenza_provincia, telefono, email, tipologia_socio, stato_richiesta)
+        VALUES (?, 0, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ordinario', 'in_attesa')
+        ON CONFLICT(codice_fiscale) DO UPDATE SET
+          telefono = excluded.telefono,
+          email = excluded.email,
+          residenza_indirizzo = excluded.residenza_indirizzo,
+          updated_at = datetime('now')
+      `).bind(socioGenitoreId, gNome, gCognome, gCF, gDataNascita || "Non indicata", gLuogoNascita || "Non indicato", gIndirizzo, gCitta, gCap, gProv, gTelefono, gEmail),
+
+      // 3. Inserimento Domanda Socio Minore (Ordinario minore, collegato a tutore)
+      env.DB.prepare(`
+        INSERT INTO soci (id, is_minore, tutore_id, nome, cognome, codice_fiscale, data_nascita, luogo_nascita, residenza_indirizzo, residenza_citta, residenza_cap, residenza_provincia, telefono, email, tipologia_socio, stato_richiesta)
         VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ordinario', 'in_attesa')
-      `).bind(
-        socio_id, tutore_id, minore_nome, minore_cognome, minore_cf, minore_data_nascita,
-        minore_luogo_nascita, tutore_indirizzo, tutore_citta, tutore_cap, tutore_provincia,
-        tutore_email, tutore_telefono
-      ),
+        ON CONFLICT(codice_fiscale) DO UPDATE SET
+          tutore_id = excluded.tutore_id,
+          updated_at = datetime('now')
+      `).bind(socioMinoreId, tutoreId, mNome, mCognome, mCF, mDataNascita, mLuogoNascita || "Non indicato", gIndirizzo, gCitta, gCap, gProv, gTelefono, gEmail),
 
-      // 3. Tabella Consensi Privacy
-      env.DB.prepare(`
-        INSERT INTO consensi_privacy (id, socio_id, tutore_id, accettazione_statuto, consenso_trattamento_dati, consenso_foto_video, ip_address)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-      `).bind(consenso_id, socio_id, tutore_id, accetta_statuto, privacy_dati, privacy_foto, client_ip),
-
-      // 4. Tabella Quote Sociali (preparata per quota APS e tesseramento UILT)
-      env.DB.prepare(`
-        INSERT INTO quote_sociali (id, socio_id, anno_sociale, quota_aps_importo, quota_aps_saldata, quota_uilt_importo, quota_uilt_saldata, note)
-        VALUES (?, ?, ?, 0, 0, 0, 0, ?)
-      `).bind(quota_id, socio_id, anno_sociale, "Iscrizione avviata da modulo online"),
-
-      // 5. Tabella Iscrizione Corso
+      // 4. Inserimento Iscrizione Corso
       env.DB.prepare(`
         INSERT INTO iscrizioni_corsi (id, attivita_id, socio_id, quota_dovuta, quota_saldata, stato_pagamento, note)
         VALUES (?, ?, ?, 0, 0, 'da_saldare', ?)
-      `).bind(iscrizione_id, corso_id, socio_id, note_socio)
-    ]);
+      `).bind(iscrizioneId, corsoId, socioMinoreId, mNote || null),
 
-    // Invio Email di notifica tramite Resend
-    if (env.RESEND_API_KEY) {
-      await sendConfirmationEmail(env, {
-        tutore_email,
-        tutore_nome,
-        tutore_cognome,
-        minore_nome,
-        minore_cognome,
-        minore_cf
-      });
+      // 5. Inserimento Consensi Privacy
+      env.DB.prepare(`
+        INSERT INTO consensi_privacy (id, socio_id, tutore_id, accettazione_statuto, consenso_trattamento_dati, consenso_foto_video, consenso_newsletter, ip_address)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).bind("cons-" + crypto.randomUUID().slice(0, 12), socioMinoreId, tutoreId, consStatuto, consPrivacy, consFoto, consNews, clientIP)
+    ];
+
+    // 6. Inserimento Deleghe al Ritiro (se presenti)
+    const delegheNomi = formData.getAll("delega_nome[]");
+    const delegheCognomi = formData.getAll("delega_cognome[]");
+    const delegheTelefoni = formData.getAll("delega_telefono[]");
+    const delegheRelazioni = formData.getAll("delega_relazione[]");
+    const delegheCF = formData.getAll("delega_cf[]");
+
+    if (delegheNomi && delegheNomi.length > 0) {
+      for (let i = 0; i < delegheNomi.length; i++) {
+        const dNome = (delegheNomi[i] || "").trim();
+        const dCognome = (delegheCognomi[i] || "").trim();
+        const dTel = (delegheTelefoni[i] || "").trim();
+        const dRel = (delegheRelazioni[i] || "").trim();
+        const dCf = (delegheCF[i] || "").trim().toUpperCase();
+
+        if (dNome && dCognome && dTel) {
+          statements.push(
+            env.DB.prepare(`
+              INSERT INTO deleghe_ritiro (id, iscrizione_id, socio_minore_id, nome, cognome, codice_fiscale, telefono, relazione)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            `).bind("del-" + crypto.randomUUID().slice(0, 12), iscrizioneId, socioMinoreId, dNome, dCognome, dCf || null, dTel, dRel || "Delegato autorizzato")
+          );
+        }
+      }
     }
 
-    return Response.redirect(`${request.url.split("/iscrizione-minori")[0].split("?")[0]}/iscrizione-confermata?nome_minore=${encodeURIComponent(minore_nome)}`, 303);
+    // Esecuzione di tutti gli inserimenti in un'unica transazione sicura
+    await env.DB.batch(statements);
 
+    // Invio Email di notifica tramite Resend se configurato
+    if (env.RESEND_API_KEY) {
+      ctx.waitUntil(
+        sendConfirmationEmails(env.RESEND_API_KEY, {
+          genitoreNome: `${gNome} ${gCognome}`,
+          genitoreEmail: gEmail,
+          minoreNome: `${mNome} ${mCognome}`,
+          telefono: gTelefono
+        })
+      );
+    }
+
+    // Reindirizzamento a pagina di conferma
+    return Response.redirect(
+      `${url.origin}/iscrizione-confermata?minore=${encodeURIComponent(mNome)}&email=${encodeURIComponent(gEmail)}`,
+      303
+    );
   } catch (err) {
     console.error("Errore salvataggio iscrizione:", err);
-    return new Response(`Si è verificato un errore durante l'invio: ${err.message}`, { status: 500 });
+    return new Response(
+      renderErrorPage(`Si è verificato un errore durante il salvataggio: ${err.message}. Ti invitiamo a riprovare o contattare l'associazione.`),
+      { status: 500, headers: { "Content-Type": "text/html; charset=utf-8" } }
+    );
   }
 }
 
 /* =========================================================================
-   INVIO EMAIL CON RESEND
+   INVIO EMAIL TRAMITE RESEND API
    ========================================================================= */
-async function sendConfirmationEmail(env, data) {
+async function sendConfirmationEmails(apiKey, data) {
   try {
-    const payload = {
-      from: "Cervelli in Affitto APS <info@cervellinaffitto-aps.it>",
-      to: [data.tutore_email],
-      bcc: ["cervellinaffitto.teatro@gmail.com"],
-      subject: `Richiesta di ammissione socio e iscrizione laboratorio: ${data.minore_nome} ${data.minore_cognome}`,
-      html: `
-        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; color: #1e293b; line-height: 1.6; border: 1px solid #e2e8f0; border-radius: 8px; padding: 24px;">
-          <h2 style="color: #0284c7; margin-top: 0;">Cervelli in Affitto APS</h2>
-          <p>Gentile <strong>${data.tutore_nome} ${data.tutore_cognome}</strong>,</p>
-          <p>abbiamo ricevuto correttamente la richiesta di ammissione come <strong>socio ordinario</strong> e l'iscrizione al <strong>Laboratorio Teatrale</strong> per:</p>
-          <div style="background: #f8fafc; border-left: 4px solid #0284c7; padding: 12px 16px; margin: 16px 0;">
-            <p style="margin: 0;"><strong>Allievo/a:</strong> ${data.minore_nome} ${data.minore_cognome}</p>
-            <p style="margin: 4px 0 0 0;"><strong>Codice Fiscale:</strong> ${data.minore_cf}</p>
-            <p style="margin: 4px 0 0 0;"><strong>Anno sociale:</strong> 2026/2027</p>
+    const emailHtml = `
+      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; color: #18181B; line-height: 1.6;">
+        <div style="background-color: #121214; padding: 24px; text-align: center; border-radius: 8px 8px 0 0;">
+          <h1 style="color: #D98295; margin: 0; font-size: 22px; letter-spacing: 0.5px;">Cervelli in Affitto APS</h1>
+          <p style="color: #E8E7E9; margin: 6px 0 0 0; font-size: 13px;">Laboratorio Teatrale & Domanda di Ammissione Socio</p>
+        </div>
+        <div style="background-color: #FFFFFF; padding: 28px; border: 1px solid #E4E4E7; border-top: none; border-radius: 0 0 8px 8px;">
+          <h2 style="color: #121214; font-size: 18px; margin-top: 0;">Richiesta ricevuta con successo!</h2>
+          <p>Gentile <strong>${data.genitoreNome}</strong>,</p>
+          <p>ti confermiamo la ricezione della richiesta di iscrizione al Laboratorio Teatrale per <strong>${data.minoreNome}</strong> e la contestuale domanda di ammissione a socio per l'anno sociale in corso.</p>
+          
+          <div style="background-color: #FAF5F6; border-left: 4px solid #D98295; padding: 14px; margin: 20px 0; border-radius: 4px;">
+            <p style="margin: 0; font-size: 14px; color: #9F5D6B;"><strong>I prossimi passi associativi:</strong></p>
+            <ul style="margin: 8px 0 0 0; padding-left: 20px; font-size: 13px; color: #4A4A50;">
+              <li>Il Consiglio Direttivo deliberera formalmente l'ammissione a socio nella prima riunione utile.</li>
+              <li>Riceverai le istruzioni per il perfezionamento del tesseramento e la copertura assicurativa UILT.</li>
+              <li>Verrai ricontattato prima dell'inizio delle lezioni per tutti i dettagli organizzativi.</li>
+            </ul>
           </div>
-          <h4 style="color: #334155; margin-bottom: 6px;">Prossimi passi:</h4>
-          <ol style="margin-top: 0; padding-left: 20px; color: #475569;">
-            <li>La richiesta verrà formalmente deliberata dal Consiglio Direttivo alla prima seduta utile, come previsto dallo Statuto.</li>
-            <li>Riceverai le istruzioni relative al versamento della quota associativa (comprensiva di assicurazione UILT) e al calendario del laboratorio.</li>
-          </ol>
-          <hr style="border: none; border-top: 1px solid #e2e8f0; margin: 24px 0;">
-          <p style="font-size: 12px; color: #64748b; margin: 0;">
-            <strong>Cervelli in Affitto APS</strong><br>
-            Associazione di Promozione Sociale - Affiliata UILT<br>
-            Sito web: <a href="https://cervellinaffitto-aps.it" style="color: #0284c7;">cervellinaffitto-aps.it</a>
+
+          <p style="font-size: 13px; color: #71717A;">Per qualsiasi necessita o chiarimento puoi rispondere a questa email o contattarci ai recapiti dell'associazione.</p>
+          <hr style="border: none; border-top: 1px solid #E4E4E7; margin: 24px 0;" />
+          <p style="font-size: 11px; color: #A1A1AA; text-align: center; margin: 0;">
+            Cervelli in Affitto APS &bull; Affiliato UILT (Unione Italiana Libero Teatro)<br>
+            cervellinaffitto-aps.it
           </p>
         </div>
-      `
-    };
+      </div>
+    `;
 
-    const res = await fetch("https://api.resend.com/emails", {
+    await fetch("https://api.resend.com/emails", {
       method: "POST",
       headers: {
-        "Authorization": `Bearer ${env.RESEND_API_KEY}`,
+        "Authorization": `Bearer ${apiKey}`,
         "Content-Type": "application/json"
       },
-      body: JSON.stringify(payload)
+      body: JSON.stringify({
+        from: "Cervelli in Affitto APS <info@cervellinaffitto-aps.it>",
+        to: [data.genitoreEmail],
+        subject: `Iscrizione Laboratorio Teatrale ricevuta - ${data.minoreNome}`,
+        html: emailHtml
+      })
     });
-
-    if (!res.ok) {
-      console.error("Resend API warning:", await res.text());
-    }
-  } catch (emailErr) {
-    console.error("Errore invio email Resend:", emailErr);
+  } catch (err) {
+    console.error("Errore invio email Resend:", err);
   }
 }
 
 /* =========================================================================
-   PAGINA FORM PUBBLICO (HTML + CSS)
+   PAGINE HTML: MODULO ISCRIZIONE E CONFERMA
    ========================================================================= */
 function renderFormPage(corsi) {
-  const optionsCorsi = corsi.map(c => `<option value="${c.id}">${c.titolo}</option>`).join("");
+  const opzioniCorsi = corsi.map((c) =>
+    `<option value="${c.id}">${c.titolo} - ${c.luogo || 'Sede APS'}</option>`
+  ).join("\n");
 
   const html = `<!DOCTYPE html>
 <html lang="it">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Iscrizione Corsi & Domanda Socio - Cervelli in Affitto APS</title>
+  <title>Iscrizione Corsi Bambini & Ragazzi | Cervelli in Affitto APS</title>
   <style>
     :root {
-      --primary: #0284c7;
-      --primary-dark: #0369a1;
-      --bg: #0f172a;
-      --card-bg: #1e293b;
-      --text: #f8fafc;
-      --muted: #94a3b8;
-      --border: #334155;
+      --bg-dark: #121214;
+      --bg-light: #F8F9FA;
+      --card-bg: #FFFFFF;
+      --brand-rose: #D98295;
+      --brand-rose-light: #DFA1AE;
+      --brand-rose-dark: #9F5D6B;
+      --brand-rose-soft: #FCF4F6;
+      --text-main: #18181B;
+      --text-muted: #71717A;
+      --border-color: #E4E4E7;
+      --silver-mask: #E8E7E9;
     }
-    * { box-sizing: border-box; }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
-      font-family: system-ui, -apple-system, sans-serif;
-      background: var(--bg);
-      color: var(--text);
-      margin: 0;
-      padding: 24px 16px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background-color: var(--bg-light);
+      color: var(--text-main);
       line-height: 1.5;
     }
-    .container {
-      max-width: 720px;
+
+    header {
+      background-color: var(--bg-dark);
+      color: #FFFFFF;
+      padding: 24px 20px;
+      border-bottom: 3px solid var(--brand-rose);
+      box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+    }
+    .header-content {
+      max-width: 860px;
       margin: 0 auto;
+      display: flex;
+      align-items: center;
+      gap: 16px;
     }
-    .header {
-      text-align: center;
-      margin-bottom: 28px;
+    .badge-icon {
+      width: 52px;
+      height: 52px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, var(--brand-rose-dark), var(--brand-rose));
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 26px;
+      box-shadow: 0 2px 8px rgba(217, 130, 149, 0.4);
+      flex-shrink: 0;
     }
-    .header h1 {
-      color: #38bdf8;
-      margin: 0 0 8px 0;
-      font-size: 1.75rem;
+    .header-titles h1 {
+      font-size: 20px;
+      font-weight: 700;
+      letter-spacing: 0.5px;
+      color: #FFFFFF;
     }
-    .header p {
-      color: var(--muted);
-      margin: 0;
-      font-size: 0.95rem;
+    .header-titles p {
+      font-size: 13px;
+      color: var(--brand-rose-light);
+      margin-top: 2px;
     }
-    .card {
+
+    main {
+      max-width: 860px;
+      margin: 28px auto 60px;
+      padding: 0 16px;
+    }
+
+    .stepper {
+      display: flex;
+      justify-content: space-between;
+      margin-bottom: 24px;
       background: var(--card-bg);
-      border: 1px solid var(--border);
+      border: 1px solid var(--border-color);
+      border-radius: 10px;
+      padding: 12px 16px;
+      overflow-x: auto;
+      gap: 8px;
+    }
+    .step-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text-muted);
+      white-space: nowrap;
+    }
+    .step-num {
+      width: 24px;
+      height: 24px;
+      border-radius: 50%;
+      background: #E4E4E7;
+      color: #52525B;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 11px;
+    }
+    .step-item.active { color: var(--brand-rose-dark); }
+    .step-item.active .step-num {
+      background: var(--brand-rose);
+      color: #FFFFFF;
+    }
+
+    .form-card {
+      background: var(--card-bg);
+      border: 1px solid var(--border-color);
       border-radius: 12px;
-      padding: 24px;
+      padding: 28px;
+      margin-bottom: 24px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+    }
+    .section-title {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 8px;
+      font-size: 18px;
+      font-weight: 700;
+      color: #121214;
+    }
+    .section-tag {
+      background: var(--brand-rose-soft);
+      color: var(--brand-rose-dark);
+      border: 1px solid #F2CBD3;
+      padding: 2px 8px;
+      border-radius: 6px;
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+    }
+    .section-desc {
+      font-size: 13px;
+      color: var(--text-muted);
       margin-bottom: 20px;
-      box-shadow: 0 4px 12px rgba(0,0,0,0.25);
     }
-    .card h2 {
-      font-size: 1.15rem;
-      color: #38bdf8;
-      margin-top: 0;
-      margin-bottom: 16px;
-      border-bottom: 1px solid var(--border);
-      padding-bottom: 8px;
-    }
-    .grid {
+
+    .grid-2 {
       display: grid;
       grid-template-columns: 1fr 1fr;
-      gap: 14px;
+      gap: 16px;
+      margin-bottom: 16px;
     }
-    @media (max-width: 600px) {
-      .grid { grid-template-columns: 1fr; }
+    .grid-3 {
+      display: grid;
+      grid-template-columns: 2fr 1fr 1fr;
+      gap: 16px;
+      margin-bottom: 16px;
     }
-    .full-width { grid-column: 1 / -1; }
-    label {
+    @media (max-width: 640px) {
+      .grid-2, .grid-3 { grid-template-columns: 1fr; gap: 12px; }
+      .form-card { padding: 20px 16px; }
+    }
+
+    .form-group { margin-bottom: 16px; }
+    .form-group label {
       display: block;
-      font-size: 0.85rem;
-      font-weight: 500;
-      margin-bottom: 4px;
-      color: #e2e8f0;
+      font-size: 13px;
+      font-weight: 600;
+      color: #27272A;
+      margin-bottom: 6px;
     }
-    label span.req { color: #f87171; }
-    input[type="text"], input[type="email"], input[type="tel"], input[type="date"], select, textarea {
+    .form-group label .req { color: #E11D48; margin-left: 2px; }
+    .form-control {
       width: 100%;
       padding: 10px 12px;
-      background: #0f172a;
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      color: #fff;
-      font-size: 0.95rem;
-    }
-    input:focus, select:focus, textarea:focus {
-      outline: none;
-      border-color: var(--primary);
-      box-shadow: 0 0 0 2px rgba(2, 132, 199, 0.3);
-    }
-    .checkbox-group {
-      margin-top: 12px;
-      display: flex;
-      gap: 10px;
-      align-items: flex-start;
-      font-size: 0.85rem;
-      color: #cbd5e1;
-    }
-    .checkbox-group input {
-      margin-top: 3px;
-      accent-color: var(--primary);
-      width: 18px;
-      height: 18px;
-    }
-    .submit-btn {
-      width: 100%;
-      background: var(--primary);
-      color: #fff;
-      font-size: 1.05rem;
-      font-weight: 600;
-      padding: 14px;
-      border: none;
+      border: 1px solid var(--border-color);
       border-radius: 8px;
+      font-size: 14px;
+      color: var(--text-main);
+      background-color: #FFFFFF;
+      transition: border-color 0.15s ease, box-shadow 0.15s ease;
+    }
+    .form-control:focus {
+      outline: none;
+      border-color: var(--brand-rose);
+      box-shadow: 0 0 0 3px rgba(217, 130, 149, 0.2);
+    }
+    textarea.form-control { resize: vertical; min-height: 80px; }
+
+    .info-callout {
+      background: var(--brand-rose-soft);
+      border-left: 4px solid var(--brand-rose);
+      border-radius: 6px;
+      padding: 14px 16px;
+      margin-bottom: 20px;
+      font-size: 13px;
+      color: #3F3F46;
+      line-height: 1.5;
+    }
+    .info-callout strong { color: var(--brand-rose-dark); }
+
+    .delegate-item {
+      background: #FAFAFA;
+      border: 1px solid #E4E4E7;
+      border-radius: 8px;
+      padding: 16px;
+      margin-bottom: 12px;
+      position: relative;
+    }
+    .btn-remove-delegate {
+      background: #FEE2E2;
+      color: #991B1B;
+      border: none;
+      border-radius: 6px;
+      padding: 4px 8px;
+      font-size: 11px;
+      font-weight: 600;
       cursor: pointer;
-      transition: background 0.2s;
+      float: right;
     }
-    .submit-btn:hover {
-      background: var(--primary-dark);
+    .btn-secondary {
+      background: #FFFFFF;
+      color: var(--brand-rose-dark);
+      border: 1px dashed var(--brand-rose);
+      padding: 10px 16px;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
     }
-    .footer-note {
+    .btn-secondary:hover { background: var(--brand-rose-soft); }
+
+    .checkbox-label {
+      display: flex;
+      align-items: flex-start;
+      gap: 12px;
+      margin-bottom: 14px;
+      font-size: 13px;
+      color: #27272A;
+      cursor: pointer;
+    }
+    .checkbox-label input[type="checkbox"] {
+      margin-top: 3px;
+      width: 17px;
+      height: 17px;
+      accent-color: var(--brand-rose);
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+
+    .btn-submit {
+      background: linear-gradient(135deg, var(--brand-rose), var(--brand-rose-dark));
+      color: #FFFFFF;
+      border: none;
+      border-radius: 10px;
+      padding: 16px 28px;
+      font-size: 16px;
+      font-weight: 700;
+      width: 100%;
+      cursor: pointer;
+      box-shadow: 0 4px 14px rgba(217, 130, 149, 0.4);
+      transition: transform 0.15s ease, box-shadow 0.15s ease;
+      letter-spacing: 0.3px;
+    }
+    .btn-submit:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 6px 18px rgba(217, 130, 149, 0.5);
+    }
+
+    .robot-trap {
+      opacity: 0;
+      position: absolute;
+      top: 0;
+      left: 0;
+      height: 0;
+      width: 0;
+      z-index: -1;
+    }
+
+    footer {
+      background-color: var(--bg-dark);
+      color: #A1A1AA;
+      padding: 32px 20px;
+      font-size: 12px;
+      border-top: 1px solid #27272A;
       text-align: center;
-      font-size: 0.8rem;
-      color: var(--muted);
-      margin-top: 16px;
+      line-height: 1.8;
     }
+    footer strong { color: #FFFFFF; }
+    footer a { color: var(--brand-rose-light); text-decoration: none; }
+    footer a:hover { text-decoration: underline; }
   </style>
 </head>
 <body>
-  <div class="container">
-    <div class="header">
-      <h1>Cervelli in Affitto APS</h1>
-      <p>Richiesta di Ammissione a Socio Ordinario & Iscrizione Laboratorio Teatrale</p>
+
+  <header>
+    <div class="header-content">
+      <div class="badge-icon">🎭</div>
+      <div class="header-titles">
+        <h1>Cervelli in Affitto APS</h1>
+        <p>Associazione di Promozione Sociale &bull; Affiliata UILT (Unione Italiana Libero Teatro)</p>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <div class="stepper">
+      <div class="step-item active"><span class="step-num">1</span> Genitore/Tutore</div>
+      <div class="step-item active"><span class="step-num">2</span> Allievo Minore</div>
+      <div class="step-item active"><span class="step-num">3</span> Laboratorio</div>
+      <div class="step-item active"><span class="step-num">4</span> Deleghe Ritiro</div>
+      <div class="step-item active"><span class="step-num">5</span> Consensi & Invio</div>
     </div>
 
-    <form method="POST" action="/iscrizione-minori">
-      <!-- 1. Dati Genitore / Tutore Legale -->
-      <div class="card">
-        <h2>1. Dati del Genitore o Tutore Legale</h2>
-        <div class="grid">
-          <div>
-            <label>Nome <span class="req">*</span></label>
-            <input type="text" name="tutore_nome" required placeholder="Es. Mario">
+    <form method="POST" action="/iscrizione-minori" id="iscrizioneForm">
+
+      <div class="robot-trap">
+        <label for="website">Non compilare questo campo:</label>
+        <input type="text" id="website" name="website" tabindex="-1" autocomplete="off">
+        <input type="text" name="codice_sicurezza_robot" tabindex="-1" autocomplete="off">
+      </div>
+
+      <!-- STEP 1: DATI GENITORE / TUTORE -->
+      <div class="form-card">
+        <div class="section-title">
+          <span>1. Dati Genitore / Tutore Legale</span>
+          <span class="section-tag">Ammissione Socio APS</span>
+        </div>
+        <p class="section-desc">
+          Per iscrivere un allievo minore ai laboratori dell'APS, il genitore o tutore legale richiede l'ammissione in qualita di Socio Ordinario.
+        </p>
+
+        <div class="grid-2">
+          <div class="form-group">
+            <label>Nome genitore/tutore <span class="req">*</span></label>
+            <input type="text" name="genitore_nome" class="form-control" required placeholder="Es. Marco">
           </div>
-          <div>
-            <label>Cognome <span class="req">*</span></label>
-            <input type="text" name="tutore_cognome" required placeholder="Es. Rossi">
+          <div class="form-group">
+            <label>Cognome genitore/tutore <span class="req">*</span></label>
+            <input type="text" name="genitore_cognome" class="form-control" required placeholder="Es. Rossi">
           </div>
-          <div>
-            <label>Codice Fiscale <span class="req">*</span></label>
-            <input type="text" name="tutore_cf" maxlength="16" required placeholder="Codice fiscale tutore" style="text-transform: uppercase;">
+        </div>
+
+        <div class="grid-2">
+          <div class="form-group">
+            <label>Codice Fiscale genitore <span class="req">*</span></label>
+            <input type="text" name="genitore_cf" class="form-control" maxlength="16" required placeholder="Es. RSSMRC80A01H501U" style="text-transform: uppercase;">
           </div>
-          <div>
-            <label>Ruolo <span class="req">*</span></label>
-            <select name="tutore_ruolo">
-              <option value="genitore">Genitore</option>
-              <option value="tutore_legale">Tutore Legale</option>
+          <div class="form-group">
+            <label>Ruolo / Grado parentela <span class="req">*</span></label>
+            <select name="genitore_ruolo" class="form-control" required>
+              <option value="genitore">Genitore (Madre / Padre)</option>
+              <option value="tutore_legale">Tutore Legale / Esercente potesta</option>
             </select>
           </div>
-          <div>
-            <label>Telefono Cellulare <span class="req">*</span></label>
-            <input type="tel" name="tutore_telefono" required placeholder="Es. 333 1234567">
+        </div>
+
+        <div class="grid-2">
+          <div class="form-group">
+            <label>Telefono / Cellulare per comunicazioni <span class="req">*</span></label>
+            <input type="tel" name="genitore_telefono" class="form-control" required placeholder="Es. 333 1234567">
           </div>
-          <div>
-            <label>Email per comunicazioni <span class="req">*</span></label>
-            <input type="email" name="tutore_email" required placeholder="nome@email.it">
+          <div class="form-group">
+            <label>Email per conferme e delibera <span class="req">*</span></label>
+            <input type="email" name="genitore_email" class="form-control" required placeholder="Es. marco.rossi@email.it">
           </div>
-          <div class="full-width">
-            <label>Indirizzo di Residenza <span class="req">*</span></label>
-            <input type="text" name="tutore_indirizzo" required placeholder="Es. Via Roma, 10">
+        </div>
+
+        <div class="form-group">
+          <label>Indirizzo di residenza (Via/Piazza e civico) <span class="req">*</span></label>
+          <input type="text" name="genitore_indirizzo" class="form-control" required placeholder="Es. Via Roma 10">
+        </div>
+
+        <div class="grid-3">
+          <div class="form-group">
+            <label>Comune di residenza <span class="req">*</span></label>
+            <input type="text" name="genitore_citta" class="form-control" required placeholder="Es. Bologna">
           </div>
-          <div>
-            <label>Città <span class="req">*</span></label>
-            <input type="text" name="tutore_citta" required placeholder="Es. Mantova">
-          </div>
-          <div>
+          <div class="form-group">
             <label>CAP <span class="req">*</span></label>
-            <input type="text" name="tutore_cap" maxlength="5" required placeholder="Es. 46100">
+            <input type="text" name="genitore_cap" class="form-control" maxlength="5" required placeholder="40100">
           </div>
-          <div class="full-width">
+          <div class="form-group">
             <label>Provincia <span class="req">*</span></label>
-            <input type="text" name="tutore_provincia" maxlength="2" required placeholder="MN" style="text-transform: uppercase; width: 100px;">
+            <input type="text" name="genitore_provincia" class="form-control" maxlength="2" required placeholder="BO" style="text-transform: uppercase;">
           </div>
         </div>
       </div>
 
-      <!-- 2. Dati Allievo Minorenne -->
-      <div class="card">
-        <h2>2. Dati dell'Allievo/a (Minore)</h2>
-        <div class="grid">
-          <div>
-            <label>Nome Minore <span class="req">*</span></label>
-            <input type="text" name="minore_nome" required placeholder="Nome bambino/a">
+      <!-- STEP 2: DATI ALLIEVO MINORE -->
+      <div class="form-card">
+        <div class="section-title">
+          <span>2. Dati dell'Allievo/a (Minore)</span>
+          <span class="section-tag">Socio Minore</span>
+        </div>
+        <p class="section-desc">
+          I minori iscritti ai corsi vengono associati all'APS e tesserati UILT per la necessaria copertura assicurativa infortuni e RC.
+        </p>
+
+        <div class="grid-2">
+          <div class="form-group">
+            <label>Nome allievo/a <span class="req">*</span></label>
+            <input type="text" name="minore_nome" class="form-control" required placeholder="Es. Sofia">
           </div>
-          <div>
-            <label>Cognome Minore <span class="req">*</span></label>
-            <input type="text" name="minore_cognome" required placeholder="Cognome bambino/a">
+          <div class="form-group">
+            <label>Cognome allievo/a <span class="req">*</span></label>
+            <input type="text" name="minore_cognome" class="form-control" required placeholder="Es. Rossi">
           </div>
-          <div>
-            <label>Codice Fiscale Minore <span class="req">*</span></label>
-            <input type="text" name="minore_cf" maxlength="16" required placeholder="Codice fiscale minore" style="text-transform: uppercase;">
+        </div>
+
+        <div class="grid-2">
+          <div class="form-group">
+            <label>Codice Fiscale allievo/a <span class="req">*</span></label>
+            <input type="text" name="minore_cf" class="form-control" maxlength="16" required placeholder="Es. RSSFSO15M41H501Z" style="text-transform: uppercase;">
           </div>
-          <div>
-            <label>Data di Nascita <span class="req">*</span></label>
-            <input type="date" name="minore_data_nascita" required>
+          <div class="form-group">
+            <label>Data di nascita <span class="req">*</span></label>
+            <input type="date" name="minore_data_nascita" class="form-control" required>
           </div>
-          <div class="full-width">
-            <label>Luogo di Nascita <span class="req">*</span></label>
-            <input type="text" name="minore_luogo_nascita" required placeholder="Città di nascita">
-          </div>
-          <div class="full-width">
-            <label>Seleziona Attività / Corso <span class="req">*</span></label>
-            <select name="corso_id">
-              ${optionsCorsi}
-            </select>
-          </div>
-          <div class="full-width">
-            <label>Eventuali note o segnalazioni</label>
-            <textarea name="note" rows="2" placeholder="Indicazioni utili, esigenze particolari o orari"></textarea>
-          </div>
+        </div>
+
+        <div class="form-group">
+          <label>Luogo di nascita (Comune o Stato estero)</label>
+          <input type="text" name="minore_luogo_nascita" class="form-control" placeholder="Es. Bologna">
+        </div>
+
+        <div class="form-group">
+          <label>Note utili per gli insegnanti (allergie, esigenze particolari o bisogni educativi)</label>
+          <textarea name="minore_note" class="form-control" placeholder="Segnala eventuali aspetti importanti per il benessere del bambino/a durante l'attivita"></textarea>
         </div>
       </div>
 
-      <!-- 3. Statuto e Consensi Privacy -->
-      <div class="card">
-        <h2>3. Statuto e Consensi di Legge</h2>
-        
-        <div class="checkbox-group">
-          <input type="checkbox" id="statuto" name="accetta_statuto" value="1" required checked>
-          <label for="statuto">
-            <strong>Richiesta di ammissione socio & Accettazione Statuto</strong> <span class="req">*</span><br>
-            In qualità di genitore/tutore, richiedo l'ammissione dell'allievo/a quale Socio Ordinario di Cervelli in Affitto APS, dichiarando di conoscere e approvare lo Statuto e i regolamenti associativi.
-          </label>
+      <!-- STEP 3: SELEZIONE LABORATORIO -->
+      <div class="form-card">
+        <div class="section-title">
+          <span>3. Laboratorio Teatrale</span>
+          <span class="section-tag">Attivita APS</span>
         </div>
+        <p class="section-desc">Seleziona il gruppo o laboratorio a cui intendi iscrivere l'allievo/a.</p>
 
-        <div class="checkbox-group">
-          <input type="checkbox" id="privacy" name="privacy_dati" value="1" required checked>
-          <label for="privacy">
-            <strong>Trattamento dei Dati Personali (GDPR)</strong> <span class="req">*</span><br>
-            Acconsento al trattamento dei dati personali forniti ai fini dell'iscrizione, della gestione del libro soci e delle coperture assicurative obbligatorie con l'ente affiliante UILT.
-          </label>
-        </div>
-
-        <div class="checkbox-group">
-          <input type="checkbox" id="foto" name="privacy_foto" value="1">
-          <label for="foto">
-            <strong>Liberatoria Foto e Video per attività teatrali</strong><br>
-            Autorizzo riprese fotografiche e video effettuate durante saggi, prove e spettacoli del laboratorio per sole finalità promozionali e istituzionali dell'APS (senza fini di lucro).
-          </label>
+        <div class="form-group">
+          <label>Corso prescelto <span class="req">*</span></label>
+          <select name="corso_id" class="form-control" required>
+            ${opzioniCorsi}
+          </select>
         </div>
       </div>
 
-      <button type="submit" class="submit-btn">Invia Richiesta di Iscrizione &rarr;</button>
+      <!-- STEP 4: DELEGHE AL RITIRO -->
+      <div class="form-card">
+        <div class="section-title">
+          <span>4. Deleghe al Ritiro dell'Allievo/a</span>
+          <span class="section-tag">Sicurezza Minori</span>
+        </div>
+        <p class="section-desc">
+          Indica le persone maggiorenni autorizzate a ritirare il minore al termine delle lezioni oltre ai genitori (es. nonni, zii, amici di famiglia).
+        </p>
+
+        <div id="delegheContainer"></div>
+
+        <button type="button" class="btn-secondary" id="btnAddDelega" onclick="addDelegaBlock()">
+          + Aggiungi una persona delegata al ritiro
+        </button>
+      </div>
+
+      <!-- STEP 5: STATUTO, PRIVACY & CONSENSI -->
+      <div class="form-card">
+        <div class="section-title">
+          <span>5. Statuto dell'APS, Privacy & Consensi</span>
+          <span class="section-tag">Conformita di Legge</span>
+        </div>
+
+        <div class="info-callout">
+          <strong>Trasparenza Associativa:</strong> Con l'invio del presente modulo richiedi formalmente l'ammissione all'Associazione di Promozione Sociale "Cervelli in Affitto APS" per l'anno sociale in corso, dichiarando di condividerne le finalita educative, culturali e teatrali.
+        </div>
+
+        <label class="checkbox-label">
+          <input type="checkbox" name="consenso_statuto" value="1" required checked>
+          <span>
+            <strong>Adesione allo Statuto dell'APS <span class="req">*</span>:</strong>
+            Dichiaro di aver preso visione dello Statuto di Cervelli in Affitto APS, di accettarne le norme e i regolamenti interni e di richiedere l'ammissione a socio per me e per il minore rappresentato.
+          </span>
+        </label>
+
+        <label class="checkbox-label">
+          <input type="checkbox" name="consenso_privacy" value="1" required checked>
+          <span>
+            <strong>Informativa Privacy GDPR <span class="req">*</span>:</strong>
+            Acconsento al trattamento dei dati personali forniti per le finalita connesse alla gestione associativa, all'affiliazione e assicurazione UILT e alla partecipazione al laboratorio teatrale.
+          </span>
+        </label>
+
+        <label class="checkbox-label">
+          <input type="checkbox" name="consenso_foto" value="1" checked>
+          <span>
+            <strong>Liberatoria Foto e Video Teatrali (consigliato):</strong>
+            Autorizzo l'APS a effettuare riprese fotografiche e video esclusivamente a scopo documentativo interno e per saggi teatrali di fine corso.
+          </span>
+        </label>
+
+        <label class="checkbox-label">
+          <input type="checkbox" name="consenso_news" value="1">
+          <span>
+            <strong>Comunicazioni su spettacoli ed eventi:</strong>
+            Desidero ricevere via email gli inviti e le date degli spettacoli teatrali dell'APS.
+          </span>
+        </label>
+
+        <div style="margin-top: 24px;">
+          <button type="submit" class="btn-submit">
+            Invia Domanda di Iscrizione & Ammissione Socio
+          </button>
+        </div>
+      </div>
+
     </form>
+  </main>
 
-    <div class="footer-note">
-      Cervelli in Affitto APS - Codice Fiscale & Associazione di Promozione Sociale affiliata UILT.<br>
-      Tutti i dati sono protetti in conformità al Regolamento UE 2016/679 (GDPR).
-    </div>
-  </div>
+  <footer>
+    <p>
+      <strong>Cervelli in Affitto APS</strong> &bull; Associazione di Promozione Sociale<br>
+      Affiliata UILT (Unione Italiana Libero Teatro) &bull; Dominio ufficiale: <a href="https://cervellinaffitto-aps.it" target="_blank">cervellinaffitto-aps.it</a><br>
+      Codice Fiscale: <strong>92095900518</strong> &bull; Tutti i diritti riservati
+    </p>
+  </footer>
+
+  <script>
+    let delegaCount = 0;
+    function addDelegaBlock() {
+      delegaCount++;
+      const container = document.getElementById('delegheContainer');
+      const div = document.createElement('div');
+      div.className = 'delegate-item';
+      div.id = 'delega_' + delegaCount;
+      div.innerHTML = \`
+        <button type="button" class="btn-remove-delegate" onclick="removeDelega('delega_\${delegaCount}')">Rimuovi</button>
+        <strong style="display:block; margin-bottom: 10px; color: #121214; font-size: 13px;">Persona Delegata #\${delegaCount}</strong>
+        <div class="grid-2">
+          <div class="form-group" style="margin-bottom:8px;">
+            <label style="font-size:12px;">Nome <span class="req">*</span></label>
+            <input type="text" name="delega_nome[]" class="form-control" required placeholder="Es. Anna">
+          </div>
+          <div class="form-group" style="margin-bottom:8px;">
+            <label style="font-size:12px;">Cognome <span class="req">*</span></label>
+            <input type="text" name="delega_cognome[]" class="form-control" required placeholder="Es. Bianchi">
+          </div>
+        </div>
+        <div class="grid-2">
+          <div class="form-group" style="margin-bottom:0;">
+            <label style="font-size:12px;">Telefono di reperibilita <span class="req">*</span></label>
+            <input type="tel" name="delega_telefono[]" class="form-control" required placeholder="Es. 347 9876543">
+          </div>
+          <div class="form-group" style="margin-bottom:0;">
+            <label style="font-size:12px;">Relazione con l'allievo/a</label>
+            <input type="text" name="delega_relazione[]" class="form-control" placeholder="Es. Nonna / Zio / Amica di famiglia">
+          </div>
+        </div>
+      \`;
+      container.appendChild(div);
+    }
+
+    function removeDelega(id) {
+      const el = document.getElementById(id);
+      if (el) el.remove();
+    }
+  </script>
+
 </body>
 </html>`;
-
-  return new Response(html, {
-    headers: { "Content-Type": "text/html; charset=utf-8" }
-  });
+  return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
 }
 
-/* =========================================================================
-   PAGINA DI SUCCESSO
-   ========================================================================= */
-function renderSuccessPage(nomeMinore) {
+function renderSuccessPage(nomeMinore, email) {
   const html = `<!DOCTYPE html>
 <html lang="it">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Iscrizione Ricevuta - Cervelli in Affitto APS</title>
+  <title>Iscrizione Ricevuta | Cervelli in Affitto APS</title>
   <style>
     body {
-      font-family: system-ui, -apple-system, sans-serif;
-      background: #0f172a;
-      color: #f8fafc;
-      display: grid;
-      place-content: center;
-      min-height: 100vh;
-      margin: 0;
-      padding: 16px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background-color: #F8F9FA;
+      color: #18181B;
+      margin: 0; padding: 20px;
+      display: flex; align-items: center; justify-content: center; min-height: 100vh;
     }
     .card {
-      background: #1e293b;
-      border: 1px solid #334155;
+      background: #FFFFFF;
+      max-width: 580px; width: 100%;
       border-radius: 12px;
-      padding: 32px;
-      max-width: 520px;
+      border: 1px solid #E4E4E7;
+      padding: 36px 28px;
       text-align: center;
-      box-shadow: 0 4px 16px rgba(0,0,0,0.3);
+      box-shadow: 0 4px 16px rgba(0,0,0,0.06);
     }
     .icon {
-      font-size: 3rem;
-      margin-bottom: 12px;
+      width: 64px; height: 64px;
+      border-radius: 50%;
+      background: #ECFDF5;
+      color: #059669;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 32px;
+      margin: 0 auto 20px;
     }
-    h1 {
-      color: #38bdf8;
-      margin: 0 0 12px 0;
-      font-size: 1.5rem;
+    h1 { font-size: 22px; color: #121214; margin-bottom: 12px; }
+    p { font-size: 14px; color: #52525B; line-height: 1.6; margin-bottom: 16px; }
+    .box {
+      background: #FCF4F6;
+      border-left: 4px solid #D98295;
+      text-align: left;
+      padding: 16px;
+      border-radius: 6px;
+      margin: 24px 0;
+      font-size: 13px;
     }
-    p {
-      color: #cbd5e1;
-      line-height: 1.6;
-      font-size: 0.95rem;
-    }
-    .badge {
-      display: inline-block;
-      background: rgba(56, 189, 248, 0.15);
-      color: #38bdf8;
-      padding: 6px 14px;
-      border-radius: 20px;
-      font-weight: 600;
-      margin: 12px 0;
-    }
+    .box strong { color: #9F5D6B; }
     .btn {
       display: inline-block;
-      margin-top: 20px;
-      background: #0284c7;
-      color: #fff;
-      padding: 10px 20px;
-      border-radius: 6px;
+      background: #121214;
+      color: #FFFFFF;
+      padding: 12px 24px;
+      border-radius: 8px;
       text-decoration: none;
-      font-weight: 500;
+      font-size: 14px;
+      font-weight: 600;
     }
-    .btn:hover { background: #0369a1; }
   </style>
 </head>
 <body>
   <div class="card">
-    <div class="icon">🎭</div>
-    <h1>Richiesta Ricevuta con Successo!</h1>
-    <div class="badge">Allievo/a: ${nomeMinore}</div>
+    <div class="icon">✓</div>
+    <h1>Richiesta Registrata con Successo!</h1>
     <p>
-      La richiesta di ammissione a socio ordinario e l'iscrizione al laboratorio teatrale sono state registrate nel sistema.
+      La domanda di ammissione e iscrizione al laboratorio per <strong>${nomeMinore}</strong> e stata registrata correttamente nel gestionale associativo.
     </p>
-    <p style="font-size: 0.85rem; color: #94a3b8;">
-      Abbiamo inviato un'email di riepilogo al genitore/tutore. Il Consiglio Direttivo provvederà alla delibera associativa e riceverai a breve tutte le informazioni organizzative.
-    </p>
-    <a href="/" class="btn">&larr; Torna alla pagina iniziale</a>
+    ${email ? `<p style="font-size:13px; color:#71717A;">Abbiamo inviato un'email di riepilogo all'indirizzo <strong>${email}</strong>.</p>` : ''}
+    <div class="box">
+      <strong>Cosa succede adesso?</strong>
+      <ol style="margin: 8px 0 0 18px; padding: 0; color: #4A4A50; line-height: 1.6;">
+        <li>Il Consiglio Direttivo dell'APS deliberera formalmente la richiesta di ammissione socio.</li>
+        <li>L'allievo/a verra registrato presso la federazione teatrale <strong>UILT</strong> per l'attivazione della copertura assicurativa obbligatoria.</li>
+        <li>La segreteria ti contattera per fornirti il calendario delle lezioni e le indicazioni sul saldo della quota.</li>
+      </ol>
+    </div>
+    <a href="/" class="btn">Torna al modulo principale</a>
   </div>
 </body>
 </html>`;
+  return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+}
 
-  return new Response(html, {
-    headers: { "Content-Type": "text/html; charset=utf-8" }
-  });
+function renderErrorPage(messaggio) {
+  return `<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8">
+  <title>Attenzione | Cervelli in Affitto APS</title>
+  <style>
+    body { font-family: sans-serif; background: #F8F9FA; padding: 30px; text-align: center; }
+    .box { max-width: 500px; margin: 40px auto; background: #fff; padding: 30px; border-radius: 10px; border: 1px solid #E4E4E7; }
+    h2 { color: #DC2626; margin-bottom: 12px; }
+    p { font-size: 14px; color: #4B5563; line-height: 1.5; margin-bottom: 20px; }
+    a { display: inline-block; background: #121214; color: #fff; padding: 10px 20px; text-decoration: none; border-radius: 6px; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h2>Attenzione</h2>
+    <p>${messaggio}</p>
+    <a href="javascript:history.back()">Torna indietro e correggi</a>
+  </div>
+</body>
+</html>`;
 }
