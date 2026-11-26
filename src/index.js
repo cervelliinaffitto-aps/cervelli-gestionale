@@ -292,6 +292,9 @@ async function handleLoginPost(request, env) {
    ========================================================================= */
 
 async function renderAdminDashboard(env, utente, url) {
+  const currentView = url.searchParams.get("view") || "domande";
+  const msgParam = url.searchParams.get("msg");
+
   let domande = [];
   try {
     const { results } = await env.DB.prepare(`
@@ -362,224 +365,627 @@ async function renderAdminDashboard(env, utente, url) {
   const inAttesa = domande.filter((d) => d.stato_richiesta === "in_attesa").length;
   const approvate = domande.filter((d) => d.stato_richiesta === "approvato").length;
 
-  const msgParam = url.searchParams.get("msg");
   let msgNotifica = "";
   if (msgParam === "delibera_ok") {
-    msgNotifica = `<div class="alert-success">Delibera Consiglio Direttivo salvata con successo! Il socio &egrave; ora tesserato.</div>`;
+    msgNotifica = `<div class="alert-success">✓ Delibera Consiglio Direttivo registrata con successo! Il socio è ora approvato e tesserato.</div>`;
   }
 
-  const righeDomande = domande.length === 0
-    ? `<tr><td colspan="7" style="text-align: center; padding: 32px; color: #71717A;">Nessuna domanda ricevuta al momento.</td></tr>`
-    : domande.map((d) => {
-        const dList = delegheMap[d.socio_id] || [];
-        const delegheText = dList.length > 0
-          ? dList.map((x) => `<span class="tag-delegato">${x}</span>`).join("<br>")
-          : `<span style="color: #9CA3AF; font-size: 11px;">Nessuna delega</span>`;
+  const menuSections = [
+    {
+      id: "macro1",
+      titolo: "Soci & Libro Soci",
+      colore: "#D98295",
+      icona: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>`,
+      voci: [
+        { id: "domande", etichetta: "1.1 Domande Ammissione", badge: inAttesa > 0 ? inAttesa : null },
+        { id: "libro_soci", etichetta: "1.2 Registro Libro Soci", badge: null },
+        { id: "schede_soci", etichetta: "1.3 Schede Soci & Minori", badge: null },
+        { id: "quote_uilt", etichetta: "1.4 Quote & Tessere UILT", badge: null }
+      ]
+    },
+    {
+      id: "macro2",
+      titolo: "Attività & Corsi",
+      colore: "#38BDF8",
+      icona: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>`,
+      voci: [
+        { id: "corsi", etichetta: "2.1 Corsi & Laboratori", badge: null },
+        { id: "presenze", etichetta: "2.2 Presenze & Iscritti", badge: null }
+      ]
+    },
+    {
+      id: "macro3",
+      titolo: "Eventi, Teatro & Casse",
+      colore: "#F59E0B",
+      icona: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="4" width="20" height="16" rx="2"/><line x1="2" y1="10" x2="22" y2="10"/></svg>`,
+      voci: [
+        { id: "spettacoli", etichetta: "3.1 Spettacoli Teatrali", badge: null },
+        { id: "eventi_altri", etichetta: "3.2 Eventi Altri & Cene", badge: null },
+        { id: "cassa_teatro", etichetta: "3.3 Cassa Spettacoli", badge: null },
+        { id: "cassa_eventi", etichetta: "3.4 Cassa Eventi Generali", badge: null }
+      ]
+    },
+    {
+      id: "macro4",
+      titolo: "Builder & Contenuti",
+      colore: "#10B981",
+      icona: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>`,
+      voci: [
+        { id: "form_builder", etichetta: "4.1 Form Builder Dinamico", badge: null },
+        { id: "tema_builder", etichetta: "4.2 Builder Tema & Brand", badge: "Prossimo" },
+        { id: "pagine_pubbliche", etichetta: "4.3 Pagine Pubbliche & Home", badge: null },
+        { id: "email_template", etichetta: "4.4 Template Email", badge: null }
+      ]
+    },
+    {
+      id: "macro5",
+      titolo: "Sistema & Utenti",
+      colore: "#818CF8",
+      icona: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>`,
+      voci: [
+        { id: "utenti", etichetta: "5.1 Utenti & Ruoli", badge: null },
+        { id: "log", etichetta: "5.2 Registro Log Attività", badge: null },
+        { id: "database", etichetta: "5.3 Backup & Database D1", badge: null }
+      ]
+    }
+  ];
 
-        const cons = consensiMap[d.socio_id];
-        const fotoVideoTag = cons && cons.consenso_foto_video === 1
-          ? `<span class="badge-pill bg-green">Foto/Video: SI</span>`
-          : `<span class="badge-pill bg-gray">Foto/Video: NO</span>`;
+  let currentTitle = "1.1 Domande di Ammissione & Minori";
+  let currentMacro = "Soci & Libro Soci";
+  let currentMacroColor = "#D98295";
 
-        const isApprovata = d.stato_richiesta === "approvato";
-        const badgeStato = isApprovata
-          ? `<span class="badge-pill bg-green">Socio Approvato</span>`
-          : `<span class="badge-pill bg-amber">In Attesa Delibera</span>`;
+  menuSections.forEach((sec) => {
+    sec.voci.forEach((v) => {
+      if (v.id === currentView) {
+        currentTitle = v.etichetta;
+        currentMacro = sec.titolo;
+        currentMacroColor = sec.colore;
+      }
+    });
+  });
 
-        const moduloAzione = isApprovata
-          ? `<div class="delibera-info">
-               <div>Data: <strong>${d.data_delibera || "N.D."}</strong></div>
-               <div>Verbale: <strong>${d.numero_verbale || "N.D."}</strong></div>
-               <div>Tessera APS: <strong class="tessera-highlight">#${d.numero_tessera_aps || "N.D."}</strong></div>
-             </div>`
-          : `<form method="POST" action="/admin/delibera" class="form-delibera">
-               <input type="hidden" name="socio_id" value="${d.socio_id}">
-               <div class="form-row">
-                 <label>Data Delibera:
-                   <input type="date" name="data_delibera" value="${new Date().toISOString().slice(0, 10)}" required>
-                 </label>
-                 <label>Verbale N°:
-                   <input type="text" name="numero_verbale" placeholder="Es. 04/2026" required>
-                 </label>
-               </div>
-               <div class="form-row">
-                 <label>N° Tessera APS:
-                   <input type="text" name="numero_tessera_aps" placeholder="Es. 2026-042" required>
-                 </label>
-                 <button type="submit" class="btn-approva">Approva & Tessereggia</button>
-               </div>
-             </form>`;
+  const sidebarNavHtml = menuSections.map((sec) => {
+    const isAnyActive = sec.voci.some((v) => v.id === currentView);
+    const subItems = sec.voci.map((v) => {
+      const activeClass = v.id === currentView ? "active" : "";
+      const badgeHtml = v.badge ? `<span class="nav-badge ${v.badge === "Prossimo" ? "badge-next" : ""}">${v.badge}</span>` : "";
+      return `<a href="/admin?view=${v.id}" class="nav-sub-item ${activeClass}">
+        <span class="sub-dot" style="background: ${sec.colore};"></span>
+        <span class="sub-text">${v.etichetta}</span>
+        ${badgeHtml}
+      </a>`;
+    }).join("");
 
-        return `
-          <tr>
-            <td>
-              <strong>${d.minore_nome} ${d.minore_cognome}</strong><br>
-              <span class="text-sub">CF: ${d.minore_cf}</span><br>
-              <span class="text-sub">Nascita: ${d.minore_nascita || "N.D."} (${d.minore_luogo || "N.D."})</span>
-            </td>
-            <td>
-              <strong>${d.tutore_nome || "N.D."} ${d.tutore_cognome || ""}</strong> (${d.grado_parentela || "Genitore"})<br>
-              <span class="text-sub">CF: ${d.tutore_cf || "N.D."}</span><br>
-              <span class="text-sub">Tel: ${d.tutore_telefono || "N.D."}</span><br>
-              <span class="text-sub">Email: ${d.tutore_email || "N.D."}</span>
-            </td>
-            <td>
-              <strong>${d.corso_titolo || "Laboratorio Teatrale"}</strong><br>
-              <span class="text-sub">Data domanda: ${d.data_domanda ? d.data_domanda.slice(0, 10) : "Oggi"}</span>
-            </td>
-            <td>${delegheText}</td>
-            <td>
-              <span class="badge-pill bg-green">Statuto: SI</span>
-              <span class="badge-pill bg-green">Privacy: SI</span><br>
-              ${fotoVideoTag}
-            </td>
-            <td>${badgeStato}</td>
-            <td>${moduloAzione}</td>
-          </tr>
-        `;
-      }).join("");
+    return `
+      <div class="nav-group ${isAnyActive ? "expanded" : ""}">
+        <div class="nav-group-header" onclick="this.parentElement.classList.toggle('expanded')">
+          <div class="nav-group-title">
+            <span class="nav-icon" style="color: ${sec.colore};">${sec.icona}</span>
+            <span class="nav-group-name">${sec.titolo}</span>
+          </div>
+          <svg class="chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+        </div>
+        <div class="nav-group-sub">
+          ${subItems}
+        </div>
+      </div>
+    `;
+  }).join("");
+
+  let mainContentHtml = "";
+
+  if (currentView === "domande") {
+    const righeDomande = domande.length === 0
+      ? `<tr><td colspan="7" style="text-align: center; padding: 36px; color: #71717A;">Nessuna domanda ricevuta al momento.</td></tr>`
+      : domande.map((d) => {
+          const dList = delegheMap[d.socio_id] || [];
+          const delegheText = dList.length > 0
+            ? dList.map((x) => `<span class="tag-delegato">${x}</span>`).join("<br>")
+            : `<span style="color: #9CA3AF; font-size: 11px;">Nessuna delega</span>`;
+
+          const cons = consensiMap[d.socio_id];
+          const fotoVideoTag = cons && cons.consenso_foto_video === 1
+            ? `<span class="badge-pill bg-green">Foto/Video: SI</span>`
+            : `<span class="badge-pill bg-gray">Foto/Video: NO</span>`;
+
+          const isApprovata = d.stato_richiesta === "approvato";
+          const badgeStato = isApprovata
+            ? `<span class="badge-pill bg-green">Socio Approvato</span>`
+            : `<span class="badge-pill bg-amber">In Attesa Delibera</span>`;
+
+          const moduloAzione = isApprovata
+            ? `<div class="delibera-info">
+                 <div>Data: <strong>${d.data_delibera || "N.D."}</strong></div>
+                 <div>Verbale: <strong>${d.numero_verbale || "N.D."}</strong></div>
+                 <div>Tessera APS: <strong class="tessera-highlight">#${d.numero_tessera_aps || "N.D."}</strong></div>
+               </div>`
+            : `<form method="POST" action="/admin/delibera" class="form-delibera">
+                 <input type="hidden" name="socio_id" value="${d.socio_id}">
+                 <div class="form-row">
+                   <label>Data Delibera:
+                     <input type="date" name="data_delibera" value="${new Date().toISOString().slice(0, 10)}" required>
+                   </label>
+                   <label>Verbale N°:
+                     <input type="text" name="numero_verbale" placeholder="Es. 04/2026" required>
+                   </label>
+                 </div>
+                 <div class="form-row">
+                   <label>N° Tessera APS:
+                     <input type="text" name="numero_tessera_aps" placeholder="Es. 2026-042" required>
+                   </label>
+                   <button type="submit" class="btn-approva">Approva &amp; Tessera</button>
+                 </div>
+               </form>`;
+
+          return `
+            <tr>
+              <td>
+                <strong>${d.minore_nome} ${d.minore_cognome}</strong><br>
+                <span class="text-sub">CF: ${d.minore_cf}</span><br>
+                <span class="text-sub">Nascita: ${d.minore_nascita || "N.D."} (${d.minore_luogo || "N.D."})</span>
+              </td>
+              <td>
+                <strong>${d.tutore_nome || "N.D."} ${d.tutore_cognome || ""}</strong> (${d.grado_parentela || "Genitore"})<br>
+                <span class="text-sub">CF: ${d.tutore_cf || "N.D."}</span><br>
+                <span class="text-sub">Tel: ${d.tutore_telefono || "N.D."}</span><br>
+                <span class="text-sub">Email: ${d.tutore_email || "N.D."}</span>
+              </td>
+              <td>
+                <strong>${d.corso_titolo || "Laboratorio Teatrale"}</strong><br>
+                <span class="text-sub">Data domanda: ${d.data_domanda ? d.data_domanda.slice(0, 10) : "Oggi"}</span>
+              </td>
+              <td>${delegheText}</td>
+              <td>
+                <span class="badge-pill bg-green">Statuto: SI</span>
+                <span class="badge-pill bg-green">Privacy: SI</span><br>
+                ${fotoVideoTag}
+              </td>
+              <td>${badgeStato}</td>
+              <td>${moduloAzione}</td>
+            </tr>
+          `;
+        }).join("");
+
+    mainContentHtml = `
+      <div class="stats-grid">
+        <div class="stat-card">
+          <div class="stat-label">DOMANDE RICEVUTE</div>
+          <div class="stat-value">${totDomande}</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">IN ATTESA DI DELIBERA CD</div>
+          <div class="stat-value" style="color: #F59E0B;">${inAttesa}</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">SOCI APPROVATI &amp; TESSERATI</div>
+          <div class="stat-value" style="color: #10B981;">${approvate}</div>
+        </div>
+      </div>
+
+      <div class="card-table">
+        <div class="card-header-table">
+          <div>
+            <h3>Libro Soci • Domande di Ammissione e Iscrizioni Minori</h3>
+            <p>Affiliazione UILT • Flusso Ufficiale Delibere Consiglio Direttivo APS</p>
+          </div>
+        </div>
+
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr>
+                <th>Allievo Minore</th>
+                <th>Genitore / Tutore</th>
+                <th>Corso Selezionato</th>
+                <th>Deleghe al Ritiro</th>
+                <th>Consensi Privacy</th>
+                <th>Stato Domanda</th>
+                <th style="min-width: 250px;">Azione Delibera Consiglio Direttivo</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${righeDomande}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    `;
+  } else {
+    mainContentHtml = `
+      <div class="placeholder-card">
+        <div class="placeholder-icon" style="background: ${currentMacroColor}20; color: ${currentMacroColor};">
+          <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
+        </div>
+        <h2>${currentTitle}</h2>
+        <div class="placeholder-meta">
+          <span class="tag-macro" style="background: ${currentMacroColor}15; color: ${currentMacroColor}; border: 1px solid ${currentMacroColor}40;">
+            Macro-Area: ${currentMacro}
+          </span>
+          <span class="tag-status">Struttura Sidebar Ufficiale della Bibbia</span>
+        </div>
+        <p class="placeholder-desc">
+          Questa sezione è già perfettamente inserita e mappata nella struttura della Sidebar. 
+          Nei prossimi passaggi della roadmap collegheremo la configurazione D1 per gestire i contenuti e i dati direttamente da qui.
+        </p>
+        <div class="placeholder-roadmap">
+          <h4>Prossimi Step Immediati da Roadmap:</h4>
+          <ul>
+            <li><strong>Passo 2:</strong> Tabella D1 Configurazione &amp; Dati Fiscali dell'APS</li>
+            <li><strong>Passo 3:</strong> Sezione 4.2 Builder Tema &amp; Identità Visiva (Palette colori e logo caricabile)</li>
+            <li><strong>Passo 4:</strong> Sezione 4.1 Form Builder Dinamico per creare e modificare i moduli soci/corsi</li>
+          </ul>
+        </div>
+        <div style="margin-top: 24px;">
+          <a href="/admin?view=domande" class="btn-primary" style="display: inline-block; text-decoration: none;">
+            Torna a 1.1 Domande di Ammissione
+          </a>
+        </div>
+      </div>
+    `;
+  }
 
   const html = `<!DOCTYPE html>
 <html lang="it">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Dashboard Amministrativa | Cervelli in Affitto APS</title>
+  <title>${currentTitle} | Gestionale Cervelli in Affitto APS</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
   <style>
     :root {
       --bg-dark: #121214;
+      --bg-sidebar: #18181B;
+      --bg-card-dark: #1C1C1F;
       --brand-rose: #D98295;
       --brand-rose-dark: #9F5D6B;
       --brand-rose-light: #FDF2F4;
       --silver: #E8E7E9;
+      --border-dark: #27272A;
       --text-dark: #18181B;
       --text-muted: #71717A;
-      --bg-light: #F4F4F5;
+      --bg-light: #F8F9FA;
       --border-light: #E4E4E7;
       --success: #15803D;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
       font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      background-color: var(--bg-light);
+      background: var(--bg-light);
       color: var(--text-dark);
-      line-height: 1.5;
+      display: flex;
       min-height: 100vh;
+      overflow-x: hidden;
     }
-    header {
+
+    /* Top Bar */
+    .topbar {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 64px;
       background: var(--bg-dark);
-      color: #fff;
-      padding: 16px 24px;
+      border-bottom: 1px solid var(--border-dark);
       display: flex;
+      align-items: center;
       justify-content: space-between;
-      align-items: center;
-      border-bottom: 2px solid var(--brand-rose);
-    }
-    .header-brand {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-    }
-    .header-brand h1 {
-      font-size: 18px;
-      font-weight: 800;
-      letter-spacing: -0.5px;
+      padding: 0 20px;
+      z-index: 100;
       color: var(--silver);
     }
-    .header-brand h1 span { color: var(--brand-rose); }
-    .badge-role {
-      background: rgba(217, 130, 149, 0.2);
+    .topbar-left {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+    .btn-toggle-sidebar {
+      background: #27272A;
+      border: 1px solid #3F3F46;
+      color: var(--silver);
+      border-radius: 8px;
+      width: 36px;
+      height: 36px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .btn-toggle-sidebar:hover {
+      background: var(--brand-rose);
+      color: #fff;
+    }
+    .topbar-brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-weight: 800;
+      font-size: 17px;
+      color: #fff;
+      text-decoration: none;
+    }
+    .badge-superadmin {
+      background: rgba(217, 130, 149, 0.18);
       color: var(--brand-rose);
       border: 1px solid var(--brand-rose);
-      font-size: 11px;
-      padding: 3px 8px;
       border-radius: 999px;
+      padding: 2px 10px;
+      font-size: 11px;
       font-weight: 700;
-      text-transform: uppercase;
       letter-spacing: 0.5px;
     }
-    .header-user {
+    .topbar-right {
       display: flex;
       align-items: center;
       gap: 16px;
+    }
+    .user-info {
       font-size: 13px;
+      color: #A1A1AA;
+    }
+    .user-info strong {
+      color: #fff;
     }
     .btn-logout {
       background: #27272A;
-      color: #fff;
-      text-decoration: none;
+      border: 1px solid #3F3F46;
+      color: #E4E4E7;
       padding: 6px 14px;
-      border-radius: 6px;
-      font-weight: 600;
+      border-radius: 8px;
       font-size: 12px;
-      transition: background 0.2s;
+      font-weight: 600;
+      text-decoration: none;
+      transition: all 0.2s;
     }
-    .btn-logout:hover { background: #3F3F46; }
-    .container {
-      max-width: 1400px;
-      margin: 0 auto;
-      padding: 24px 20px;
+    .btn-logout:hover {
+      background: #DC2626;
+      border-color: #DC2626;
+      color: #fff;
     }
+
+    /* Layout: Sidebar + Main */
+    .sidebar {
+      width: 270px;
+      background: var(--bg-sidebar);
+      border-right: 1px solid var(--border-dark);
+      position: fixed;
+      top: 64px;
+      bottom: 0;
+      left: 0;
+      overflow-y: auto;
+      transition: width 0.25s ease;
+      z-index: 90;
+      padding: 16px 12px;
+      color: #D4D4D8;
+    }
+    .sidebar.collapsed {
+      width: 72px;
+    }
+    .sidebar.collapsed .nav-group-name,
+    .sidebar.collapsed .chevron,
+    .sidebar.collapsed .nav-group-sub,
+    .sidebar.collapsed .sidebar-header-label {
+      display: none !important;
+    }
+    .sidebar.collapsed .nav-group-header {
+      justify-content: center;
+      padding: 10px 0;
+    }
+    .sidebar.collapsed .nav-icon {
+      margin: 0;
+    }
+
+    .main-workspace {
+      margin-left: 270px;
+      margin-top: 64px;
+      flex: 1;
+      padding: 28px 32px;
+      transition: margin-left 0.25s ease;
+      min-height: calc(100vh - 64px);
+    }
+    .main-workspace.expanded {
+      margin-left: 72px;
+    }
+
+    /* Nav items */
+    .sidebar-header-label {
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      color: #71717A;
+      padding: 8px 12px 6px;
+    }
+    .nav-dashboard-link {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 10px 12px;
+      border-radius: 8px;
+      color: #E4E4E7;
+      text-decoration: none;
+      font-weight: 600;
+      font-size: 13px;
+      margin-bottom: 12px;
+      background: #27272A;
+      transition: all 0.2s;
+    }
+    .nav-dashboard-link:hover, .nav-dashboard-link.active {
+      background: var(--brand-rose);
+      color: #fff;
+    }
+
+    .nav-group {
+      margin-bottom: 8px;
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    .nav-group-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 12px;
+      border-radius: 8px;
+      cursor: pointer;
+      user-select: none;
+      transition: background 0.15s;
+    }
+    .nav-group-header:hover {
+      background: #27272A;
+    }
+    .nav-group-title {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 13px;
+      font-weight: 700;
+      color: #FAFAFA;
+    }
+    .nav-icon {
+      display: flex;
+      align-items: center;
+    }
+    .chevron {
+      color: #71717A;
+      transition: transform 0.2s ease;
+    }
+    .nav-group.expanded .chevron {
+      transform: rotate(180deg);
+    }
+    .nav-group-sub {
+      display: none;
+      padding: 4px 0 6px 14px;
+    }
+    .nav-group.expanded .nav-group-sub {
+      display: block;
+    }
+    .nav-sub-item {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 10px;
+      border-radius: 6px;
+      color: #A1A1AA;
+      text-decoration: none;
+      font-size: 12px;
+      font-weight: 500;
+      margin-bottom: 2px;
+      transition: all 0.15s;
+    }
+    .nav-sub-item:hover {
+      color: #fff;
+      background: #27272A;
+    }
+    .nav-sub-item.active {
+      color: #fff;
+      background: #27272A;
+      font-weight: 700;
+      border-left: 3px solid var(--brand-rose);
+    }
+    .sub-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+    }
+    .nav-badge {
+      margin-left: auto;
+      background: #DC2626;
+      color: #fff;
+      border-radius: 999px;
+      padding: 1px 7px;
+      font-size: 10px;
+      font-weight: 700;
+    }
+    .nav-badge.badge-next {
+      background: #10B981;
+    }
+
+    /* Page Content Header */
+    .page-banner {
+      background: #fff;
+      border: 1px solid var(--border-light);
+      border-radius: 12px;
+      padding: 20px 24px;
+      margin-bottom: 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+    }
+    .page-banner-left {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+    .macro-icon-box {
+      width: 44px;
+      height: 44px;
+      border-radius: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .page-banner-title h1 {
+      font-size: 20px;
+      font-weight: 800;
+      color: var(--text-dark);
+    }
+    .page-banner-title .breadcrumb {
+      font-size: 12px;
+      color: var(--text-muted);
+      margin-top: 2px;
+    }
+
+    /* Stat Cards */
     .stats-grid {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-      gap: 16px;
+      gap: 18px;
       margin-bottom: 24px;
     }
     .stat-card {
       background: #fff;
-      padding: 20px;
-      border-radius: 12px;
       border: 1px solid var(--border-light);
-      box-shadow: 0 2px 4px rgba(0,0,0,0.02);
+      border-radius: 12px;
+      padding: 22px 24px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.04);
     }
-    .stat-title {
-      font-size: 12px;
+    .stat-label {
+      font-size: 11px;
       font-weight: 700;
-      text-transform: uppercase;
       color: var(--text-muted);
-      margin-bottom: 6px;
+      letter-spacing: 0.6px;
+      margin-bottom: 8px;
     }
-    .stat-number {
-      font-size: 28px;
+    .stat-value {
+      font-size: 32px;
       font-weight: 800;
       color: var(--text-dark);
     }
-    .stat-card.alert-card .stat-number { color: #B45309; }
-    .stat-card.success-card .stat-number { color: #15803D; }
-    .alert-success {
-      background: #ECFDF5;
-      color: #065F46;
-      border: 1px solid #A7F3D0;
-      padding: 12px 16px;
-      border-radius: 8px;
-      margin-bottom: 20px;
-      font-size: 14px;
-      font-weight: 600;
-    }
-    .table-card {
+
+    /* Tables */
+    .card-table {
       background: #fff;
-      border-radius: 12px;
       border: 1px solid var(--border-light);
+      border-radius: 12px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.04);
       overflow: hidden;
-      box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05);
     }
-    .table-header {
-      padding: 16px 20px;
+    .card-header-table {
+      padding: 20px 24px;
       border-bottom: 1px solid var(--border-light);
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      background: #FAFAFA;
     }
-    .table-header h2 {
+    .card-header-table h3 {
       font-size: 16px;
-      font-weight: 800;
-      color: var(--text-dark);
+      font-weight: 700;
     }
-    .table-wrapper {
+    .card-header-table p {
+      font-size: 12px;
+      color: var(--text-muted);
+      margin-top: 2px;
+    }
+    .table-responsive {
       overflow-x: auto;
     }
     table {
@@ -588,158 +994,278 @@ async function renderAdminDashboard(env, utente, url) {
       font-size: 13px;
     }
     th {
-      background: #F4F4F5;
-      color: var(--text-muted);
+      background: #F9FAFB;
+      text-align: left;
+      padding: 12px 16px;
       font-size: 11px;
       font-weight: 700;
+      color: var(--text-muted);
       text-transform: uppercase;
       letter-spacing: 0.5px;
-      padding: 12px 16px;
-      text-align: left;
       border-bottom: 1px solid var(--border-light);
     }
     td {
-      padding: 14px 16px;
+      padding: 16px;
       border-bottom: 1px solid var(--border-light);
       vertical-align: top;
-      color: #374151;
     }
-    tr:hover td { background: #FAFAFA; }
+    tr:last-child td {
+      border-bottom: none;
+    }
     .text-sub {
-      font-size: 11px;
       color: var(--text-muted);
+      font-size: 12px;
     }
     .badge-pill {
       display: inline-block;
-      font-size: 10px;
-      font-weight: 700;
       padding: 3px 8px;
-      border-radius: 999px;
-      margin-bottom: 3px;
+      border-radius: 6px;
+      font-size: 11px;
+      font-weight: 700;
+      margin-right: 4px;
+      margin-bottom: 4px;
     }
-    .bg-green { background: #DCFCE7; color: #166534; }
-    .bg-amber { background: #FEF3C7; color: #92400E; }
+    .bg-green { background: #DCFCE7; color: #15803D; }
+    .bg-amber { background: #FEF3C7; color: #B45309; }
     .bg-gray { background: #F3F4F6; color: #4B5563; }
     .tag-delegato {
       display: inline-block;
       background: #EFF6FF;
-      color: #1E40AF;
+      color: #1D4ED8;
       border: 1px solid #BFDBFE;
-      padding: 2px 6px;
       border-radius: 4px;
+      padding: 2px 6px;
       font-size: 11px;
       margin-bottom: 4px;
     }
+
+    /* Form Delibera */
     .form-delibera {
       background: #F9FAFB;
       border: 1px solid #E5E7EB;
-      padding: 10px;
       border-radius: 8px;
+      padding: 10px;
     }
     .form-row {
       display: flex;
       gap: 8px;
-      margin-bottom: 6px;
+      margin-bottom: 8px;
     }
-    .form-row:last-child { margin-bottom: 0; }
+    .form-row:last-child {
+      margin-bottom: 0;
+    }
     .form-row label {
+      display: block;
       font-size: 10px;
       font-weight: 700;
       color: #4B5563;
       flex: 1;
-      display: flex;
-      flex-direction: column;
-      gap: 3px;
     }
     .form-row input {
+      width: 100%;
       padding: 5px 8px;
       border: 1px solid #D1D5DB;
-      border-radius: 4px;
+      border-radius: 6px;
       font-size: 12px;
-      font-family: inherit;
+      margin-top: 2px;
     }
     .btn-approva {
       background: var(--brand-rose);
       color: #fff;
       border: none;
-      padding: 6px 12px;
-      border-radius: 4px;
+      padding: 8px 12px;
+      border-radius: 6px;
+      font-size: 12px;
       font-weight: 700;
-      font-size: 11px;
       cursor: pointer;
-      align-self: flex-end;
+      width: 100%;
       transition: background 0.2s;
     }
-    .btn-approva:hover { background: var(--brand-rose-dark); }
+    .btn-approva:hover {
+      background: var(--brand-rose-dark);
+    }
     .delibera-info {
+      background: #F0FDF4;
+      border: 1px solid #BBF7D0;
+      border-radius: 8px;
+      padding: 10px;
       font-size: 12px;
-      line-height: 1.5;
-      color: #374151;
+      color: #166534;
+      line-height: 1.6;
     }
     .tessera-highlight {
+      color: var(--brand-rose-dark);
       font-weight: 800;
-      color: #15803D;
+    }
+    .alert-success {
       background: #DCFCE7;
-      padding: 2px 6px;
-      border-radius: 4px;
+      color: #15803D;
+      border: 1px solid #86EFAC;
+      border-radius: 8px;
+      padding: 12px 18px;
+      margin-bottom: 20px;
+      font-weight: 600;
+      font-size: 13px;
+    }
+
+    /* Placeholder Screens */
+    .placeholder-card {
+      background: #fff;
+      border: 1px solid var(--border-light);
+      border-radius: 16px;
+      padding: 40px;
+      text-align: center;
+      max-width: 700px;
+      margin: 40px auto;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.03);
+    }
+    .placeholder-icon {
+      width: 72px;
+      height: 72px;
+      border-radius: 16px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      margin-bottom: 20px;
+    }
+    .placeholder-card h2 {
+      font-size: 24px;
+      font-weight: 800;
+      color: var(--text-dark);
+      margin-bottom: 12px;
+    }
+    .placeholder-meta {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      margin-bottom: 20px;
+    }
+    .tag-macro {
+      padding: 4px 12px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .tag-status {
+      background: #F3F4F6;
+      color: #4B5563;
+      padding: 4px 12px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 600;
+    }
+    .placeholder-desc {
+      font-size: 14px;
+      line-height: 1.6;
+      color: var(--text-muted);
+      margin-bottom: 28px;
+    }
+    .placeholder-roadmap {
+      background: #F9FAFB;
+      border: 1px solid #E5E7EB;
+      border-radius: 12px;
+      padding: 20px;
+      text-align: left;
+    }
+    .placeholder-roadmap h4 {
+      font-size: 13px;
+      font-weight: 700;
+      margin-bottom: 10px;
+      color: var(--text-dark);
+    }
+    .placeholder-roadmap ul {
+      list-style: none;
+      padding-left: 0;
+      font-size: 13px;
+      color: #4B5563;
+    }
+    .placeholder-roadmap li {
+      padding: 6px 0;
+      border-bottom: 1px dashed #E5E7EB;
+    }
+    .placeholder-roadmap li:last-child {
+      border-bottom: none;
+    }
+    .btn-primary {
+      background: var(--brand-rose);
+      color: #fff;
+      padding: 10px 20px;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 700;
+      transition: background 0.2s;
+    }
+    .btn-primary:hover {
+      background: var(--brand-rose-dark);
     }
   </style>
 </head>
 <body>
-  <header>
-    <div class="header-brand">
-      <h1>Cervelli in Affitto <span>APS</span></h1>
-      <span class="badge-role">Super Admin</span>
+  <div class="topbar">
+    <div class="topbar-left">
+      <button class="btn-toggle-sidebar" id="toggleSidebar" title="Comprimi / Espandi Sidebar">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+      <a href="/admin" class="topbar-brand">
+        <span>Cervelli in Affitto APS</span>
+        <span class="badge-superadmin">SUPER ADMIN</span>
+      </a>
     </div>
-    <div class="header-user">
-      <span>Connesso: <strong>${utente.nome} ${utente.cognome}</strong> (${utente.email})</span>
+    <div class="topbar-right">
+      <div class="user-info">
+        Connesso: <strong>${utente.nome} ${utente.cognome}</strong> (${utente.email})
+      </div>
       <a href="/admin/logout" class="btn-logout">Disconnetti</a>
     </div>
-  </header>
+  </div>
 
-  <div class="container">
+  <div class="sidebar" id="sidebar">
+    <div class="sidebar-header-label">Area Gestionale</div>
+    <a href="/admin?view=domande" class="nav-dashboard-link ${currentView === "domande" ? "active" : ""}">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+      <span>Dashboard Generale</span>
+    </a>
+
+    <div class="sidebar-header-label">Macro-Aree Bibbia</div>
+    ${sidebarNavHtml}
+  </div>
+
+  <div class="main-workspace" id="mainWorkspace">
     ${msgNotifica}
 
-    <div class="stats-grid">
-      <div class="stat-card">
-        <div class="stat-title">Domande Ricevute</div>
-        <div class="stat-number">${totDomande}</div>
-      </div>
-      <div class="stat-card alert-card">
-        <div class="stat-title">In Attesa di Delibera CD</div>
-        <div class="stat-number">${inAttesa}</div>
-      </div>
-      <div class="stat-card success-card">
-        <div class="stat-title">Soci Approvati & Tesserati</div>
-        <div class="stat-number">${approvate}</div>
+    <div class="page-banner">
+      <div class="page-banner-left">
+        <div class="macro-icon-box" style="background: ${currentMacroColor}18; color: ${currentMacroColor};">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
+        </div>
+        <div class="page-banner-title">
+          <h1>${currentTitle}</h1>
+          <div class="breadcrumb">Pannello Gestionale &gt; ${currentMacro} &gt; <strong>${currentTitle}</strong></div>
+        </div>
       </div>
     </div>
 
-    <div class="table-card">
-      <div class="table-header">
-        <h2>Libro Soci &bull; Domande di Ammissione e Iscrizioni Minori</h2>
-        <span style="font-size: 12px; color: #71717A;">Affiliazione UILT &bull; Flusso Delibere CD</span>
-      </div>
-      <div class="table-wrapper">
-        <table>
-          <thead>
-            <tr>
-              <th>Allievo Minore</th>
-              <th>Genitore / Tutore</th>
-              <th>Corso Selezionato</th>
-              <th>Deleghe al Ritiro</th>
-              <th>Consensi Privacy</th>
-              <th>Stato Domanda</th>
-              <th>Azione Delibera Consiglio Direttivo</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${righeDomande}
-          </tbody>
-        </table>
-      </div>
-    </div>
+    ${mainContentHtml}
   </div>
+
+  <script>
+    const toggleBtn = document.getElementById("toggleSidebar");
+    const sidebar = document.getElementById("sidebar");
+    const mainWorkspace = document.getElementById("mainWorkspace");
+
+    // Ripristina preferenza salvata
+    if (localStorage.getItem("cervelli_sidebar_collapsed") === "true") {
+      sidebar.classList.add("collapsed");
+      mainWorkspace.classList.add("expanded");
+    }
+
+    toggleBtn.addEventListener("click", () => {
+      sidebar.classList.toggle("collapsed");
+      mainWorkspace.classList.toggle("expanded");
+      localStorage.setItem("cervelli_sidebar_collapsed", sidebar.classList.contains("collapsed"));
+    });
+  </script>
 </body>
 </html>`;
 
