@@ -1,7 +1,7 @@
 /**
  * Cervelli in Affitto APS - Piattaforma Gestionale
  * - Portale Pubblico: Modulo Iscrizione Corsi Minori & Domanda Socio (Wizard a 5 step)
- * - Area Riservata (/admin): Setup Super Admin, Login con Sessioni D1, Dashboard e Delibera CD
+ * - Area Riservata (/admin): Dashboard Generale, Pagine HUB Macro-Aree a Tessere e Delibera CD
  * Affiliato UILT - Unione Italiana Libero Teatro
  */
 
@@ -13,271 +13,272 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // 1. Endpoint diagnostico database D1
+    // 1. Endpoint di test rapido per verificare il database
     if (url.pathname === "/api/test-db") {
       try {
         const { results } = await env.DB.prepare(
-          "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+          "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;"
         ).all();
-        const tables = results.map((r) => r.name);
-        return Response.json({
-          status: "ok",
-          database: "cervelli-gestionale-db",
-          tabelle_attive: tables,
-          deleghe_pronte: tables.includes("deleghe_ritiro"),
-          timestamp: new Date().toISOString()
+        return new Response(JSON.stringify({ status: "ok", tables: results }), {
+          headers: { "Content-Type": "application/json" }
         });
       } catch (err) {
-        return Response.json({ status: "error", message: err.message }, { status: 500 });
+        return new Response(JSON.stringify({ status: "error", message: err.message }), {
+          status: 500,
+          headers: { "Content-Type": "application/json" }
+        });
       }
     }
 
-    // 2. Rotte Area Riservata Amministrativa (/admin*)
+    // 2. Sezione Amministrazione (/admin)
     if (url.pathname.startsWith("/admin")) {
       return handleAdminRoutes(request, env, url);
     }
 
-    // Assicura l'esistenza del corso predefinito in D1
-    await seedDefaultCourseIfNeeded(env);
-
-    // 3. Ricezione modulo pubblico iscrizioni (POST)
-    if (request.method === "POST" && (url.pathname === "/iscrizione-minori" || url.pathname === "/")) {
-      return handleIscrizionePost(request, env, ctx);
+    // 3. Portale Pubblico: Invio Modulo Minori
+    if (url.pathname === "/iscrizione-minori" && request.method === "POST") {
+      return handleIscrizionePost(request, env, url);
     }
 
-    // 4. Pagina di conferma avvenuta iscrizione
-    if (url.pathname === "/iscrizione-confermata") {
-      const nomeMinore = url.searchParams.get("minore") || "allievo/a";
-      const email = url.searchParams.get("email") || "";
-      return renderSuccessPage(nomeMinore, email);
+    // 4. Portale Pubblico: Visualizzazione Wizard 5 Step
+    if (url.pathname === "/" || url.pathname === "/iscrizione-minori") {
+      const step = parseInt(url.searchParams.get("step") || "1", 10);
+      const isSuccess = url.searchParams.get("success") === "1";
+      return renderPublicWizard(step, isSuccess, url.searchParams);
     }
 
-    // 5. Portale pubblico: Wizard iscrizione
-    const corsi = await getCorsiAttivi(env);
-    return renderFormPage(corsi);
+    return new Response("Pagina non trovata", { status: 404 });
   }
 };
 
 /* =========================================================================
-   ROUTER E GESTIONE AREA AMMINISTRATIVA (/admin)
+   ROUTER AREA AMMINISTRATIVA
    ========================================================================= */
 
 async function handleAdminRoutes(request, env, url) {
-  // A. Controllo esistenza Super Admin
-  const checkAdmin = await env.DB.prepare("SELECT COUNT(*) as tot FROM utenti_gestionale").first();
-  const hasSuperAdmin = checkAdmin && checkAdmin.tot > 0;
-
-  // B. PRIMO AVVIO: se non esiste alcun admin nel database
-  if (!hasSuperAdmin) {
-    if (request.method === "POST" && url.pathname === "/admin/setup") {
-      return handleSetupAdminPost(request, env);
-    }
-    return renderSetupAdminPage();
+  // Setup primo avvio Super Admin
+  if (url.pathname === "/admin/setup" && request.method === "POST") {
+    return handleSetupPost(request, env);
   }
 
-  // C. LOGIN
-  if (url.pathname === "/admin/login") {
-    if (request.method === "POST") {
-      return handleLoginPost(request, env);
-    }
-    return renderLoginPage();
+  // Login POST
+  if (url.pathname === "/admin/login" && request.method === "POST") {
+    return handleLoginPost(request, env);
   }
 
-  // D. LOGOUT
+  // Logout GET
   if (url.pathname === "/admin/logout") {
-    const cookies = parseCookies(request.headers.get("Cookie"));
-    const token = cookies[COOKIE_NAME];
-    if (token) {
-      await env.DB.prepare("DELETE FROM sessioni_admin WHERE token = ?").bind(token).run();
-    }
-    return new Response(null, {
-      status: 303,
-      headers: {
-        "Location": "/admin/login",
-        "Set-Cookie": `${COOKIE_NAME}=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; SameSite=Lax; Secure`
-      }
-    });
+    return handleLogout(request, env);
   }
 
-  // E. AUTENTICAZIONE SESSIONE PER ACCEDERE ALLA DASHBOARD
-  const utenteLoggato = await getAuthenticatedUser(request, env);
-  if (!utenteLoggato) {
-    return Response.redirect(`${url.origin}/admin/login`, 303);
+  // Delibera Consiglio Direttivo POST
+  if (url.pathname === "/admin/delibera" && request.method === "POST") {
+    const session = await getAdminSession(request, env);
+    if (!session) {
+      return new Response(null, { status: 302, headers: { Location: "/admin" } });
+    }
+    return handleDeliberaPost(request, env, session.user);
   }
 
-  // F. AZIONE: Delibera Domanda Ammissione Socio
-  if (request.method === "POST" && url.pathname === "/admin/delibera") {
-    const formData = await request.formData();
-    const socioId = (formData.get("socio_id") || "").trim();
-    const dataDelibera = (formData.get("data_delibera") || "").trim() || new Date().toISOString().slice(0, 10);
-    const numeroVerbale = (formData.get("numero_verbale") || "").trim() || "Verbale CD";
-    const numeroTessera = (formData.get("numero_tessera_aps") || "").trim();
-
-    if (!socioId || !numeroTessera) {
-      return new Response("ID Socio e Numero Tessera APS sono obbligatori.", { status: 400 });
-    }
-
-    try {
-      await env.DB.prepare(`
-        UPDATE soci 
-        SET stato_richiesta = 'approvato',
-            data_delibera = ?,
-            numero_verbale = ?,
-            numero_tessera_aps = ?,
-            updated_at = datetime('now')
-        WHERE id = ?
-      `).bind(dataDelibera, numeroVerbale, numeroTessera, socioId).run();
-
-      return new Response(null, {
-        status: 303,
-        headers: { "Location": "/admin?msg=delibera_ok" }
-      });
-    } catch (e) {
-      console.error("Errore salvataggio delibera:", e);
-      return new Response(renderErrorPage(`Errore durante il salvataggio della delibera: ${e.message}`), {
-        status: 500,
-        headers: { "Content-Type": "text/html; charset=utf-8" }
-      });
-    }
+  // Verifica se esiste già un Super Admin
+  let adminExists = false;
+  try {
+    const row = await env.DB.prepare(
+      "SELECT id FROM utenti_gestionale WHERE ruolo = 'super_admin' LIMIT 1"
+    ).first();
+    adminExists = !!row;
+  } catch (e) {
+    console.error("Errore verifica utenti:", e);
   }
 
-  // G. VISTA DASHBOARD AMMINISTRATIVA
-  return renderAdminDashboard(env, utenteLoggato, url);
+  if (!adminExists) {
+    return renderSetupPage();
+  }
+
+  // Verifica sessione attiva tramite Cookie
+  const session = await getAdminSession(request, env);
+  if (!session) {
+    const errorMsg = url.searchParams.get("error");
+    return renderLoginPage(errorMsg);
+  }
+
+  // Visualizzazione Area di Lavoro Admin (Dashboard, Hub Macro-Aree o Sottosezioni)
+  return renderAdminDashboard(env, session.user, url);
 }
 
 /* =========================================================================
-   FUNZIONI DI SUPPORTO SICUREZZA, PASSWORD E SESSIONI
+   AUTENTICAZIONE E SICUREZZA CON PBKDF2 (WEB CRYPTO)
    ========================================================================= */
 
-async function hashPassword(password, salt = PBKDF2_SALT) {
+async function hashPassword(password) {
   const enc = new TextEncoder();
   const keyMaterial = await crypto.subtle.importKey(
     "raw",
     enc.encode(password),
     { name: "PBKDF2" },
     false,
-    ["deriveBits"]
+    ["deriveBits", "deriveKey"]
   );
-  const derivedBits = await crypto.subtle.deriveBits(
-    { name: "PBKDF2", salt: enc.encode(salt), iterations: 100000, hash: "SHA-256" },
+  const derivedKey = await crypto.subtle.deriveKey(
+    {
+      name: "PBKDF2",
+      salt: enc.encode(PBKDF2_SALT),
+      iterations: 100000,
+      hash: "SHA-256"
+    },
     keyMaterial,
-    256
+    { name: "HMAC", hash: "SHA-256", length: 256 },
+    true,
+    ["sign"]
   );
-  return Array.from(new Uint8Array(derivedBits)).map((b) => b.toString(16).padStart(2, "0")).join("");
+  const exported = await crypto.subtle.exportKey("raw", derivedKey);
+  return Array.from(new Uint8Array(exported))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 }
 
-function parseCookies(cookieHeader) {
-  const list = {};
-  if (!cookieHeader) return list;
-  cookieHeader.split(";").forEach((cookie) => {
-    let [name, ...rest] = cookie.split("=");
-    name = name?.trim();
-    if (!name) return;
-    const value = rest.join("=").trim();
-    if (value) list[name] = decodeURIComponent(value);
-  });
-  return list;
+function generateSessionToken() {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 }
 
-async function getAuthenticatedUser(request, env) {
-  const cookies = parseCookies(request.headers.get("Cookie"));
-  const token = cookies[COOKIE_NAME];
-  if (!token) return null;
+async function getAdminSession(request, env) {
+  const cookieHeader = request.headers.get("Cookie") || "";
+  const match = cookieHeader.match(new RegExp(`${COOKIE_NAME}=([^;]+)`));
+  if (!match) return null;
+  const token = match[1];
 
   try {
     const session = await env.DB.prepare(`
-      SELECT s.token, u.id, u.email, u.nome, u.cognome, u.ruolo 
+      SELECT s.token, s.scadenza, u.id, u.email, u.nome, u.cognome, u.ruolo
       FROM sessioni_admin s
       JOIN utenti_gestionale u ON s.utente_id = u.id
-      WHERE s.token = ? AND s.expires_at > datetime('now') AND u.attivo = 1
+      WHERE s.token = ? AND s.scadenza > datetime('now')
     `).bind(token).first();
 
-    return session || null;
-  } catch (err) {
-    console.error("Errore verifica sessione:", err);
+    if (!session) return null;
+
+    return {
+      token: session.token,
+      user: {
+        id: session.id,
+        email: session.email,
+        nome: session.nome,
+        cognome: session.cognome,
+        ruolo: session.ruolo
+      }
+    };
+  } catch (e) {
+    console.error("Errore verifica sessione:", e);
     return null;
   }
 }
 
-async function handleSetupAdminPost(request, env) {
-  const formData = await request.formData();
-  const nome = (formData.get("nome") || "").trim();
-  const cognome = (formData.get("cognome") || "").trim();
-  const email = (formData.get("email") || "").trim().toLowerCase();
-  const password = (formData.get("password") || "").trim();
-
-  if (!nome || !cognome || !email || password.length < 8) {
-    return renderSetupAdminPage("Compila tutti i campi. La password deve contenere almeno 8 caratteri.");
+async function handleLogout(request, env) {
+  const cookieHeader = request.headers.get("Cookie") || "";
+  const match = cookieHeader.match(new RegExp(`${COOKIE_NAME}=([^;]+)`));
+  if (match) {
+    try {
+      await env.DB.prepare("DELETE FROM sessioni_admin WHERE token = ?").bind(match[1]).run();
+    } catch (e) {
+      console.warn("Errore eliminazione sessione:", e);
+    }
   }
+  return new Response(null, {
+    status: 302,
+    headers: {
+      Location: "/admin",
+      "Set-Cookie": `${COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0; Secure`
+    }
+  });
+}
 
+async function handleSetupPost(request, env) {
   try {
-    const passwordHash = await hashPassword(password);
-    const insertRes = await env.DB.prepare(`
-      INSERT INTO utenti_gestionale (email, password_hash, nome, cognome, ruolo, attivo)
-      VALUES (?, ?, ?, ?, 'super_admin', 1)
-    `).bind(email, passwordHash, nome, cognome).run();
+    const formData = await request.formData();
+    const nome = (formData.get("nome") || "").toString().trim();
+    const cognome = (formData.get("cognome") || "").toString().trim();
+    const email = (formData.get("email") || "").toString().trim().toLowerCase();
+    const password = (formData.get("password") || "").toString();
 
-    const utenteId = insertRes.meta.last_row_id;
-    const sessionToken = crypto.randomUUID();
-    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+    if (!nome || !cognome || !email || password.length < 8) {
+      return renderSetupPage("Tutti i campi sono obbligatori (password min 8 caratteri).");
+    }
+
+    const adminCheck = await env.DB.prepare(
+      "SELECT id FROM utenti_gestionale WHERE ruolo = 'super_admin' LIMIT 1"
+    ).first();
+    if (adminCheck) {
+      return new Response(null, { status: 302, headers: { Location: "/admin" } });
+    }
+
+    const userId = "usr-admin-" + Date.now();
+    const passwordHash = await hashPassword(password);
 
     await env.DB.prepare(`
-      INSERT INTO sessioni_admin (token, utente_id, expires_at)
-      VALUES (?, ?, ?)
-    `).bind(sessionToken, utenteId, expiresAt).run();
+      INSERT INTO utenti_gestionale (id, email, password_hash, nome, cognome, ruolo, attivo)
+      VALUES (?, ?, ?, ?, ?, 'super_admin', 1)
+    `).bind(userId, email, passwordHash, nome, cognome).run();
+
+    const sessionToken = generateSessionToken();
+    await env.DB.prepare(`
+      INSERT INTO sessioni_admin (token, utente_id, scadenza)
+      VALUES (?, ?, datetime('now', '+7 days'))
+    `).bind(sessionToken, userId).run();
 
     return new Response(null, {
-      status: 303,
+      status: 302,
       headers: {
-        "Location": "/admin",
+        Location: "/admin?view=dashboard",
         "Set-Cookie": `${COOKIE_NAME}=${sessionToken}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800; Secure`
       }
     });
   } catch (e) {
     console.error("Errore setup admin:", e);
-    return renderSetupAdminPage(`Errore durante la creazione dell'account: ${e.message}`);
+    return renderSetupPage(`Errore durante la creazione: ${e.message}`);
   }
 }
 
 async function handleLoginPost(request, env) {
-  const formData = await request.formData();
-  const email = (formData.get("email") || "").trim().toLowerCase();
-  const password = (formData.get("password") || "").trim();
-
-  if (!email || !password) {
-    return renderLoginPage("Inserisci sia l'email che la password.");
-  }
-
   try {
-    const utente = await env.DB.prepare(
-      "SELECT id, password_hash, attivo FROM utenti_gestionale WHERE email = ?"
-    ).bind(email).first();
+    const formData = await request.formData();
+    const email = (formData.get("email") || "").toString().trim().toLowerCase();
+    const password = (formData.get("password") || "").toString();
 
-    if (!utente || utente.attivo !== 1) {
-      return renderLoginPage("Credenziali non valide o utente non attivo.");
+    if (!email || !password) {
+      return renderLoginPage("Inserisci sia email che password.");
     }
 
-    const inputHash = await hashPassword(password);
-    if (inputHash !== utente.password_hash) {
+    const user = await env.DB.prepare(
+      "SELECT id, email, password_hash, nome, cognome, attivo FROM utenti_gestionale WHERE email = ?"
+    ).bind(email).first();
+
+    if (!user || user.attivo !== 1) {
+      return renderLoginPage("Credenziali non valide o utente disattivato.");
+    }
+
+    const hashedInput = await hashPassword(password);
+    if (hashedInput !== user.password_hash) {
       return renderLoginPage("Credenziali non valide.");
     }
 
-    const sessionToken = crypto.randomUUID();
-    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
-
+    const sessionToken = generateSessionToken();
     await env.DB.prepare(`
-      INSERT INTO sessioni_admin (token, utente_id, expires_at)
-      VALUES (?, ?, ?)
-    `).bind(sessionToken, utente.id, expiresAt).run();
+      INSERT INTO sessioni_admin (token, utente_id, scadenza)
+      VALUES (?, ?, datetime('now', '+7 days'))
+    `).bind(sessionToken, user.id).run();
 
     await env.DB.prepare(
       "UPDATE utenti_gestionale SET ultimo_accesso = datetime('now') WHERE id = ?"
-    ).bind(utente.id).run();
+    ).bind(user.id).run();
 
     return new Response(null, {
-      status: 303,
+      status: 302,
       headers: {
-        "Location": "/admin",
+        Location: "/admin?view=dashboard",
         "Set-Cookie": `${COOKIE_NAME}=${sessionToken}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800; Secure`
       }
     });
@@ -287,12 +288,133 @@ async function handleLoginPost(request, env) {
   }
 }
 
+async function handleDeliberaPost(request, env, user) {
+  try {
+    const formData = await request.formData();
+    const socioId = (formData.get("socio_id") || "").toString().trim();
+    const dataDelibera = (formData.get("data_delibera") || "").toString().trim();
+    const numeroVerbale = (formData.get("numero_verbale") || "").toString().trim();
+    let numeroTessera = (formData.get("numero_tessera") || "").toString().trim();
+
+    if (!socioId || !dataDelibera || !numeroVerbale) {
+      return new Response(null, {
+        status: 302,
+        headers: { Location: "/admin?view=domande&msg=err_campi" }
+      });
+    }
+
+    if (!numeroTessera) {
+      const year = new Date().getFullYear();
+      const countRow = await env.DB.prepare(
+        "SELECT COUNT(*) as tot FROM soci WHERE anno_adesione = ? AND stato_richiesta = 'approvato'"
+      ).bind(year).first();
+      const nextNum = (countRow ? countRow.tot : 0) + 1;
+      numeroTessera = `${year}-${String(nextNum).padStart(3, "0")}`;
+    }
+
+    await env.DB.prepare(`
+      UPDATE soci 
+      SET 
+        stato_richiesta = 'approvato',
+        data_delibera = ?,
+        numero_verbale = ?,
+        numero_tessera_aps = ?,
+        updated_at = datetime('now')
+      WHERE id = ?
+    `).bind(dataDelibera, numeroVerbale, numeroTessera, socioId).run();
+
+    return new Response(null, {
+      status: 302,
+      headers: { Location: "/admin?view=domande&msg=delibera_ok" }
+    });
+  } catch (e) {
+    console.error("Errore delibera CD:", e);
+    return new Response(null, {
+      status: 302,
+      headers: { Location: "/admin?view=domande&msg=err_server" }
+    });
+  }
+}
+
+/* =========================================================================
+   DIZIONARIO STRUTTURATO DELLE MACRO-AREE E SOTTOMENU (BIBBIA)
+   ========================================================================= */
+
+const MENU_SECTIONS = [
+  {
+    id: "macro-soci",
+    titolo: "Soci & Libro Soci",
+    colore: "#D98295", // Rosa Corallo Brand
+    icona: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>`,
+    descrizione: "Gestione domande di ammissione, Libro Soci ufficiale, anagrafiche minori, quote sociali e tesseramento nazionale UILT.",
+    voci: [
+      { id: "domande", etichetta: "1.1 Domande Ammissione", desc: "Verifica e approvazione con data delibera, verbale CD e numero tessera APS." },
+      { id: "registro-soci", etichetta: "1.2 Registro Libro Soci", desc: "Registro cronologico ufficiale dei soci con filtri di ricerca ed esportazione." },
+      { id: "schede-soci", etichetta: "1.3 Schede Soci & Minori", desc: "Dossier anagrafico completo dei soci, tutori legali e deleghe al ritiro." },
+      { id: "quote-uilt", etichetta: "1.4 Quote & Tessere UILT", desc: "Stato quote annuali APS (1 nov-31 ott), quote UILT (anno solare) e upload tessere." }
+    ]
+  },
+  {
+    id: "macro-corsi",
+    titolo: "Attività & Corsi",
+    colore: "#06B6D4", // Ciano Teatrale
+    icona: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>`,
+    descrizione: "Laboratori teatrali per bambini, ragazzi e adulti, registri allievi, quote di frequenza e foglio presenze.",
+    voci: [
+      { id: "corsi", etichetta: "2.1 Corsi e Laboratori Teatrali", desc: "Creazione e gestione corsi, docenti, calendario lezioni e quote mensili." },
+      { id: "iscritti-corsi", etichetta: "2.2 Registro Iscritti per Corso", desc: "Elenco iscritti attivi, stato pagamenti quote laboratori e contatti tutori." },
+      { id: "presenze", etichetta: "2.3 Registro Presenze & Lezioni", desc: "Appello digitale delle lezioni per docenti con report esportabile." }
+    ]
+  },
+  {
+    id: "macro-eventi",
+    titolo: "Eventi, Teatro & Casse",
+    colore: "#F59E0B", // Ambra Ribalta
+    icona: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="7" width="20" height="14" rx="2" ry="2"/><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"/></svg>`,
+    descrizione: "Cartellone spettacoli, cene con delitto, eventi sul territorio, gestione prenotazioni e casse distinte.",
+    voci: [
+      { id: "cartellone", etichetta: "3.1 Cartellone & Spettacoli Teatrali", desc: "Gestione repliche teatrali, debutti, locandine e capienza teatri." },
+      { id: "eventi-extra", etichetta: "3.2 Altri Eventi (Cene con Delitto)", desc: "Eventi gastronomici o speciali con form e cassa dedicati." },
+      { id: "prenotazioni", etichetta: "3.3 Prenotazioni & Posti", desc: "Ricerca persistente, modifica prenotazioni con verifica capienza e omaggi." },
+      { id: "cassa-teatro", etichetta: "3.4 Cassa Spettacoli & Ingressi", desc: "Botteghino teatro, emissione biglietti, pagamenti e controllo ingressi." },
+      { id: "cassa-eventi", etichetta: "3.5 Cassa Altri Eventi & Quote", desc: "Cassa flessibile per eventi convenzionati e incassi cene." }
+    ]
+  },
+  {
+    id: "macro-builder",
+    titolo: "Builder & Contenuti",
+    colore: "#10B981", // Smeraldo Strumenti
+    icona: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>`,
+    descrizione: "Strumenti per personalizzare logo, colori, moduli pubblici, modelli di tessere e comunicazioni email.",
+    voci: [
+      { id: "form-builder", etichetta: "4.1 Form Builder Dinamico", desc: "Crea e modifica i campi dei form pubblici per corsi, soci o eventi." },
+      { id: "theme-builder", etichetta: "4.2 Builder Tema & Identità Visiva", desc: "Configura colori, sfondi, logo e layout di portale e gestionale." },
+      { id: "tessera-builder", etichetta: "4.3 Builder Tessera APS", desc: "Modello grafico della tessera associativa digitale e parametri di stampa." },
+      { id: "email-builder", etichetta: "4.4 Template Email & Comunicazioni", desc: "Modifica i testi delle email automatiche di conferma e promemoria." }
+    ]
+  },
+  {
+    id: "macro-sistema",
+    titolo: "Sistema & Utenti",
+    colore: "#6366F1", // Indaco Sicurezza
+    icona: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>`,
+    descrizione: "Controllo accessi per ruoli (Super Admin, Cassiere, Docente), dati fiscali APS, registro log e backup D1.",
+    voci: [
+      { id: "utenti-ruoli", etichetta: "5.1 Utenti Gestionale & Ruoli", desc: "Gestione operatori interni, password e permessi per macro-area." },
+      { id: "registro-attivita", etichetta: "5.2 Registro Attività & Log", desc: "Tracciamento cronologico immutabile delle operazioni amministrative." },
+      { id: "dati-aps", etichetta: "5.3 Dati Fiscali APS & Impostazioni", desc: "CF, affiliazione UILT, sede legale, email mittente Resend e footer." },
+      { id: "backup-dati", etichetta: "5.4 Esportazioni & Backup", desc: "Esportazione completa in CSV/JSON dei dati per massima sicurezza." }
+    ]
+  }
+];
+
 /* =========================================================================
    CARICAMENTO DATI E VISTE HTML AREA AMMINISTRATIVA
    ========================================================================= */
 
 async function renderAdminDashboard(env, utente, url) {
-  const currentView = url.searchParams.get("view") || "domande";
+  // Se non c'è parametro view, il default ufficiale è la Dashboard Generale
+  const currentView = url.searchParams.get("view") || "dashboard";
   const msgParam = url.searchParams.get("msg");
 
   let domande = [];
@@ -353,7 +475,7 @@ async function renderAdminDashboard(env, utente, url) {
   const delegheMap = {};
   deleghe.forEach((d) => {
     if (!delegheMap[d.socio_minore_id]) delegheMap[d.socio_minore_id] = [];
-    delegheMap[d.socio_minore_id].push(`${d.nome} ${d.cognome} (${d.relazione || "Delegato"} - Tel. ${d.telefono || "N.D."})`);
+    delegheMap[d.socio_minore_id].push(`${d.nome} ${d.cognome} (${d.relazione || "Delegato"} - ${d.telefono || ""})`);
   });
 
   const consensiMap = {};
@@ -365,90 +487,44 @@ async function renderAdminDashboard(env, utente, url) {
   const inAttesa = domande.filter((d) => d.stato_richiesta === "in_attesa").length;
   const approvate = domande.filter((d) => d.stato_richiesta === "approvato").length;
 
-  let msgNotifica = "";
-  if (msgParam === "delibera_ok") {
-    msgNotifica = `<div class="alert-success">✓ Delibera Consiglio Direttivo registrata con successo! Il socio è ora approvato e tesserato.</div>`;
-  }
+  // Assegnazione badge dinamici alle voci
+  MENU_SECTIONS[0].voci[0].badge = inAttesa > 0 ? inAttesa : null;
 
-  const menuSections = [
-    {
-      id: "macro1",
-      titolo: "Soci & Libro Soci",
-      colore: "#D98295",
-      icona: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>`,
-      voci: [
-        { id: "domande", etichetta: "1.1 Domande Ammissione", badge: inAttesa > 0 ? inAttesa : null },
-        { id: "libro_soci", etichetta: "1.2 Registro Libro Soci", badge: null },
-        { id: "schede_soci", etichetta: "1.3 Schede Soci & Minori", badge: null },
-        { id: "quote_uilt", etichetta: "1.4 Quote & Tessere UILT", badge: null }
-      ]
-    },
-    {
-      id: "macro2",
-      titolo: "Attività & Corsi",
-      colore: "#38BDF8",
-      icona: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>`,
-      voci: [
-        { id: "corsi", etichetta: "2.1 Corsi & Laboratori", badge: null },
-        { id: "presenze", etichetta: "2.2 Presenze & Iscritti", badge: null }
-      ]
-    },
-    {
-      id: "macro3",
-      titolo: "Eventi, Teatro & Casse",
-      colore: "#F59E0B",
-      icona: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="4" width="20" height="16" rx="2"/><line x1="2" y1="10" x2="22" y2="10"/></svg>`,
-      voci: [
-        { id: "spettacoli", etichetta: "3.1 Spettacoli Teatrali", badge: null },
-        { id: "eventi_altri", etichetta: "3.2 Eventi Altri & Cene", badge: null },
-        { id: "cassa_teatro", etichetta: "3.3 Cassa Spettacoli", badge: null },
-        { id: "cassa_eventi", etichetta: "3.4 Cassa Eventi Generali", badge: null }
-      ]
-    },
-    {
-      id: "macro4",
-      titolo: "Builder & Contenuti",
-      colore: "#10B981",
-      icona: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>`,
-      voci: [
-        { id: "form_builder", etichetta: "4.1 Form Builder Dinamico", badge: null },
-        { id: "tema_builder", etichetta: "4.2 Builder Tema & Brand", badge: "Prossimo" },
-        { id: "pagine_pubbliche", etichetta: "4.3 Pagine Pubbliche & Home", badge: null },
-        { id: "email_template", etichetta: "4.4 Template Email", badge: null }
-      ]
-    },
-    {
-      id: "macro5",
-      titolo: "Sistema & Utenti",
-      colore: "#818CF8",
-      icona: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>`,
-      voci: [
-        { id: "utenti", etichetta: "5.1 Utenti & Ruoli", badge: null },
-        { id: "log", etichetta: "5.2 Registro Log Attività", badge: null },
-        { id: "database", etichetta: "5.3 Backup & Database D1", badge: null }
-      ]
-    }
-  ];
-
-  let currentTitle = "1.1 Domande di Ammissione & Minori";
-  let currentMacro = "Soci & Libro Soci";
+  // Riconoscimento pagina corrente, titolo, macro-area e colore
+  let currentTitle = "Dashboard Generale";
+  let currentMacro = "Panoramica Associazione";
   let currentMacroColor = "#D98295";
+  let currentMacroIcon = `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>`;
+  let activeMacroId = null;
 
-  menuSections.forEach((sec) => {
+  MENU_SECTIONS.forEach((sec) => {
+    if (sec.id === currentView) {
+      currentTitle = `Hub: ${sec.titolo}`;
+      currentMacro = sec.titolo;
+      currentMacroColor = sec.colore;
+      currentMacroIcon = sec.icona;
+      activeMacroId = sec.id;
+    }
     sec.voci.forEach((v) => {
       if (v.id === currentView) {
         currentTitle = v.etichetta;
         currentMacro = sec.titolo;
         currentMacroColor = sec.colore;
+        currentMacroIcon = sec.icona;
+        activeMacroId = sec.id;
       }
     });
   });
 
-  const sidebarNavHtml = menuSections.map((sec) => {
-    const isAnyActive = sec.voci.some((v) => v.id === currentView);
+  // Costruzione della Sidebar HTML
+  const sidebarNavHtml = MENU_SECTIONS.map((sec) => {
+    const isThisMacroHub = sec.id === currentView;
+    const isAnyChildActive = sec.voci.some((v) => v.id === currentView);
+    const isExpanded = isThisMacroHub || isAnyChildActive;
+
     const subItems = sec.voci.map((v) => {
       const activeClass = v.id === currentView ? "active" : "";
-      const badgeHtml = v.badge ? `<span class="nav-badge ${v.badge === "Prossimo" ? "badge-next" : ""}">${v.badge}</span>` : "";
+      const badgeHtml = v.badge ? `<span class="nav-badge">${v.badge}</span>` : "";
       return `<a href="/admin?view=${v.id}" class="nav-sub-item ${activeClass}">
         <span class="sub-dot" style="background: ${sec.colore};"></span>
         <span class="sub-text">${v.etichetta}</span>
@@ -457,13 +533,15 @@ async function renderAdminDashboard(env, utente, url) {
     }).join("");
 
     return `
-      <div class="nav-group ${isAnyActive ? "expanded" : ""}">
-        <div class="nav-group-header" onclick="this.parentElement.classList.toggle('expanded')">
-          <div class="nav-group-title">
+      <div class="nav-group ${isExpanded ? "expanded" : ""}">
+        <div class="nav-group-header">
+          <a href="/admin?view=${sec.id}" class="nav-group-title ${isThisMacroHub ? "macro-active" : ""}">
             <span class="nav-icon" style="color: ${sec.colore};">${sec.icona}</span>
             <span class="nav-group-name">${sec.titolo}</span>
-          </div>
-          <svg class="chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+          </a>
+          <button type="button" class="chevron-btn" onclick="this.closest('.nav-group').classList.toggle('expanded')" title="Espandi/Comprimi sottomenu">
+            <svg class="chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+          </button>
         </div>
         <div class="nav-group-sub">
           ${subItems}
@@ -472,9 +550,106 @@ async function renderAdminDashboard(env, utente, url) {
     `;
   }).join("");
 
+  let msgNotifica = "";
+  if (msgParam === "delibera_ok") {
+    msgNotifica = `<div class="alert-box alert-success">Delibera Consiglio Direttivo registrata con successo! Il socio è stato approvato e tesserato.</div>`;
+  } else if (msgParam === "err_campi") {
+    msgNotifica = `<div class="alert-box alert-error">Compila tutti i campi obbligatori della delibera (Data, N° Verbale).</div>`;
+  }
+
+  // Costruzione del Contenuto Principale (Workspace)
   let mainContentHtml = "";
 
-  if (currentView === "domande") {
+  // CASO 1: DASHBOARD GENERALE
+  if (currentView === "dashboard") {
+    mainContentHtml = `
+      <div class="stats-grid">
+        <div class="stat-card">
+          <div class="stat-label">DOMANDE IN ATTESA CD</div>
+          <div class="stat-value" style="color: #F59E0B;">${inAttesa}</div>
+          <div class="stat-sub">Richieste di ammissione da deliberare</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">SOCI ATTIVI &amp; TESSERATI</div>
+          <div class="stat-value" style="color: #10B981;">${approvate}</div>
+          <div class="stat-sub">Soci con tessera APS attiva</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">ATTIVITÀ &amp; LABORATORI</div>
+          <div class="stat-value" style="color: #06B6D4;">1</div>
+          <div class="stat-sub">Corsi di teatro attivi</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">SPETTACOLI &amp; CASSA</div>
+          <div class="stat-value" style="color: #D98295;">0 €</div>
+          <div class="stat-sub">Incassi del mese corrente</div>
+        </div>
+      </div>
+
+      <div class="dashboard-hub-section">
+        <div class="section-header-clean">
+          <h2>Centro di Controllo • Tutte le Macro-Aree</h2>
+          <p>Naviga rapidamente tra i settori del gestionale approvati nella Bibbia</p>
+        </div>
+
+        <div class="hub-cards-grid">
+          ${MENU_SECTIONS.map((sec) => `
+            <a href="/admin?view=${sec.id}" class="hub-card" style="--card-accent: ${sec.colore};">
+              <div class="hub-card-top">
+                <div class="hub-card-icon" style="background: ${sec.colore}18; color: ${sec.colore};">
+                  ${sec.icona}
+                </div>
+                <span class="hub-card-badge" style="border-color: ${sec.colore}40; color: ${sec.colore};">
+                  ${sec.voci.length} sezioni
+                </span>
+              </div>
+              <h3 class="hub-card-title">${sec.titolo}</h3>
+              <p class="hub-card-desc">${sec.descrizione}</p>
+              <div class="hub-card-footer" style="color: ${sec.colore};">
+                <span>Apri panoramica</span>
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>
+              </div>
+            </a>
+          `).join("")}
+        </div>
+      </div>
+    `;
+  }
+  // CASO 2: HUB DI UNA MACRO-AREA (Tessere quadrate con descrizione e link diretti)
+  else if (currentView.startsWith("macro-")) {
+    const sec = MENU_SECTIONS.find((s) => s.id === currentView);
+    if (sec) {
+      mainContentHtml = `
+        <div class="macro-hub-intro">
+          <p class="macro-hub-desc">${sec.descrizione}</p>
+        </div>
+
+        <div class="hub-cards-grid">
+          ${sec.voci.map((v) => {
+            const badgeLive = v.badge ? `<span class="badge-pill bg-amber" style="margin-left: auto;">${v.badge} in attesa</span>` : "";
+            return `
+              <a href="/admin?view=${v.id}" class="hub-card" style="--card-accent: ${sec.colore};">
+                <div class="hub-card-top">
+                  <div class="hub-card-icon" style="background: ${sec.colore}18; color: ${sec.colore};">
+                    ${sec.icona}
+                  </div>
+                  ${badgeLive}
+                </div>
+                <h3 class="hub-card-title">${v.etichetta}</h3>
+                <p class="hub-card-desc">${v.desc}</p>
+                <div class="hub-card-footer" style="color: ${sec.colore};">
+                  <span>Accedi alla sezione</span>
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>
+                </div>
+              </a>
+            `;
+          }).join("")}
+        </div>
+      `;
+    }
+  }
+  // CASO 3: SEZIONE 1.1 DOMANDE DI AMMISSIONE (TABELLA OPERATIVA & DELIBERE)
+  else if (currentView === "domande") {
     const righeDomande = domande.length === 0
       ? `<tr><td colspan="7" style="text-align: center; padding: 36px; color: #71717A;">Nessuna domanda ricevuta al momento.</td></tr>`
       : domande.map((d) => {
@@ -509,11 +684,11 @@ async function renderAdminDashboard(env, utente, url) {
                      <input type="text" name="numero_verbale" placeholder="Es. 04/2026" required>
                    </label>
                  </div>
-                 <div class="form-row">
+                 <div class="form-row" style="margin-top: 6px;">
                    <label>N° Tessera APS:
-                     <input type="text" name="numero_tessera_aps" placeholder="Es. 2026-042" required>
+                     <input type="text" name="numero_tessera" placeholder="Es. 2026-001 (vuoto = auto)">
                    </label>
-                   <button type="submit" class="btn-approva">Approva &amp; Tessera</button>
+                   <button type="submit" class="btn-delibera">Approva &amp; Tessera</button>
                  </div>
                </form>`;
 
@@ -590,11 +765,13 @@ async function renderAdminDashboard(env, utente, url) {
         </div>
       </div>
     `;
-  } else {
+  }
+  // CASO 4: ALTRE VOCI SOTTOMENU NON ANCORA COLLEGATE A D1
+  else {
     mainContentHtml = `
       <div class="placeholder-card">
         <div class="placeholder-icon" style="background: ${currentMacroColor}20; color: ${currentMacroColor};">
-          <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
+          ${currentMacroIcon}
         </div>
         <h2>${currentTitle}</h2>
         <div class="placeholder-meta">
@@ -604,7 +781,7 @@ async function renderAdminDashboard(env, utente, url) {
           <span class="tag-status">Struttura Sidebar Ufficiale della Bibbia</span>
         </div>
         <p class="placeholder-desc">
-          Questa sezione è già perfettamente inserita e mappata nella struttura della Sidebar. 
+          Questa sezione è già perfettamente inserita e mappata nella struttura del gestionale. 
           Nei prossimi passaggi della roadmap collegheremo la configurazione D1 per gestire i contenuti e i dati direttamente da qui.
         </p>
         <div class="placeholder-roadmap">
@@ -615,9 +792,12 @@ async function renderAdminDashboard(env, utente, url) {
             <li><strong>Passo 4:</strong> Sezione 4.1 Form Builder Dinamico per creare e modificare i moduli soci/corsi</li>
           </ul>
         </div>
-        <div style="margin-top: 24px;">
+        <div style="margin-top: 24px; display: flex; gap: 12px; justify-content: center;">
+          <a href="/admin?view=${activeMacroId || 'dashboard'}" class="btn-secondary" style="text-decoration: none;">
+            Torna all'Hub ${currentMacro}
+          </a>
           <a href="/admin?view=domande" class="btn-primary" style="display: inline-block; text-decoration: none;">
-            Torna a 1.1 Domande di Ammissione
+            Vai a 1.1 Domande Ammissione
           </a>
         </div>
       </div>
@@ -629,289 +809,307 @@ async function renderAdminDashboard(env, utente, url) {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>${currentTitle} | Gestionale Cervelli in Affitto APS</title>
+  <title>Gestionale Admin • Cervelli in Affitto APS</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
   <style>
     :root {
-      --bg-dark: #121214;
-      --bg-sidebar: #18181B;
-      --bg-card-dark: #1C1C1F;
-      --brand-rose: #D98295;
-      --brand-rose-dark: #9F5D6B;
-      --brand-rose-light: #FDF2F4;
-      --silver: #E8E7E9;
-      --border-dark: #27272A;
-      --text-dark: #18181B;
-      --text-muted: #71717A;
-      --bg-light: #F8F9FA;
-      --border-light: #E4E4E7;
-      --success: #15803D;
+      --brand-coral: #D98295;
+      --brand-silver: #E8E7E9;
+      --brand-black: #121214;
+      --card-bg: #18181B;
+      --card-border: #27272A;
+      --text-muted: #A1A1AA;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
-      font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      background: var(--bg-light);
-      color: var(--text-dark);
-      display: flex;
+      font-family: 'Plus Jakarta Sans', sans-serif;
+      background: #09090B;
+      color: #FAFAFA;
       min-height: 100vh;
-      overflow-x: hidden;
+      display: flex;
+      flex-direction: column;
     }
 
-    /* Top Bar */
+    /* TOP NAVBAR */
     .topbar {
-      position: fixed;
-      top: 0;
-      left: 0;
-      right: 0;
       height: 64px;
-      background: var(--bg-dark);
-      border-bottom: 1px solid var(--border-dark);
+      background: #121214;
+      border-bottom: 1px solid var(--card-border);
       display: flex;
       align-items: center;
       justify-content: space-between;
       padding: 0 20px;
+      position: sticky;
+      top: 0;
       z-index: 100;
-      color: var(--silver);
     }
     .topbar-left {
       display: flex;
       align-items: center;
       gap: 14px;
     }
-    .btn-toggle-sidebar {
-      background: #27272A;
-      border: 1px solid #3F3F46;
-      color: var(--silver);
-      border-radius: 8px;
-      width: 36px;
-      height: 36px;
+    .toggle-sidebar-btn {
+      background: transparent;
+      border: 1px solid var(--card-border);
+      color: #FAFAFA;
+      padding: 7px 10px;
+      border-radius: 6px;
+      cursor: pointer;
       display: flex;
       align-items: center;
-      justify-content: center;
-      cursor: pointer;
       transition: all 0.2s;
     }
-    .btn-toggle-sidebar:hover {
-      background: var(--brand-rose);
-      color: #fff;
+    .toggle-sidebar-btn:hover {
+      background: #27272A;
+      color: var(--brand-coral);
     }
     .topbar-brand {
+      font-weight: 700;
+      font-size: 16px;
+      letter-spacing: -0.01em;
       display: flex;
       align-items: center;
       gap: 10px;
-      font-weight: 800;
-      font-size: 17px;
-      color: #fff;
+      color: #FFF;
       text-decoration: none;
     }
-    .badge-superadmin {
-      background: rgba(217, 130, 149, 0.18);
-      color: var(--brand-rose);
-      border: 1px solid var(--brand-rose);
-      border-radius: 999px;
-      padding: 2px 10px;
+    .badge-role {
       font-size: 11px;
       font-weight: 700;
-      letter-spacing: 0.5px;
+      background: var(--brand-coral)22;
+      color: var(--brand-coral);
+      padding: 3px 8px;
+      border-radius: 9999px;
+      border: 1px solid var(--brand-coral)44;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
     }
     .topbar-right {
       display: flex;
       align-items: center;
       gap: 16px;
+      font-size: 13px;
     }
     .user-info {
-      font-size: 13px;
-      color: #A1A1AA;
+      color: var(--text-muted);
     }
     .user-info strong {
-      color: #fff;
+      color: #FAFAFA;
     }
     .btn-logout {
-      background: #27272A;
+      background: transparent;
       border: 1px solid #3F3F46;
       color: #E4E4E7;
-      padding: 6px 14px;
-      border-radius: 8px;
+      padding: 6px 12px;
+      border-radius: 6px;
       font-size: 12px;
       font-weight: 600;
+      cursor: pointer;
       text-decoration: none;
       transition: all 0.2s;
     }
     .btn-logout:hover {
-      background: #DC2626;
-      border-color: #DC2626;
-      color: #fff;
+      background: #EF444422;
+      border-color: #EF4444;
+      color: #EF4444;
     }
 
-    /* Layout: Sidebar + Main */
+    /* APP LAYOUT */
+    .app-body {
+      display: flex;
+      flex: 1;
+      overflow: hidden;
+    }
+
+    /* SIDEBAR */
     .sidebar {
       width: 270px;
-      background: var(--bg-sidebar);
-      border-right: 1px solid var(--border-dark);
-      position: fixed;
-      top: 64px;
-      bottom: 0;
-      left: 0;
+      background: #121214;
+      border-right: 1px solid var(--card-border);
+      display: flex;
+      flex-direction: column;
+      flex-shrink: 0;
       overflow-y: auto;
-      transition: width 0.25s ease;
-      z-index: 90;
       padding: 16px 12px;
-      color: #D4D4D8;
+      transition: width 0.25s cubic-bezier(0.4, 0, 0.2, 1);
     }
     .sidebar.collapsed {
-      width: 72px;
+      width: 68px;
+      padding: 16px 8px;
     }
+    .sidebar.collapsed .sidebar-header-label,
     .sidebar.collapsed .nav-group-name,
-    .sidebar.collapsed .chevron,
+    .sidebar.collapsed .chevron-btn,
     .sidebar.collapsed .nav-group-sub,
-    .sidebar.collapsed .sidebar-header-label {
+    .sidebar.collapsed .nav-dashboard-link span,
+    .sidebar.collapsed .sub-text,
+    .sidebar.collapsed .nav-badge {
       display: none !important;
     }
-    .sidebar.collapsed .nav-group-header {
+    .sidebar.collapsed .nav-group-title,
+    .sidebar.collapsed .nav-dashboard-link {
       justify-content: center;
       padding: 10px 0;
     }
-    .sidebar.collapsed .nav-icon {
-      margin: 0;
-    }
 
-    .main-workspace {
-      margin-left: 270px;
-      margin-top: 64px;
-      flex: 1;
-      padding: 28px 32px;
-      transition: margin-left 0.25s ease;
-      min-height: calc(100vh - 64px);
-    }
-    .main-workspace.expanded {
-      margin-left: 72px;
-    }
-
-    /* Nav items */
     .sidebar-header-label {
-      font-size: 11px;
+      font-size: 10px;
       font-weight: 700;
+      color: #52525B;
       text-transform: uppercase;
-      letter-spacing: 0.8px;
-      color: #71717A;
-      padding: 8px 12px 6px;
+      letter-spacing: 0.08em;
+      margin: 14px 8px 6px;
     }
+
+    /* DASHBOARD LINK */
     .nav-dashboard-link {
       display: flex;
       align-items: center;
-      gap: 12px;
+      gap: 10px;
       padding: 10px 12px;
       border-radius: 8px;
-      color: #E4E4E7;
+      color: #D4D4D8;
       text-decoration: none;
+      font-size: 13.5px;
       font-weight: 600;
-      font-size: 13px;
-      margin-bottom: 12px;
-      background: #27272A;
-      transition: all 0.2s;
+      transition: all 0.15s;
+      margin-bottom: 8px;
+      background: transparent;
     }
-    .nav-dashboard-link:hover, .nav-dashboard-link.active {
-      background: var(--brand-rose);
-      color: #fff;
+    .nav-dashboard-link:hover {
+      background: #1E1E24;
+      color: #FFF;
+    }
+    .nav-dashboard-link.active {
+      background: var(--brand-coral);
+      color: #121214;
+      font-weight: 700;
     }
 
+    /* NAV GROUPS (ACCORDION) */
     .nav-group {
-      margin-bottom: 8px;
-      border-radius: 8px;
-      overflow: hidden;
+      margin-bottom: 4px;
     }
     .nav-group-header {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      padding: 10px 12px;
       border-radius: 8px;
-      cursor: pointer;
-      user-select: none;
       transition: background 0.15s;
     }
     .nav-group-header:hover {
-      background: #27272A;
+      background: #1E1E24;
     }
     .nav-group-title {
+      flex: 1;
       display: flex;
       align-items: center;
       gap: 10px;
-      font-size: 13px;
-      font-weight: 700;
+      padding: 9px 12px;
+      color: #E4E4E7;
+      text-decoration: none;
+      font-size: 13.5px;
+      font-weight: 600;
+      border-radius: 8px 0 0 8px;
+    }
+    .nav-group-title.macro-active {
+      background: #27272A;
+      color: #FFF;
+    }
+    .chevron-btn {
+      background: transparent;
+      border: none;
+      color: #71717A;
+      padding: 10px 12px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      border-radius: 0 8px 8px 0;
+      transition: color 0.15s;
+    }
+    .chevron-btn:hover {
       color: #FAFAFA;
     }
     .nav-icon {
       display: flex;
       align-items: center;
+      justify-content: center;
+      width: 20px;
     }
     .chevron {
-      color: #71717A;
-      transition: transform 0.2s ease;
+      transition: transform 0.2s;
     }
     .nav-group.expanded .chevron {
       transform: rotate(180deg);
     }
     .nav-group-sub {
       display: none;
-      padding: 4px 0 6px 14px;
+      padding-left: 14px;
+      margin-top: 2px;
+      margin-bottom: 6px;
+      border-left: 1px solid #27272A;
+      margin-left: 20px;
     }
     .nav-group.expanded .nav-group-sub {
-      display: block;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
     }
     .nav-sub-item {
       display: flex;
       align-items: center;
-      gap: 10px;
-      padding: 8px 10px;
+      gap: 9px;
+      padding: 7px 10px;
       border-radius: 6px;
       color: #A1A1AA;
       text-decoration: none;
-      font-size: 12px;
+      font-size: 12.5px;
       font-weight: 500;
-      margin-bottom: 2px;
       transition: all 0.15s;
     }
     .nav-sub-item:hover {
-      color: #fff;
-      background: #27272A;
+      color: #FFF;
+      background: #1E1E24;
     }
     .nav-sub-item.active {
-      color: #fff;
+      color: #FAFAFA;
       background: #27272A;
-      font-weight: 700;
-      border-left: 3px solid var(--brand-rose);
+      font-weight: 600;
     }
     .sub-dot {
       width: 6px;
       height: 6px;
       border-radius: 50%;
+      flex-shrink: 0;
     }
     .nav-badge {
       margin-left: auto;
-      background: #DC2626;
-      color: #fff;
-      border-radius: 999px;
-      padding: 1px 7px;
-      font-size: 10px;
+      font-size: 10.5px;
       font-weight: 700;
-    }
-    .nav-badge.badge-next {
-      background: #10B981;
+      background: #EF4444;
+      color: #FFF;
+      padding: 2px 6px;
+      border-radius: 9999px;
     }
 
-    /* Page Content Header */
+    /* MAIN WORKSPACE */
+    .main-workspace {
+      flex: 1;
+      overflow-y: auto;
+      padding: 28px 36px;
+      background: #09090B;
+    }
+
+    /* PAGE BANNER */
     .page-banner {
-      background: #fff;
-      border: 1px solid var(--border-light);
-      border-radius: 12px;
-      padding: 20px 24px;
-      margin-bottom: 24px;
       display: flex;
       align-items: center;
       justify-content: space-between;
-      box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+      margin-bottom: 24px;
+      padding-bottom: 16px;
+      border-bottom: 1px solid var(--card-border);
     }
     .page-banner-left {
       display: flex;
@@ -925,65 +1123,187 @@ async function renderAdminDashboard(env, utente, url) {
       display: flex;
       align-items: center;
       justify-content: center;
+      flex-shrink: 0;
     }
     .page-banner-title h1 {
-      font-size: 20px;
-      font-weight: 800;
-      color: var(--text-dark);
+      font-size: 22px;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      color: #FFF;
     }
-    .page-banner-title .breadcrumb {
+    .breadcrumb {
       font-size: 12px;
       color: var(--text-muted);
       margin-top: 2px;
     }
 
-    /* Stat Cards */
+    /* STATS GRID */
     .stats-grid {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-      gap: 18px;
-      margin-bottom: 24px;
+      gap: 16px;
+      margin-bottom: 28px;
     }
     .stat-card {
-      background: #fff;
-      border: 1px solid var(--border-light);
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
       border-radius: 12px;
-      padding: 22px 24px;
-      box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+      padding: 18px 20px;
     }
     .stat-label {
       font-size: 11px;
       font-weight: 700;
       color: var(--text-muted);
-      letter-spacing: 0.6px;
-      margin-bottom: 8px;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
     }
     .stat-value {
-      font-size: 32px;
+      font-size: 28px;
       font-weight: 800;
-      color: var(--text-dark);
+      color: #FFF;
+      margin-top: 6px;
+      letter-spacing: -0.02em;
+    }
+    .stat-sub {
+      font-size: 12px;
+      color: #71717A;
+      margin-top: 4px;
     }
 
-    /* Tables */
-    .card-table {
-      background: #fff;
-      border: 1px solid var(--border-light);
+    /* HUB SECTION & CARDS GRID */
+    .section-header-clean {
+      margin-bottom: 18px;
+    }
+    .section-header-clean h2 {
+      font-size: 18px;
+      font-weight: 700;
+      color: #FAFAFA;
+    }
+    .section-header-clean p {
+      font-size: 13px;
+      color: var(--text-muted);
+      margin-top: 2px;
+    }
+    .macro-hub-intro {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      padding: 16px 20px;
+      border-radius: 10px;
+      margin-bottom: 24px;
+    }
+    .macro-hub-desc {
+      font-size: 14px;
+      color: #D4D4D8;
+      line-height: 1.5;
+    }
+    .hub-cards-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      gap: 18px;
+      margin-bottom: 32px;
+    }
+    .hub-card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
       border-radius: 12px;
-      box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+      padding: 22px;
+      text-decoration: none;
+      display: flex;
+      flex-direction: column;
+      position: relative;
+      transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
       overflow: hidden;
+    }
+    .hub-card::before {
+      content: "";
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 3px;
+      background: var(--card-accent, var(--brand-coral));
+      opacity: 0.4;
+      transition: opacity 0.2s;
+    }
+    .hub-card:hover {
+      transform: translateY(-3px);
+      border-color: #3F3F46;
+      background: #1F1F24;
+      box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.5);
+    }
+    .hub-card:hover::before {
+      opacity: 1;
+    }
+    .hub-card-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 16px;
+    }
+    .hub-card-icon {
+      width: 40px;
+      height: 40px;
+      border-radius: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .hub-card-badge {
+      font-size: 11px;
+      font-weight: 700;
+      padding: 3px 8px;
+      border-radius: 9999px;
+      border: 1px solid;
+    }
+    .hub-card-title {
+      font-size: 16px;
+      font-weight: 700;
+      color: #FAFAFA;
+      letter-spacing: -0.01em;
+      margin-bottom: 8px;
+    }
+    .hub-card-desc {
+      font-size: 13px;
+      color: var(--text-muted);
+      line-height: 1.45;
+      margin-bottom: 20px;
+      flex: 1;
+    }
+    .hub-card-footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 12.5px;
+      font-weight: 600;
+      border-top: 1px solid #27272A;
+      padding-top: 14px;
+      transition: gap 0.2s;
+    }
+    .hub-card:hover .hub-card-footer svg {
+      transform: translateX(3px);
+    }
+
+    /* TABLE SECTION */
+    .card-table {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 12px;
+      overflow: hidden;
+      margin-bottom: 30px;
     }
     .card-header-table {
       padding: 20px 24px;
-      border-bottom: 1px solid var(--border-light);
+      border-bottom: 1px solid var(--card-border);
     }
     .card-header-table h3 {
       font-size: 16px;
       font-weight: 700;
+      color: #FAFAFA;
     }
     .card-header-table p {
-      font-size: 12px;
+      font-size: 12.5px;
       color: var(--text-muted);
-      margin-top: 2px;
+      margin-top: 3px;
     }
     .table-responsive {
       overflow-x: auto;
@@ -991,913 +1311,740 @@ async function renderAdminDashboard(env, utente, url) {
     table {
       width: 100%;
       border-collapse: collapse;
+      text-align: left;
       font-size: 13px;
     }
     th {
-      background: #F9FAFB;
-      text-align: left;
-      padding: 12px 16px;
-      font-size: 11px;
-      font-weight: 700;
-      color: var(--text-muted);
+      background: #141416;
+      color: #A1A1AA;
+      font-weight: 600;
+      font-size: 11.5px;
       text-transform: uppercase;
-      letter-spacing: 0.5px;
-      border-bottom: 1px solid var(--border-light);
+      letter-spacing: 0.05em;
+      padding: 12px 18px;
+      border-bottom: 1px solid var(--card-border);
     }
     td {
-      padding: 16px;
-      border-bottom: 1px solid var(--border-light);
+      padding: 16px 18px;
+      border-bottom: 1px solid #27272A;
       vertical-align: top;
+      color: #E4E4E7;
     }
-    tr:last-child td {
-      border-bottom: none;
+    tr:hover td {
+      background: #1C1C20;
     }
     .text-sub {
-      color: var(--text-muted);
-      font-size: 12px;
+      font-size: 11.5px;
+      color: #A1A1AA;
     }
     .badge-pill {
       display: inline-block;
-      padding: 3px 8px;
-      border-radius: 6px;
       font-size: 11px;
       font-weight: 700;
-      margin-right: 4px;
-      margin-bottom: 4px;
+      padding: 2px 8px;
+      border-radius: 9999px;
+      margin: 2px 0;
     }
-    .bg-green { background: #DCFCE7; color: #15803D; }
-    .bg-amber { background: #FEF3C7; color: #B45309; }
-    .bg-gray { background: #F3F4F6; color: #4B5563; }
+    .bg-green { background: #10B98122; color: #10B981; border: 1px solid #10B98144; }
+    .bg-amber { background: #F59E0B22; color: #F59E0B; border: 1px solid #F59E0B44; }
+    .bg-gray { background: #27272A; color: #A1A1AA; border: 1px solid #3F3F46; }
     .tag-delegato {
       display: inline-block;
-      background: #EFF6FF;
-      color: #1D4ED8;
-      border: 1px solid #BFDBFE;
-      border-radius: 4px;
-      padding: 2px 6px;
+      background: #27272A;
+      color: #E4E4E7;
       font-size: 11px;
-      margin-bottom: 4px;
+      padding: 2px 6px;
+      border-radius: 4px;
+      margin-bottom: 2px;
     }
 
-    /* Form Delibera */
+    /* FORM DELIBERA */
     .form-delibera {
-      background: #F9FAFB;
-      border: 1px solid #E5E7EB;
+      background: #141416;
+      padding: 10px 12px;
       border-radius: 8px;
-      padding: 10px;
+      border: 1px solid #27272A;
     }
     .form-row {
       display: flex;
       gap: 8px;
-      margin-bottom: 8px;
+      align-items: flex-end;
     }
-    .form-row:last-child {
-      margin-bottom: 0;
-    }
-    .form-row label {
-      display: block;
-      font-size: 10px;
-      font-weight: 700;
-      color: #4B5563;
+    .form-delibera label {
+      font-size: 10.5px;
+      color: #A1A1AA;
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
       flex: 1;
     }
-    .form-row input {
-      width: 100%;
-      padding: 5px 8px;
-      border: 1px solid #D1D5DB;
-      border-radius: 6px;
+    .form-delibera input {
+      background: #09090B;
+      border: 1px solid #3F3F46;
+      color: #FFF;
+      padding: 6px 8px;
+      border-radius: 5px;
       font-size: 12px;
-      margin-top: 2px;
     }
-    .btn-approva {
-      background: var(--brand-rose);
-      color: #fff;
-      border: none;
-      padding: 8px 12px;
-      border-radius: 6px;
-      font-size: 12px;
+    .form-delibera input:focus {
+      outline: none;
+      border-color: var(--brand-coral);
+    }
+    .btn-delibera {
+      background: var(--brand-coral);
+      color: #121214;
       font-weight: 700;
+      font-size: 12px;
+      border: none;
+      padding: 8px 14px;
+      border-radius: 6px;
       cursor: pointer;
-      width: 100%;
-      transition: background 0.2s;
+      transition: opacity 0.2s;
+      white-space: nowrap;
     }
-    .btn-approva:hover {
-      background: var(--brand-rose-dark);
+    .btn-delibera:hover {
+      opacity: 0.9;
     }
     .delibera-info {
-      background: #F0FDF4;
-      border: 1px solid #BBF7D0;
-      border-radius: 8px;
-      padding: 10px;
       font-size: 12px;
-      color: #166534;
+      color: #D4D4D8;
       line-height: 1.6;
     }
     .tessera-highlight {
-      color: var(--brand-rose-dark);
-      font-weight: 800;
-    }
-    .alert-success {
-      background: #DCFCE7;
-      color: #15803D;
-      border: 1px solid #86EFAC;
-      border-radius: 8px;
-      padding: 12px 18px;
-      margin-bottom: 20px;
-      font-weight: 600;
+      color: var(--brand-coral);
       font-size: 13px;
     }
 
-    /* Placeholder Screens */
+    /* PLACEHOLDER SECTION */
     .placeholder-card {
-      background: #fff;
-      border: 1px solid var(--border-light);
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
       border-radius: 16px;
-      padding: 40px;
+      padding: 40px 32px;
       text-align: center;
-      max-width: 700px;
-      margin: 40px auto;
-      box-shadow: 0 4px 12px rgba(0,0,0,0.03);
+      max-width: 680px;
+      margin: 30px auto;
     }
     .placeholder-icon {
       width: 72px;
       height: 72px;
-      border-radius: 16px;
-      display: inline-flex;
+      border-radius: 18px;
+      display: flex;
       align-items: center;
       justify-content: center;
-      margin-bottom: 20px;
+      margin: 0 auto 20px;
     }
     .placeholder-card h2 {
-      font-size: 24px;
-      font-weight: 800;
-      color: var(--text-dark);
+      font-size: 22px;
+      font-weight: 700;
+      color: #FFF;
       margin-bottom: 12px;
     }
     .placeholder-meta {
       display: flex;
-      align-items: center;
+      gap: 8px;
       justify-content: center;
-      gap: 10px;
-      margin-bottom: 20px;
+      margin-bottom: 16px;
     }
     .tag-macro {
-      padding: 4px 12px;
-      border-radius: 999px;
       font-size: 12px;
       font-weight: 700;
+      padding: 3px 10px;
+      border-radius: 9999px;
     }
     .tag-status {
-      background: #F3F4F6;
-      color: #4B5563;
-      padding: 4px 12px;
-      border-radius: 999px;
       font-size: 12px;
-      font-weight: 600;
+      background: #27272A;
+      color: #D4D4D8;
+      padding: 3px 10px;
+      border-radius: 9999px;
     }
     .placeholder-desc {
       font-size: 14px;
-      line-height: 1.6;
       color: var(--text-muted);
-      margin-bottom: 28px;
+      line-height: 1.6;
+      margin-bottom: 24px;
     }
     .placeholder-roadmap {
-      background: #F9FAFB;
-      border: 1px solid #E5E7EB;
-      border-radius: 12px;
-      padding: 20px;
+      background: #121214;
+      border: 1px solid #27272A;
+      border-radius: 10px;
+      padding: 16px 20px;
       text-align: left;
+      font-size: 13px;
+      color: #D4D4D8;
     }
     .placeholder-roadmap h4 {
       font-size: 13px;
       font-weight: 700;
+      color: #FFF;
       margin-bottom: 10px;
-      color: var(--text-dark);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
     }
     .placeholder-roadmap ul {
-      list-style: none;
-      padding-left: 0;
-      font-size: 13px;
-      color: #4B5563;
-    }
-    .placeholder-roadmap li {
-      padding: 6px 0;
-      border-bottom: 1px dashed #E5E7EB;
-    }
-    .placeholder-roadmap li:last-child {
-      border-bottom: none;
+      list-style-type: none;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
     }
     .btn-primary {
-      background: var(--brand-rose);
-      color: #fff;
-      padding: 10px 20px;
-      border-radius: 8px;
-      font-size: 13px;
+      background: var(--brand-coral);
+      color: #121214;
       font-weight: 700;
+      font-size: 13px;
+      padding: 10px 18px;
+      border-radius: 8px;
+      transition: opacity 0.2s;
+    }
+    .btn-secondary {
+      background: #27272A;
+      color: #FAFAFA;
+      font-weight: 600;
+      font-size: 13px;
+      padding: 10px 18px;
+      border-radius: 8px;
       transition: background 0.2s;
     }
-    .btn-primary:hover {
-      background: var(--brand-rose-dark);
+    .btn-secondary:hover {
+      background: #3F3F46;
+    }
+
+    /* ALERTS */
+    .alert-box {
+      padding: 12px 16px;
+      border-radius: 8px;
+      font-size: 13px;
+      margin-bottom: 20px;
+      font-weight: 600;
+    }
+    .alert-success { background: #10B98120; border: 1px solid #10B981; color: #10B981; }
+    .alert-error { background: #EF444420; border: 1px solid #EF4444; color: #EF4444; }
+
+    @media (max-width: 900px) {
+      .sidebar { position: fixed; height: calc(100vh - 64px); z-index: 99; transform: translateX(-100%); }
+      .sidebar.open { transform: translateX(0); }
+      .main-workspace { padding: 20px 16px; }
+      .stats-grid { grid-template-columns: 1fr; }
     }
   </style>
 </head>
 <body>
-  <div class="topbar">
+
+  <!-- TOP NAVBAR -->
+  <header class="topbar">
     <div class="topbar-left">
-      <button class="btn-toggle-sidebar" id="toggleSidebar" title="Comprimi / Espandi Sidebar">
+      <button class="toggle-sidebar-btn" id="toggleSidebar" title="Comprimi o Espandi Sidebar">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
       </button>
-      <a href="/admin" class="topbar-brand">
+      <a href="/admin?view=dashboard" class="topbar-brand">
         <span>Cervelli in Affitto APS</span>
-        <span class="badge-superadmin">SUPER ADMIN</span>
+        <span class="badge-role">SUPER ADMIN</span>
       </a>
     </div>
     <div class="topbar-right">
-      <div class="user-info">
-        Connesso: <strong>${utente.nome} ${utente.cognome}</strong> (${utente.email})
-      </div>
+      <span class="user-info">Connesso: <strong>${utente.nome} ${utente.cognome}</strong> (${utente.email})</span>
       <a href="/admin/logout" class="btn-logout">Disconnetti</a>
     </div>
-  </div>
+  </header>
 
-  <div class="sidebar" id="sidebar">
-    <div class="sidebar-header-label">Area Gestionale</div>
-    <a href="/admin?view=domande" class="nav-dashboard-link ${currentView === "domande" ? "active" : ""}">
-      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
-      <span>Dashboard Generale</span>
-    </a>
+  <!-- CORPO PRINCIPALE -->
+  <div class="app-body">
+    <!-- SIDEBAR -->
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-header-label">Area Gestionale</div>
+      <a href="/admin?view=dashboard" class="nav-dashboard-link ${currentView === "dashboard" ? "active" : ""}">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+        <span>Dashboard Generale</span>
+      </a>
 
-    <div class="sidebar-header-label">Macro-Aree Bibbia</div>
-    ${sidebarNavHtml}
-  </div>
+      <div class="sidebar-header-label">Macro-Aree Bibbia</div>
+      ${sidebarNavHtml}
+    </aside>
 
-  <div class="main-workspace" id="mainWorkspace">
-    ${msgNotifica}
+    <!-- AREA DI LAVORO CENTRALE -->
+    <main class="main-workspace" id="mainWorkspace">
+      ${msgNotifica}
 
-    <div class="page-banner">
-      <div class="page-banner-left">
-        <div class="macro-icon-box" style="background: ${currentMacroColor}18; color: ${currentMacroColor};">
-          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
-        </div>
-        <div class="page-banner-title">
-          <h1>${currentTitle}</h1>
-          <div class="breadcrumb">Pannello Gestionale &gt; ${currentMacro} &gt; <strong>${currentTitle}</strong></div>
+      <div class="page-banner">
+        <div class="page-banner-left">
+          <div class="macro-icon-box" style="background: ${currentMacroColor}18; color: ${currentMacroColor};">
+            ${currentMacroIcon}
+          </div>
+          <div class="page-banner-title">
+            <h1>${currentTitle}</h1>
+            <div class="breadcrumb">Pannello Gestionale &gt; ${currentMacro} &gt; <strong>${currentTitle}</strong></div>
+          </div>
         </div>
       </div>
-    </div>
 
-    ${mainContentHtml}
+      ${mainContentHtml}
+    </main>
   </div>
 
   <script>
     const toggleBtn = document.getElementById("toggleSidebar");
     const sidebar = document.getElementById("sidebar");
-    const mainWorkspace = document.getElementById("mainWorkspace");
-
-    // Ripristina preferenza salvata
-    if (localStorage.getItem("cervelli_sidebar_collapsed") === "true") {
-      sidebar.classList.add("collapsed");
-      mainWorkspace.classList.add("expanded");
-    }
 
     toggleBtn.addEventListener("click", () => {
       sidebar.classList.toggle("collapsed");
-      mainWorkspace.classList.toggle("expanded");
-      localStorage.setItem("cervelli_sidebar_collapsed", sidebar.classList.contains("collapsed"));
     });
   </script>
 </body>
 </html>`;
 
-  return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+  return new Response(html, {
+    headers: { "Content-Type": "text/html; charset=utf-8" }
+  });
 }
 
-function renderSetupAdminPage(errore = "") {
-  const errHtml = errore ? `<div class="error-msg">${errore}</div>` : "";
+/* =========================================================================
+   PAGINE DI AUTENTICAZIONE AMMINISTRATIVA (SETUP & LOGIN)
+   ========================================================================= */
+
+function renderSetupPage(error = "") {
   const html = `<!DOCTYPE html>
 <html lang="it">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Primo Avvio: Configurazione Super Admin | Cervelli in Affitto APS</title>
+  <title>Setup Iniziale Super Admin • Cervelli in Affitto APS</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;700;800&display=swap" rel="stylesheet">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
       font-family: 'Plus Jakarta Sans', sans-serif;
       background: #121214;
-      color: #E8E7E9;
+      color: #FAFAFA;
+      min-height: 100vh;
       display: flex;
       align-items: center;
       justify-content: center;
-      min-height: 100vh;
       padding: 20px;
     }
-    .card {
-      background: #1C1C1F;
-      border: 1px solid #2E2E33;
+    .auth-card {
+      background: #18181B;
+      border: 1px solid #27272A;
       border-radius: 16px;
       padding: 36px 32px;
       width: 100%;
-      max-width: 480px;
-      box-shadow: 0 20px 40px rgba(0,0,0,0.5);
+      max-width: 460px;
+      box-shadow: 0 20px 40px -15px rgba(0,0,0,0.7);
     }
-    .badge {
+    .brand-header {
+      text-align: center;
+      margin-bottom: 24px;
+    }
+    .brand-badge {
       display: inline-block;
-      background: rgba(217, 130, 149, 0.15);
-      color: #D98295;
       font-size: 11px;
       font-weight: 700;
-      padding: 4px 10px;
-      border-radius: 999px;
+      background: #D9829522;
+      color: #D98295;
+      padding: 4px 12px;
+      border-radius: 9999px;
+      border: 1px solid #D9829544;
       margin-bottom: 12px;
       text-transform: uppercase;
-      letter-spacing: 0.5px;
+      letter-spacing: 0.05em;
     }
-    h1 { font-size: 22px; font-weight: 800; color: #fff; margin-bottom: 8px; }
-    p { font-size: 13px; color: #9CA3AF; line-height: 1.5; margin-bottom: 24px; }
-    .form-group { margin-bottom: 16px; }
-    .row { display: flex; gap: 12px; }
-    .row .form-group { flex: 1; }
-    label { display: block; font-size: 12px; font-weight: 700; color: #D1D5DB; margin-bottom: 6px; }
+    h1 {
+      font-size: 22px;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      margin-bottom: 8px;
+    }
+    p.sub {
+      color: #A1A1AA;
+      font-size: 13.5px;
+      line-height: 1.5;
+    }
+    .error-box {
+      background: #EF444422;
+      border: 1px solid #EF4444;
+      color: #F87171;
+      padding: 10px 14px;
+      border-radius: 8px;
+      font-size: 13px;
+      margin-bottom: 20px;
+    }
+    .form-group {
+      margin-bottom: 16px;
+      text-align: left;
+    }
+    label {
+      display: block;
+      font-size: 12.5px;
+      font-weight: 600;
+      color: #E4E4E7;
+      margin-bottom: 6px;
+    }
     input {
       width: 100%;
-      padding: 12px 14px;
-      background: #27272A;
+      background: #09090B;
       border: 1px solid #3F3F46;
+      color: #FFF;
+      padding: 10px 14px;
       border-radius: 8px;
-      color: #fff;
       font-size: 14px;
-      font-family: inherit;
+      transition: border-color 0.2s;
     }
-    input:focus { outline: none; border-color: #D98295; }
+    input:focus {
+      outline: none;
+      border-color: #D98295;
+      box-shadow: 0 0 0 2px #D9829533;
+    }
     .btn-submit {
       width: 100%;
       background: #D98295;
-      color: #fff;
-      border: none;
-      padding: 13px;
-      border-radius: 8px;
-      font-weight: 800;
+      color: #121214;
+      font-weight: 700;
       font-size: 14px;
+      padding: 12px;
+      border-radius: 8px;
+      border: none;
       cursor: pointer;
       margin-top: 10px;
-      transition: background 0.2s;
+      transition: opacity 0.2s;
     }
-    .btn-submit:hover { background: #9F5D6B; }
-    .error-msg {
-      background: #7F1D1D;
-      color: #FCA5A5;
-      padding: 10px 14px;
-      border-radius: 6px;
-      font-size: 13px;
-      margin-bottom: 16px;
-    }
-    .info-footer {
-      text-align: center;
-      margin-top: 24px;
-      font-size: 11px;
-      color: #71717A;
-    }
+    .btn-submit:hover { opacity: 0.9; }
   </style>
 </head>
 <body>
-  <div class="card">
-    <span class="badge">Inizializzazione Sistema</span>
-    <h1>Benvenuto, Super Admin</h1>
-    <p>Crea il profilo principale per accedere alla gestione di <strong>Cervelli in Affitto APS</strong>. Questo passaggio comparir&agrave; una sola volta.</p>
-    ${errHtml}
+  <div class="auth-card">
+    <div class="brand-header">
+      <span class="brand-badge">Primo Avvio Gestionale</span>
+      <h1>Attivazione Super Admin</h1>
+      <p class="sub">Crea l'account principale con pieno controllo su tutte le macro-aree della Bibbia.</p>
+    </div>
+
+    ${error ? `<div class="error-box">${error}</div>` : ""}
+
     <form method="POST" action="/admin/setup">
-      <div class="row">
+      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
         <div class="form-group">
-          <label>Nome *</label>
-          <input type="text" name="nome" placeholder="Es. Giacomo" required>
+          <label>Nome</label>
+          <input type="text" name="nome" placeholder="Giacomo" required autofocus>
         </div>
         <div class="form-group">
-          <label>Cognome *</label>
-          <input type="text" name="cognome" placeholder="Es. Garofani" required>
+          <label>Cognome</label>
+          <input type="text" name="cognome" placeholder="Garofani" required>
         </div>
       </div>
       <div class="form-group">
-        <label>Email Super Admin *</label>
-        <input type="email" name="email" placeholder="latua@email.it" required>
+        <label>Email Ufficiale</label>
+        <input type="email" name="email" placeholder="tua@email.it" required>
       </div>
       <div class="form-group">
-        <label>Password Personale (almeno 8 caratteri) *</label>
-        <input type="password" name="password" minlength="8" required>
+        <label>Password Personale (min 8 caratteri)</label>
+        <input type="password" name="password" placeholder="••••••••••••" minlength="8" required>
       </div>
       <button type="submit" class="btn-submit">Attiva Account Super Admin &amp; Accedi</button>
     </form>
-    <div class="info-footer">
-      Gestionale Cervelli in Affitto APS &bull; Affiliato UILT
-    </div>
   </div>
 </body>
 </html>`;
-  return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+
+  return new Response(html, {
+    headers: { "Content-Type": "text/html; charset=utf-8" }
+  });
 }
 
-function renderLoginPage(errore = "") {
-  const errHtml = errore ? `<div class="error-msg">${errore}</div>` : "";
+function renderLoginPage(error = "") {
   const html = `<!DOCTYPE html>
 <html lang="it">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Accesso Gestionale | Cervelli in Affitto APS</title>
+  <title>Accedi al Gestionale • Cervelli in Affitto APS</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;700;800&display=swap" rel="stylesheet">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
       font-family: 'Plus Jakarta Sans', sans-serif;
       background: #121214;
-      color: #E8E7E9;
+      color: #FAFAFA;
+      min-height: 100vh;
       display: flex;
       align-items: center;
       justify-content: center;
-      min-height: 100vh;
       padding: 20px;
     }
-    .card {
-      background: #1C1C1F;
-      border: 1px solid #2E2E33;
+    .auth-card {
+      background: #18181B;
+      border: 1px solid #27272A;
       border-radius: 16px;
-      padding: 36px 32px;
+      padding: 40px 32px;
       width: 100%;
       max-width: 420px;
-      box-shadow: 0 20px 40px rgba(0,0,0,0.5);
+      box-shadow: 0 20px 40px -15px rgba(0,0,0,0.7);
     }
-    h1 { font-size: 20px; font-weight: 800; color: #fff; margin-bottom: 4px; }
-    h1 span { color: #D98295; }
-    p { font-size: 13px; color: #9CA3AF; margin-bottom: 24px; }
-    .form-group { margin-bottom: 16px; }
-    label { display: block; font-size: 12px; font-weight: 700; color: #D1D5DB; margin-bottom: 6px; }
-    input {
-      width: 100%;
-      padding: 12px 14px;
-      background: #27272A;
-      border: 1px solid #3F3F46;
-      border-radius: 8px;
-      color: #fff;
-      font-size: 14px;
-      font-family: inherit;
-    }
-    input:focus { outline: none; border-color: #D98295; }
-    .btn-submit {
-      width: 100%;
-      background: #D98295;
-      color: #fff;
-      border: none;
-      padding: 13px;
-      border-radius: 8px;
-      font-weight: 800;
-      font-size: 14px;
-      cursor: pointer;
-      margin-top: 10px;
-      transition: background 0.2s;
-    }
-    .btn-submit:hover { background: #9F5D6B; }
-    .error-msg {
-      background: #7F1D1D;
-      color: #FCA5A5;
-      padding: 10px 14px;
-      border-radius: 6px;
-      font-size: 13px;
-      margin-bottom: 16px;
-    }
-    .back-link {
-      display: block;
+    .brand-header {
       text-align: center;
-      margin-top: 20px;
-      font-size: 12px;
-      color: #71717A;
-      text-decoration: none;
+      margin-bottom: 28px;
     }
-    .back-link:hover { color: #D98295; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h1>Cervelli in Affitto <span>APS</span></h1>
-    <p>Accedi all'area riservata gestionale</p>
-    ${errHtml}
-    <form method="POST" action="/admin/login">
-      <div class="form-group">
-        <label>Email *</label>
-        <input type="email" name="email" placeholder="latua@email.it" required>
-      </div>
-      <div class="form-group">
-        <label>Password *</label>
-        <input type="password" name="password" required>
-      </div>
-      <button type="submit" class="btn-submit">Accedi al Gestionale</button>
-    </form>
-    <a href="/" class="back-link">&larr; Torna al portale pubblico</a>
-  </div>
-</body>
-</html>`;
-  return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
-}
-
-/* =========================================================================
-   GESTIONE DEI CORSI IN DATABASE
-   ========================================================================= */
-
-async function seedDefaultCourseIfNeeded(env) {
-  try {
-    await env.DB.prepare(`
-      INSERT OR IGNORE INTO attivita_eventi (id, titolo, tipo, descrizione, luogo, quota_o_prezzo, capienza_massima, stato)
-      VALUES (
-        ?,
-        'Laboratorio Teatrale Bambini e Ragazzi',
-        'corso_teatro_minori',
-        'Laboratorio propedeutico di teatro per bambini e ragazzi con saggio finale.',
-        'Sede Operativa APS / Teatro',
-        250.00,
-        25,
-        'aperto'
-      )
-    `).bind(DEFAULT_CORSO_ID).run();
-  } catch (err) {
-    console.warn("Avviso seed corso predefinito:", err);
-  }
-}
-
-async function getCorsiAttivi(env) {
-  try {
-    const { results } = await env.DB.prepare(
-      "SELECT id, titolo, descrizione, quota_o_prezzo, capienza_massima FROM attivita_eventi WHERE tipo = 'corso_teatro_minori' AND stato = 'aperto'"
-    ).all();
-    if (results && results.length > 0) return results;
-  } catch (err) {
-    console.warn("Impossibile recuperare corsi da D1:", err);
-  }
-  return [{
-    id: DEFAULT_CORSO_ID,
-    titolo: "Laboratorio Teatrale Bambini e Ragazzi",
-    descrizione: "Percorso ludico ed espressivo di teatro per la crescita e la fiducia in se stessi.",
-    quota_o_prezzo: 250.00
-  }];
-}
-
-/* =========================================================================
-   RICEZIONE ED ELABORAZIONE ISCRIZIONE PUBBLICA (POST)
-   ========================================================================= */
-
-async function handleIscrizionePost(request, env, ctx) {
-  const url = new URL(request.url);
-
-  try {
-    const formData = await request.formData();
-
-    // 1. Dati Genitore / Tutore
-    const gNome = (formData.get("genitore_nome") || "").trim();
-    const gCognome = (formData.get("genitore_cognome") || "").trim();
-    const gCf = (formData.get("genitore_cf") || "").trim().toUpperCase();
-    const gTelefono = (formData.get("genitore_telefono") || "").trim();
-    const gEmail = (formData.get("genitore_email") || "").trim().toLowerCase();
-    const gRuolo = (formData.get("genitore_ruolo") || "genitore").trim();
-    const gIndirizzo = (formData.get("genitore_indirizzo") || "").trim();
-    const gCitta = (formData.get("genitore_citta") || "").trim();
-    const gCap = (formData.get("genitore_cap") || "").trim();
-    const gProvincia = (formData.get("genitore_provincia") || "").trim().toUpperCase();
-
-    // 2. Dati Minore (Allievo/a)
-    const mNome = (formData.get("minore_nome") || "").trim();
-    const mCognome = (formData.get("minore_cognome") || "").trim();
-    const mCf = (formData.get("minore_cf") || "").trim().toUpperCase();
-    const mDataNascita = (formData.get("minore_data_nascita") || "").trim();
-    const mLuogoNascita = (formData.get("minore_luogo_nascita") || "").trim();
-    const mIndirizzo = (formData.get("minore_indirizzo") || "").trim();
-    const mNote = (formData.get("minore_note") || "").trim();
-
-    // 3. Corso selezionato
-    const corsoId = (formData.get("corso_id") || DEFAULT_CORSO_ID).trim();
-
-    // 4. Consensi Privacy e Statuto
-    const consStatuto = formData.get("consenso_statuto") ? 1 : 0;
-    const consPrivacy = formData.get("consenso_privacy") ? 1 : 0;
-    const consFoto = formData.get("consenso_foto") ? 1 : 0;
-    const consNews = formData.get("consenso_news") ? 1 : 0;
-
-    if (!consStatuto || !consPrivacy) {
-      return new Response(
-        renderErrorPage("L'accettazione dello Statuto APS e il Consenso Privacy sono obbligatori per legge."),
-        { status: 400, headers: { "Content-Type": "text/html; charset=utf-8" } }
-      );
-    }
-
-    if (!gNome || !gCognome || !gCf || !gTelefono || !gEmail || !mNome || !mCognome || !mCf) {
-      return new Response(
-        renderErrorPage("I campi anagrafici e di contatto contrassegnati con l'asterisco (*) sono obbligatori."),
-        { status: 400, headers: { "Content-Type": "text/html; charset=utf-8" } }
-      );
-    }
-
-    // 5. Inserimento Tutore (o recupero esistente)
-    let tutoreId = null;
-    const existingTutore = await env.DB.prepare(
-      "SELECT id FROM tutori WHERE codice_fiscale = ?"
-    ).bind(gCf).first();
-
-    if (existingTutore) {
-      tutoreId = existingTutore.id;
-      await env.DB.prepare(`
-        UPDATE tutori SET telefono = ?, email = ? WHERE id = ?
-      `).bind(gTelefono, gEmail, tutoreId).run();
-    } else {
-      tutoreId = crypto.randomUUID();
-      await env.DB.prepare(`
-        INSERT INTO tutori (id, nome, cognome, codice_fiscale, telefono, email, grado_parentela, residenza_indirizzo, residenza_citta, residenza_cap, residenza_provincia)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).bind(tutoreId, gNome, gCognome, gCf, gTelefono, gEmail, gRuolo, gIndirizzo || "N.D.", gCitta || "N.D.", gCap || "00000", gProvincia || "XX").run();
-    }
-
-    // 6. Inserimento Socio Minore
-    let socioId = null;
-    const existingSocio = await env.DB.prepare(
-      "SELECT id FROM soci WHERE codice_fiscale = ?"
-    ).bind(mCf).first();
-
-    if (existingSocio) {
-      socioId = existingSocio.id;
-    } else {
-      socioId = crypto.randomUUID();
-      await env.DB.prepare(`
-        INSERT INTO soci (
-          id, is_minore, tutore_id, nome, cognome, codice_fiscale, data_nascita, luogo_nascita,
-          residenza_indirizzo, residenza_citta, residenza_cap, residenza_provincia, tipologia_socio, stato_richiesta
-        ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ordinario', 'in_attesa')
-      `).bind(
-        socioId, tutoreId, mNome, mCognome, mCf, mDataNascita || "2015-01-01", mLuogoNascita || "N.D.",
-        mIndirizzo || gIndirizzo || "N.D.", gCitta || "N.D.", gCap || "00000", gProvincia || "XX"
-      ).run();
-    }
-
-    // 7. Iscrizione al Corso & Deleghe
-    const iscrizioneId = crypto.randomUUID();
-    await env.DB.prepare(`
-      INSERT INTO iscrizioni_corsi (id, attivita_id, socio_id, note_allievo, stato_iscrizione)
-      VALUES (?, ?, ?, ?, 'confermata')
-    `).bind(iscrizioneId, corsoId, socioId, mNote).run();
-
-    // Inserimento eventuale delega 1
-    const del1Nome = (formData.get("delega_1_nome") || "").trim();
-    const del1Cognome = (formData.get("delega_1_cognome") || "").trim();
-    const del1Tel = (formData.get("delega_1_telefono") || "").trim();
-    const del1Grado = (formData.get("delega_1_relazione") || "").trim();
-
-    if (del1Nome && del1Cognome) {
-      await env.DB.prepare(`
-        INSERT INTO deleghe_ritiro (id, iscrizione_id, socio_minore_id, nome, cognome, telefono, relazione)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-      `).bind(crypto.randomUUID(), iscrizioneId, socioId, del1Nome, del1Cognome, del1Tel, del1Grado).run();
-    }
-
-    // Inserimento consensi privacy
-    await env.DB.prepare(`
-      INSERT INTO consensi_privacy (id, socio_id, tutore_id, accettazione_statuto, consenso_trattamento_dati, consenso_foto_video, consenso_newsletter)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).bind(crypto.randomUUID(), socioId, tutoreId, consStatuto, consPrivacy, consFoto, consNews).run();
-
-    // 8. Invio email asincrono tramite Resend
-    if (env.RESEND_API_KEY) {
-      const emailPromise = sendConfirmationEmails(env.RESEND_API_KEY, {
-        genitoreEmail: gEmail,
-        genitoreNome: gNome,
-        minoreNome: mNome
-      });
-      if (ctx && typeof ctx.waitUntil === "function") {
-        ctx.waitUntil(emailPromise);
-      } else {
-        await emailPromise;
-      }
-    }
-
-    // 9. Reindirizzamento a pagina di conferma
-    return Response.redirect(
-      `${url.origin}/iscrizione-confermata?minore=${encodeURIComponent(mNome)}&email=${encodeURIComponent(gEmail)}`,
-      303
-    );
-  } catch (err) {
-    console.error("Errore salvataggio iscrizione:", err);
-    return new Response(
-      renderErrorPage(`Si &egrave; verificato un errore durante il salvataggio: ${err.message}. Ti invitiamo a riprovare o contattare l'associazione.`),
-      { status: 500, headers: { "Content-Type": "text/html; charset=utf-8" } }
-    );
-  }
-}
-
-/* =========================================================================
-   INVIO EMAIL CON RESEND
-   ========================================================================= */
-async function sendConfirmationEmails(apiKey, data) {
-  try {
-    await fetch("https://api.resend.com/emails", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${apiKey}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        from: "Cervelli in Affitto APS <noreply@cervellinaffitto-aps.it>",
-        to: [data.genitoreEmail],
-        subject: `Richiesta Iscrizione Ricevuta - ${data.minoreNome}`,
-        html: `
-          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; color: #1f2937; line-height: 1.6;">
-            <div style="background-color: #121214; padding: 25px; text-align: center; border-radius: 8px 8px 0 0;">
-              <h2 style="color: #D98295; margin: 0; font-size: 22px;">Cervelli in Affitto APS</h2>
-              <p style="color: #9ca3af; margin: 5px 0 0 0; font-size: 13px;">Affiliata UILT - Unione Italiana Libero Teatro</p>
-            </div>
-            <div style="padding: 25px; border: 1px solid #e5e7eb; border-top: none; background: #ffffff;">
-              <p>Gentile <strong>${data.genitoreNome}</strong>,</p>
-              <p>abbiamo ricevuto correttamente la domanda di ammissione a socio e la richiesta di iscrizione al laboratorio teatrale per <strong>${data.minoreNome}</strong>.</p>
-              <div style="background-color: #fdf2f4; border-left: 4px solid #D98295; padding: 15px; margin: 20px 0; border-radius: 4px;">
-                <p style="margin: 0; font-size: 14px; color: #831843;">
-                  <strong>Prossimi passi:</strong> La domanda sar&agrave; ratificata dal Consiglio Direttivo con l'assegnazione del Numero Tessera APS e la copertura assicurativa UILT.
-                </p>
-              </div>
-              <p>A presto sul palcoscenico!</p>
-              <hr style="border: none; border-top: 1px solid #e5e7eb; margin: 25px 0;" />
-              <p style="font-size: 11px; color: #6b7280; text-align: center;">
-                Cervelli in Affitto APS &bull; CF: 91456950371 &bull; info@cervellinaffitto-aps.it
-              </p>
-            </div>
-          </div>
-        `
-      })
-    });
-  } catch (err) {
-    console.error("Errore invio notifica Resend:", err);
-  }
-}
-
-/* =========================================================================
-   PAGINE HTML: FORM A 5 STEP, CONFERMA, ERRORE
-   ========================================================================= */
-function renderFormPage(corsi) {
-  const opzioniCorsi = corsi.map((c) => `
-    <label class="radio-card">
-      <input type="radio" name="corso_id" value="${c.id}" checked required>
-      <div class="radio-body">
-        <div class="radio-title">${c.titolo}</div>
-        <div class="radio-desc">${c.descrizione || ""}</div>
-        <div class="radio-price">&euro; ${c.quota_o_prezzo ? Number(c.quota_o_prezzo).toFixed(2) : "0.00"} (inclusa assicurazione UILT)</div>
-      </div>
-    </label>
-  `).join("");
-
-  const html = `<!DOCTYPE html>
-<html lang="it">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Iscrizione Corsi Minori & Domanda Socio | Cervelli in Affitto APS</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-  <style>
-    :root {
-      --bg-dark: #121214;
-      --brand-rose: #D98295;
-      --brand-rose-dark: #9F5D6B;
-      --brand-rose-light: #FDF2F4;
-      --silver: #E8E7E9;
-      --text-dark: #18181B;
-      --text-muted: #71717A;
-      --bg-light: #F4F4F5;
-      --border-light: #E4E4E7;
-      --success: #15803D;
-    }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      background-color: var(--bg-light);
-      color: var(--text-dark);
-      line-height: 1.5;
-      min-height: 100vh;
-      display: flex;
-      flex-direction: column;
-    }
-    header {
-      background-color: var(--bg-dark);
-      color: #FFFFFF;
-      padding: 24px 20px;
-      text-align: center;
-      border-bottom: 2px solid var(--brand-rose);
-    }
-    .badge-uilt {
-      display: inline-block;
-      background: rgba(232, 231, 233, 0.1);
-      color: var(--silver);
-      font-size: 11px;
+    .brand-title {
+      font-size: 20px;
       font-weight: 700;
-      letter-spacing: 0.5px;
-      text-transform: uppercase;
-      padding: 4px 12px;
-      border-radius: 999px;
-      border: 1px solid rgba(232, 231, 233, 0.2);
-      margin-bottom: 10px;
+      color: #FFF;
+      letter-spacing: -0.01em;
+      margin-top: 10px;
     }
-    header h1 {
-      font-size: 24px;
-      font-weight: 800;
-      letter-spacing: -0.5px;
-      color: var(--silver);
-    }
-    header h1 span { color: var(--brand-rose); }
-    header p {
+    .brand-sub {
       color: #A1A1AA;
       font-size: 13px;
       margin-top: 4px;
     }
-    .container {
+    .error-box {
+      background: #EF444422;
+      border: 1px solid #EF4444;
+      color: #F87171;
+      padding: 10px 14px;
+      border-radius: 8px;
+      font-size: 13px;
+      margin-bottom: 20px;
+    }
+    .form-group {
+      margin-bottom: 18px;
+      text-align: left;
+    }
+    label {
+      display: block;
+      font-size: 12.5px;
+      font-weight: 600;
+      color: #E4E4E7;
+      margin-bottom: 6px;
+    }
+    input {
+      width: 100%;
+      background: #09090B;
+      border: 1px solid #3F3F46;
+      color: #FFF;
+      padding: 11px 14px;
+      border-radius: 8px;
+      font-size: 14px;
+      transition: border-color 0.2s;
+    }
+    input:focus {
+      outline: none;
+      border-color: #D98295;
+      box-shadow: 0 0 0 2px #D9829533;
+    }
+    .btn-submit {
+      width: 100%;
+      background: #D98295;
+      color: #121214;
+      font-weight: 700;
+      font-size: 14px;
+      padding: 12px;
+      border-radius: 8px;
+      border: none;
+      cursor: pointer;
+      margin-top: 8px;
+      transition: opacity 0.2s;
+    }
+    .btn-submit:hover { opacity: 0.9; }
+    .back-link {
+      display: block;
+      text-align: center;
+      margin-top: 24px;
+      color: #71717A;
+      font-size: 12.5px;
+      text-decoration: none;
+    }
+    .back-link:hover { color: #A1A1AA; }
+  </style>
+</head>
+<body>
+  <div class="auth-card">
+    <div class="brand-header">
+      <svg width="42" height="42" viewBox="0 0 24 24" fill="none" stroke="#D98295" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+      <h1 class="brand-title">Cervelli in Affitto APS</h1>
+      <p class="brand-sub">Area Riservata • Pannello Amministrativo</p>
+    </div>
+
+    ${error ? `<div class="error-box">${error}</div>` : ""}
+
+    <form method="POST" action="/admin/login">
+      <div class="form-group">
+        <label>Email</label>
+        <input type="email" name="email" placeholder="admin@cervellinaffitto-aps.it" required autofocus>
+      </div>
+      <div class="form-group">
+        <label>Password</label>
+        <input type="password" name="password" placeholder="••••••••••••" required>
+      </div>
+      <button type="submit" class="btn-submit">Accedi al Gestionale</button>
+    </form>
+
+    <a href="/" class="back-link">← Torna al Portale Pubblico</a>
+  </div>
+</body>
+</html>`;
+
+  return new Response(html, {
+    headers: { "Content-Type": "text/html; charset=utf-8" }
+  });
+}
+
+/* =========================================================================
+   PORTALE PUBBLICO: WIZARD A 5 STEP PER MINORI & DOMANDA SOCIO
+   ========================================================================= */
+
+function renderPublicWizard(step, isSuccess, params) {
+  if (isSuccess) {
+    return renderSuccessPage(params.get("socio") || "Socio");
+  }
+
+  const stepTitles = [
+    "Dati Anagrafici Minore",
+    "Genitore / Tutore Legale",
+    "Deleghe al Ritiro",
+    "Statuto & Consensi",
+    "Riepilogo & Firma"
+  ];
+
+  const html = `<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Iscrizione Corsi & Domanda Socio • Cervelli in Affitto APS</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --coral: #D98295;
+      --silver: #E8E7E9;
+      --dark: #121214;
+      --card-bg: #FFFFFF;
+      --text: #1F2937;
+      --border: #E5E7EB;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Plus Jakarta Sans', sans-serif;
+      background: #F9FAFB;
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+    header.pub-header {
+      background: var(--dark);
+      color: #FFF;
+      padding: 24px 20px;
+      text-align: center;
+      border-bottom: 2px solid var(--coral);
+    }
+    .brand-title {
+      font-size: 20px;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+    }
+    .brand-sub {
+      color: #9CA3AF;
+      font-size: 13px;
+      margin-top: 4px;
+    }
+    .wizard-container {
       max-width: 680px;
       width: 100%;
-      margin: 0 auto;
-      padding: 24px 16px 48px 16px;
+      margin: 30px auto;
+      padding: 0 16px;
       flex: 1;
     }
-    .stepper {
+    .wizard-progress {
       display: flex;
       justify-content: space-between;
       margin-bottom: 24px;
-      background: #FFFFFF;
-      padding: 12px 16px;
-      border-radius: 12px;
-      border: 1px solid var(--border-light);
+      position: relative;
+    }
+    .wizard-progress::before {
+      content: "";
+      position: absolute;
+      top: 14px;
+      left: 10px;
+      right: 10px;
+      height: 2px;
+      background: #E5E7EB;
+      z-index: 1;
     }
     .step-item {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      font-size: 12px;
-      font-weight: 600;
-      color: var(--text-muted);
+      position: relative;
+      z-index: 2;
+      text-align: center;
+      width: 40px;
     }
-    .step-item.active {
-      color: var(--text-dark);
-      font-weight: 800;
-    }
-    .step-num {
-      width: 24px;
-      height: 24px;
+    .step-circle {
+      width: 30px;
+      height: 30px;
       border-radius: 50%;
-      background: var(--bg-light);
-      color: var(--text-muted);
+      background: #FFF;
+      border: 2px solid #D1D5DB;
+      color: #6B7280;
       display: flex;
       align-items: center;
       justify-content: center;
-      font-size: 11px;
+      font-size: 12px;
+      font-weight: 700;
+      margin: 0 auto;
+      transition: all 0.2s;
     }
-    .step-item.active .step-num {
-      background: var(--brand-rose);
-      color: #FFFFFF;
+    .step-item.active .step-circle {
+      border-color: var(--coral);
+      background: var(--coral);
+      color: #121214;
     }
-    .step-item.completed .step-num {
-      background: var(--success);
-      color: #FFFFFF;
+    .step-item.done .step-circle {
+      border-color: #10B981;
+      background: #10B981;
+      color: #FFF;
     }
-    .form-step {
+    .step-label {
+      font-size: 10.5px;
+      color: #6B7280;
+      margin-top: 6px;
       display: none;
-      background: #FFFFFF;
-      padding: 24px;
-      border-radius: 16px;
-      border: 1px solid var(--border-light);
-      box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.04);
     }
-    .form-step.active {
-      display: block;
-      animation: fadeIn 0.2s ease-in-out;
+    @media (min-width: 640px) {
+      .step-item { width: 80px; }
+      .step-label { display: block; }
     }
-    @keyframes fadeIn {
-      from { opacity: 0; transform: translateY(4px); }
-      to { opacity: 1; transform: translateY(0); }
+    .form-card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 30px 24px;
+      box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05);
     }
-    .step-title {
-      font-size: 18px;
-      font-weight: 800;
-      color: var(--text-dark);
-      margin-bottom: 6px;
+    .step-header {
+      margin-bottom: 24px;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 14px;
     }
-    .step-desc {
+    .step-header h2 {
+      font-size: 19px;
+      font-weight: 700;
+      color: var(--dark);
+    }
+    .step-header p {
       font-size: 13px;
-      color: var(--text-muted);
-      margin-bottom: 20px;
+      color: #6B7280;
+      margin-top: 4px;
     }
     .form-grid {
       display: grid;
+      grid-template-columns: 1fr;
       gap: 16px;
-      margin-bottom: 16px;
     }
-    .two-cols {
-      grid-template-columns: 1fr 1fr;
-    }
-    @media (max-width: 600px) {
-      .two-cols { grid-template-columns: 1fr; }
-      .step-item span.step-label { display: none; }
+    @media (min-width: 600px) {
+      .form-grid.two-cols { grid-template-columns: 1fr 1fr; }
     }
     .form-group {
       display: flex;
@@ -1905,486 +2052,582 @@ function renderFormPage(corsi) {
       gap: 6px;
     }
     label {
-      font-size: 12px;
-      font-weight: 700;
+      font-size: 12.5px;
+      font-weight: 600;
       color: #374151;
     }
-    input[type="text"], input[type="email"], input[type="tel"], input[type="date"], select, textarea {
-      padding: 10px 14px;
-      border: 1px solid var(--border-light);
+    input, select, textarea {
+      padding: 10px 12px;
+      border: 1px solid #D1D5DB;
       border-radius: 8px;
       font-size: 14px;
       font-family: inherit;
-      color: var(--text-dark);
-      background: #FFFFFF;
-      transition: border-color 0.15s;
+      color: #111827;
+      background: #FFF;
     }
     input:focus, select:focus, textarea:focus {
       outline: none;
-      border-color: var(--brand-rose);
-      box-shadow: 0 0 0 3px rgba(217, 130, 149, 0.15);
+      border-color: var(--coral);
+      box-shadow: 0 0 0 2px #D9829533;
     }
-    .radio-card {
+    .checkbox-item {
       display: flex;
       align-items: flex-start;
-      gap: 12px;
-      padding: 14px;
-      border: 2px solid var(--border-light);
-      border-radius: 10px;
-      cursor: pointer;
-      margin-bottom: 10px;
-      transition: all 0.15s;
-    }
-    .radio-card:hover {
-      border-color: #CBD5E1;
-      background: #F8FAFC;
-    }
-    .radio-card input {
-      margin-top: 4px;
-      accent-color: var(--brand-rose);
-    }
-    .radio-title {
-      font-weight: 800;
-      font-size: 14px;
-      color: var(--text-dark);
-    }
-    .radio-desc {
-      font-size: 12px;
-      color: var(--text-muted);
-      margin-top: 2px;
-    }
-    .radio-price {
-      font-size: 13px;
-      font-weight: 700;
-      color: var(--brand-rose-dark);
-      margin-top: 6px;
-    }
-    .checkbox-block {
-      display: flex;
-      gap: 12px;
-      align-items: flex-start;
+      gap: 10px;
       padding: 12px;
-      background: #F9FAFB;
+      border: 1px solid var(--border);
       border-radius: 8px;
-      border: 1px solid var(--border-light);
-      margin-bottom: 12px;
+      background: #F9FAFB;
+      margin-bottom: 10px;
     }
-    .checkbox-block input {
+    .checkbox-item input[type="checkbox"] {
       margin-top: 3px;
-      accent-color: var(--brand-rose);
+      accent-color: var(--coral);
       width: 16px;
       height: 16px;
     }
-    .checkbox-text {
-      font-size: 12px;
-      color: #4B5563;
+    .checkbox-item label {
+      font-size: 12.5px;
+      font-weight: 500;
       line-height: 1.4;
+      cursor: pointer;
     }
-    .wizard-nav {
+    .wizard-actions {
       display: flex;
       justify-content: space-between;
-      gap: 12px;
-      margin-top: 24px;
-      padding-top: 16px;
-      border-top: 1px solid var(--border-light);
-    }
-    .btn-step {
-      padding: 12px 20px;
-      border-radius: 8px;
-      font-size: 13px;
-      font-weight: 700;
-      cursor: pointer;
-      border: none;
-      transition: all 0.15s;
+      margin-top: 28px;
+      padding-top: 18px;
+      border-top: 1px solid var(--border);
     }
     .btn-prev {
-      background: #F3F4F6;
-      color: #4B5563;
+      background: #E5E7EB;
+      color: #374151;
+      padding: 10px 18px;
+      border-radius: 8px;
+      font-size: 13.5px;
+      font-weight: 600;
+      border: none;
+      cursor: pointer;
     }
-    .btn-prev:hover { background: #E5E7EB; }
     .btn-next {
-      background: var(--bg-dark);
-      color: #FFFFFF;
+      background: var(--coral);
+      color: #121214;
+      padding: 10px 24px;
+      border-radius: 8px;
+      font-size: 13.5px;
+      font-weight: 700;
+      border: none;
+      cursor: pointer;
       margin-left: auto;
     }
-    .btn-next:hover { background: #27272A; }
-    .btn-submit {
-      background: var(--brand-rose);
-      color: #FFFFFF;
+    .btn-submit-final {
+      background: #10B981;
+      color: #FFF;
+      padding: 12px 28px;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 700;
+      border: none;
+      cursor: pointer;
       margin-left: auto;
     }
-    .btn-submit:hover { background: var(--brand-rose-dark); }
-    .info-callout {
-      background: var(--brand-rose-light);
-      border-left: 4px solid var(--brand-rose);
-      padding: 12px 14px;
-      border-radius: 6px;
-      font-size: 12px;
-      color: #831843;
-      margin-bottom: 16px;
-      line-height: 1.4;
-    }
-    footer {
+    footer.pub-footer {
+      background: var(--dark);
+      color: #9CA3AF;
       text-align: center;
       padding: 20px;
-      font-size: 11px;
-      color: var(--text-muted);
-      border-top: 1px solid var(--border-light);
-      background: #FFFFFF;
+      font-size: 12px;
+      margin-top: auto;
+      border-top: 1px solid #27272A;
     }
-    footer a { color: var(--text-muted); text-decoration: underline; }
   </style>
 </head>
 <body>
-  <header>
-    <div class="badge-uilt">Affiliato UILT - Libero Teatro</div>
-    <h1>Cervelli in Affitto <span>APS</span></h1>
-    <p>Domanda di Ammissione a Socio &bull; Iscrizione Laboratorio Bambini e Ragazzi</p>
+
+  <header class="pub-header">
+    <div class="brand-title">Cervelli in Affitto APS</div>
+    <div class="brand-sub">Affiliata UILT • Laboratori Teatrali Bambini &amp; Ragazzi</div>
   </header>
 
-  <div class="container">
-    <div class="stepper">
-      <div class="step-item active" id="badge-1"><span class="step-num">1</span><span class="step-label">Genitore</span></div>
-      <div class="step-item" id="badge-2"><span class="step-num">2</span><span class="step-label">Allievo/a</span></div>
-      <div class="step-item" id="badge-3"><span class="step-num">3</span><span class="step-label">Laboratorio</span></div>
-      <div class="step-item" id="badge-4"><span class="step-num">4</span><span class="step-label">Deleghe</span></div>
-      <div class="step-item" id="badge-5"><span class="step-num">5</span><span class="step-label">Firma & Invio</span></div>
+  <div class="wizard-container">
+    <div class="wizard-progress">
+      ${stepTitles.map((title, idx) => {
+        const num = idx + 1;
+        const cls = num < step ? "done" : num === step ? "active" : "";
+        return `
+          <div class="step-item ${cls}">
+            <div class="step-circle">${num < step ? "✓" : num}</div>
+            <div class="step-label">${title}</div>
+          </div>
+        `;
+      }).join("")}
     </div>
 
-    <form id="iscrizioneForm" method="POST" action="/iscrizione-minori">
-      <!-- STEP 1: DATI GENITORE -->
-      <div class="form-step active" id="step-1">
-        <div class="step-title">Passo 1: Dati del Genitore o Tutore Legale</div>
-        <div class="step-desc">Inserisci i recapiti dell'adulto referente per l'invio delle comunicazioni e la ricevuta di iscrizione.</div>
+    <form method="POST" action="/iscrizione-minori" id="wizardForm" class="form-card">
+      <input type="hidden" name="step" id="currentStepInput" value="${step}">
 
+      <!-- STEP 1: DATI MINORE -->
+      <div id="step-1" class="wizard-step-pane" style="${step === 1 ? "" : "display:none;"}">
+        <div class="step-header">
+          <h2>Passo 1: Dati Anagrafici dell'Allievo Minore</h2>
+          <p>Compila i dati del minore che frequenterà il laboratorio teatrale e diventerà socio ordinario APS.</p>
+        </div>
         <div class="form-grid two-cols">
           <div class="form-group">
-            <label>Nome del Genitore / Tutore *</label>
-            <input type="text" name="genitore_nome" placeholder="Es. Mario" required>
+            <label>Nome del Minore *</label>
+            <input type="text" name="minore_nome" required>
           </div>
           <div class="form-group">
-            <label>Cognome *</label>
-            <input type="text" name="genitore_cognome" placeholder="Es. Rossi" required>
-          </div>
-        </div>
-
-        <div class="form-grid two-cols">
-          <div class="form-group">
-            <label>Codice Fiscale *</label>
-            <input type="text" name="genitore_cf" maxlength="16" placeholder="Codice Fiscale (16 caratteri)" style="text-transform: uppercase;" required>
-          </div>
-          <div class="form-group">
-            <label>Grado di Parentela *</label>
-            <select name="genitore_ruolo" required>
-              <option value="genitore" selected>Genitore (Padre / Madre)</option>
-              <option value="tutore_legale">Tutore Legale</option>
-              <option value="affidatario">Affidatario</option>
-            </select>
+            <label>Cognome del Minore *</label>
+            <input type="text" name="minore_cognome" required>
           </div>
         </div>
-
-        <div class="form-grid two-cols">
+        <div class="form-grid two-cols" style="margin-top: 14px;">
           <div class="form-group">
-            <label>Telefono Cellulare per Comunicazioni *</label>
-            <input type="tel" name="genitore_telefono" placeholder="Es. 3331234567" required>
-          </div>
-          <div class="form-group">
-            <label>Email Ufficiale (per ricevute e comunicazioni) *</label>
-            <input type="email" name="genitore_email" placeholder="nome@esempio.it" required>
-          </div>
-        </div>
-
-        <div class="wizard-nav">
-          <button type="button" class="btn-step btn-next" onclick="goToStep(2)">Avanti: Dati Allievo/a &rarr;</button>
-        </div>
-      </div>
-
-      <!-- STEP 2: DATI ALLIEVO MINORE -->
-      <div class="form-step" id="step-2">
-        <div class="step-title">Passo 2: Anagrafica dell'Allievo/a (Minore)</div>
-        <div class="step-desc">I dati dell'allievo sono necessari per l'attivazione della copertura assicurativa UILT e per il Libro Soci.</div>
-
-        <div class="form-grid two-cols">
-          <div class="form-group">
-            <label>Nome dell'Allievo/a *</label>
-            <input type="text" name="minore_nome" placeholder="Es. Giulia" required>
-          </div>
-          <div class="form-group">
-            <label>Cognome *</label>
-            <input type="text" name="minore_cognome" placeholder="Es. Rossi" required>
-          </div>
-        </div>
-
-        <div class="form-grid two-cols">
-          <div class="form-group">
-            <label>Codice Fiscale dell'Allievo/a *</label>
-            <input type="text" name="minore_cf" maxlength="16" placeholder="Codice Fiscale (16 caratteri)" style="text-transform: uppercase;" required>
+            <label>Codice Fiscale Minore *</label>
+            <input type="text" name="minore_cf" maxlength="16" placeholder="Es. RSSMRA10A01F205Z" required>
           </div>
           <div class="form-group">
             <label>Data di Nascita *</label>
             <input type="date" name="minore_data_nascita" required>
           </div>
         </div>
-
-        <div class="form-grid two-cols">
+        <div class="form-grid two-cols" style="margin-top: 14px;">
           <div class="form-group">
-            <label>Comune o Stato Estero di Nascita *</label>
-            <input type="text" name="minore_luogo_nascita" placeholder="Es. Bologna" required>
+            <label>Luogo di Nascita *</label>
+            <input type="text" name="minore_luogo_nascita" placeholder="Comune o Stato estero" required>
           </div>
           <div class="form-group">
-            <label>Indirizzo di Residenza Completo</label>
-            <input type="text" name="minore_indirizzo" placeholder="Via/Piazza, Civico, Citt&agrave;, CAP">
+            <label>Indirizzo di Residenza *</label>
+            <input type="text" name="minore_indirizzo" placeholder="Via, Civico, Comune, CAP" required>
           </div>
-        </div>
-
-        <div class="form-group">
-          <label>Eventuali Note o Esigenze Particolari (facoltativo)</label>
-          <textarea name="minore_note" rows="2" placeholder="Indicazioni utili per i docenti o note organizzative"></textarea>
-        </div>
-
-        <div class="wizard-nav">
-          <button type="button" class="btn-step btn-prev" onclick="goToStep(1)">&larr; Indietro</button>
-          <button type="button" class="btn-step btn-next" onclick="goToStep(3)">Avanti: Laboratorio &rarr;</button>
         </div>
       </div>
 
-      <!-- STEP 3: SELEZIONE CORSO -->
-      <div class="form-step" id="step-3">
-        <div class="step-title">Passo 3: Seleziona il Laboratorio Teatrale</div>
-        <div class="step-desc">Seleziona il percorso a cui intendi iscrivere l'allievo/a.</div>
-
-        ${opzioniCorsi}
-
-        <div class="info-callout">
-          <strong>Nota sull'Assicurazione UILT:</strong> La partecipazione al laboratorio include il tesseramento alla federazione UILT (Unione Italiana Libero Teatro) con relativa copertura infortuni e RC per tutta la durata dell'anno di attivit&agrave;.
+      <!-- STEP 2: TUTORE LEGALE -->
+      <div id="step-2" class="wizard-step-pane" style="${step === 2 ? "" : "display:none;"}">
+        <div class="step-header">
+          <h2>Passo 2: Genitore o Tutore Legale Esercente la Responsabilità</h2>
+          <p>Dati dell'adulto referente che sottoscrive la richiesta di ammissione e l'iscrizione.</p>
         </div>
-
-        <div class="wizard-nav">
-          <button type="button" class="btn-step btn-prev" onclick="goToStep(2)">&larr; Indietro</button>
-          <button type="button" class="btn-step btn-next" onclick="goToStep(4)">Avanti: Deleghe al Ritiro &rarr;</button>
+        <div class="form-grid two-cols">
+          <div class="form-group">
+            <label>Nome Genitore / Tutore *</label>
+            <input type="text" name="tutore_nome">
+          </div>
+          <div class="form-group">
+            <label>Cognome Genitore / Tutore *</label>
+            <input type="text" name="tutore_cognome">
+          </div>
+        </div>
+        <div class="form-grid two-cols" style="margin-top: 14px;">
+          <div class="form-group">
+            <label>Codice Fiscale Genitore *</label>
+            <input type="text" name="tutore_cf" maxlength="16">
+          </div>
+          <div class="form-group">
+            <label>Grado di Parentela *</label>
+            <select name="tutore_ruolo">
+              <option value="Madre">Madre</option>
+              <option value="Padre">Padre</option>
+              <option value="Tutore Legale">Tutore Legale</option>
+              <option value="Affidatario">Affidatario</option>
+            </select>
+          </div>
+        </div>
+        <div class="form-grid two-cols" style="margin-top: 14px;">
+          <div class="form-group">
+            <label>Telefono Cellulare *</label>
+            <input type="tel" name="tutore_telefono" placeholder="Es. 3401234567">
+          </div>
+          <div class="form-group">
+            <label>Email Ufficiale (per comunicazioni e ricevute) *</label>
+            <input type="email" name="tutore_email" placeholder="esempio@email.it">
+          </div>
         </div>
       </div>
 
-      <!-- STEP 4: DELEGHE AL RITIRO -->
-      <div class="form-step" id="step-4">
-        <div class="step-title">Passo 4: Persone Delegate al Ritiro (Facoltativo)</div>
-        <div class="step-desc">Indica eventuali persone autorizzate a ritirare il minore al termine delle lezioni oltre ai genitori (es. nonni, zii, baby sitter).</div>
-
-        <div class="form-grid two-cols">
-          <div class="form-group">
-            <label>Nome Delegato/a</label>
-            <input type="text" name="delega_1_nome" placeholder="Es. Nonna Anna">
+      <!-- STEP 3: DELEGHE AL RITIRO -->
+      <div id="step-3" class="wizard-step-pane" style="${step === 3 ? "" : "display:none;"}">
+        <div class="step-header">
+          <h2>Passo 3: Persone Delegate al Ritiro dell'Allievo (Facoltativo)</h2>
+          <p>Indica fino a due persone maggiorenni autorizzate a ritirare il minore al termine della lezione.</p>
+        </div>
+        <div style="background: #F3F4F6; padding: 14px; border-radius: 8px; margin-bottom: 14px;">
+          <h4 style="font-size: 13px; font-weight: 700; margin-bottom: 10px;">Delegato N° 1</h4>
+          <div class="form-grid two-cols">
+            <div class="form-group"><label>Nome e Cognome</label><input type="text" name="delega1_nome" placeholder="Es. Mario Rossi"></div>
+            <div class="form-group"><label>Telefono</label><input type="tel" name="delega1_telefono" placeholder="Es. 3471122334"></div>
           </div>
-          <div class="form-group">
-            <label>Cognome Delegato/a</label>
-            <input type="text" name="delega_1_cognome" placeholder="Es. Bianchi">
-          </div>
+          <div class="form-group" style="margin-top: 10px;"><label>Relazione di parentela / fiducia</label><input type="text" name="delega1_relazione" placeholder="Es. Nonno, Zia, Babysitter"></div>
         </div>
 
-        <div class="form-grid two-cols">
-          <div class="form-group">
-            <label>Recapito Telefonico Delegato/a</label>
-            <input type="tel" name="delega_1_telefono" placeholder="Es. 3471122334">
+        <div style="background: #F3F4F6; padding: 14px; border-radius: 8px;">
+          <h4 style="font-size: 13px; font-weight: 700; margin-bottom: 10px;">Delegato N° 2</h4>
+          <div class="form-grid two-cols">
+            <div class="form-group"><label>Nome e Cognome</label><input type="text" name="delega2_nome" placeholder="Es. Anna Bianchi"></div>
+            <div class="form-group"><label>Telefono</label><input type="tel" name="delega2_telefono" placeholder="Es. 3489988776"></div>
           </div>
-          <div class="form-group">
-            <label>Relazione di Parentela / Ruolo</label>
-            <input type="text" name="delega_1_relazione" placeholder="Es. Nonna, Zio, Amico di famiglia">
-          </div>
-        </div>
-
-        <div class="wizard-nav">
-          <button type="button" class="btn-step btn-prev" onclick="goToStep(3)">&larr; Indietro</button>
-          <button type="button" class="btn-step btn-next" onclick="goToStep(5)">Avanti: Firma & Consensi &rarr;</button>
+          <div class="form-group" style="margin-top: 10px;"><label>Relazione di parentela / fiducia</label><input type="text" name="delega2_relazione" placeholder="Es. Zio, Amico di famiglia"></div>
         </div>
       </div>
 
-      <!-- STEP 5: CONSENSI E INVIO -->
-      <div class="form-step" id="step-5">
-        <div class="step-title">Passo 5: Domanda di Ammissione Socio & Consensi</div>
-        <div class="step-desc">Conferma la richiesta formale di ammissione a socio e i consensi obbligatori per legge.</div>
-
-        <div class="checkbox-block">
-          <input type="checkbox" name="consenso_statuto" id="c_statuto" value="1" required>
-          <div class="checkbox-text">
-            <strong>Richiesta Ammissione a Socio & Statuto APS *</strong><br>
-            Dichiaro di aver preso visione e di accettare integralmente lo Statuto dell'associazione "Cervelli in Affitto APS", i regolamenti interni e di condividere le finalit&agrave; associative. Richiedo l'iscrizione a socio ordinario per l'allievo/a minore.
-          </div>
+      <!-- STEP 4: STATUTO & PRIVACY -->
+      <div id="step-4" class="wizard-step-pane" style="${step === 4 ? "" : "display:none;"}">
+        <div class="step-header">
+          <h2>Passo 4: Accettazione Statuto APS &amp; Consensi Privacy</h2>
+          <p>Condizioni di ammissione a socio e tesseramento obbligatorio UILT.</p>
+        </div>
+        
+        <div class="checkbox-item">
+          <input type="checkbox" id="chk_statuto" name="accettazione_statuto" value="1" required>
+          <label for="chk_statuto">
+            <strong>Dichiaro di aver preso visione e di accettare integralmente lo Statuto e i Regolamenti interni di Cervelli in Affitto APS</strong>, nonché di condividere gli scopi associativi e culturali per conto del minore. (Obbligatorio)
+          </label>
         </div>
 
-        <div class="checkbox-block">
-          <input type="checkbox" name="consenso_privacy" id="c_privacy" value="1" required>
-          <div class="checkbox-text">
-            <strong>Informativa Trattamento Dati Personali (GDPR) *</strong><br>
-            Acconsento al trattamento dei dati personali forniti per le finalit&agrave; istituzionali, assicurative (UILT) e amministrative dell'APS ai sensi del Regolamento UE 2016/679.
-          </div>
+        <div class="checkbox-item">
+          <input type="checkbox" id="chk_privacy" name="consenso_privacy" value="1" required>
+          <label for="chk_privacy">
+            <strong>Acconsento al trattamento dei dati personali del minore e del sottoscritto</strong> ai sensi del Regolamento UE 2016/679 (GDPR), per finalità istituzionali, amministrative e per la copertura assicurativa UILT. (Obbligatorio)
+          </label>
         </div>
 
-        <div class="checkbox-block">
-          <input type="checkbox" name="consenso_foto" id="c_foto" value="1">
-          <div class="checkbox-text">
-            <strong>Liberatoria Foto e Riprese Video (Facoltativo)</strong><br>
-            Autorizzo l'associazione all'uso non commerciale di foto e riprese video effettuate durante saggi, laboratori o spettacoli per canali social e archivio storico dell'APS.
-          </div>
+        <div class="checkbox-item">
+          <input type="checkbox" id="chk_foto" name="consenso_foto_video" value="1">
+          <label for="chk_foto">
+            <strong>Autorizzo riprese foto e video durante i laboratori e saggi teatrali</strong> ad esclusivo scopo documentale, promozionale delle attività dell'APS sui propri canali e archivi istituzionali. (Facoltativo)
+          </label>
         </div>
 
-        <div class="checkbox-block">
-          <input type="checkbox" name="consenso_news" id="c_news" value="1">
-          <div class="checkbox-text">
-            <strong>Comunicazioni Attivit&agrave; e Spettacoli (Facoltativo)</strong><br>
-            Desidero ricevere via email o WhatsApp comunicazioni sugli spettacoli, repliche e nuove iniziative dell'associazione.
-          </div>
+        <div class="checkbox-item">
+          <input type="checkbox" id="chk_news" name="consenso_newsletter" value="1">
+          <label for="chk_news">
+            Autorizzo la ricezione di comunicazioni teatrali, calendario spettacoli e inviti dell'APS via email o WhatsApp. (Facoltativo)
+          </label>
+        </div>
+      </div>
+
+      <!-- STEP 5: RIEPILOGO & INVIO -->
+      <div id="step-5" class="wizard-step-pane" style="${step === 5 ? "" : "display:none;"}">
+        <div class="step-header">
+          <h2>Passo 5: Riepilogo &amp; Invio Richiesta</h2>
+          <p>Verifica i dati inseriti prima di trasmettere ufficialmente la domanda al Consiglio Direttivo.</p>
+        </div>
+        
+        <div style="background: #F3F4F6; border-left: 4px solid var(--coral); padding: 16px; border-radius: 6px; font-size: 13px; line-height: 1.6; margin-bottom: 20px;">
+          <strong>Procedura di Delibera Associativa:</strong><br>
+          L'invio di questo modulo costituisce formale richiesta di ammissione a socio ordinario per il minore e pre-iscrizione al laboratorio teatrale.
+          La domanda sarà esaminata e ratificata dal Consiglio Direttivo dell'APS alla prima riunione utile, con contestuale assegnazione del numero di tessera e attivazione della copertura assicurativa UILT.
         </div>
 
-        <div class="wizard-nav">
-          <button type="button" class="btn-step btn-prev" onclick="goToStep(4)">&larr; Indietro</button>
-          <button type="submit" class="btn-step btn-submit">Invia Domanda Ufficiale & Iscrizione &check;</button>
-        </div>
+        <p style="font-size: 13.5px; color: #4B5563; text-align: center; margin: 20px 0;">
+          Cliccando su <strong>"Invia Domanda di Ammissione &amp; Iscrizione"</strong> confermi la veridicità di tutti i dati dichiarati.
+        </p>
+      </div>
+
+      <!-- BOTTONI AVANTI / INDIETRO WIZARD -->
+      <div class="wizard-actions">
+        <button type="button" class="btn-prev" id="prevBtn" style="display: none;">← Indietro</button>
+        <button type="button" class="btn-next" id="nextBtn">Continua →</button>
+        <button type="submit" class="btn-submit-final" id="submitBtn" style="display: none;">Invia Domanda di Ammissione &amp; Iscrizione</button>
       </div>
     </form>
   </div>
 
-  <footer>
-    Cervelli in Affitto APS &bull; CF: 91456950371 &bull; Affiliata UILT<br>
-    Sede Legale: Bologna &bull; <a href="/admin">Area Riservata Gestionale</a>
+  <footer class="pub-footer">
+    Cervelli in Affitto APS • Sede Legale: Via del Teatro, Forlì • C.F. 92095390400 • Affiliata UILT
   </footer>
 
   <script>
-    function goToStep(stepNum) {
-      if (stepNum > 1) {
-        const currentActive = document.querySelector('.form-step.active');
-        if (currentActive) {
-          const requiredInputs = currentActive.querySelectorAll('input[required], select[required]');
-          for (let input of requiredInputs) {
-            if (!input.value.trim()) {
-              input.focus();
-              input.reportValidity();
-              return;
-            }
-          }
-        }
+    let currentStep = ${step};
+    const totalSteps = 5;
+
+    const prevBtn = document.getElementById("prevBtn");
+    const nextBtn = document.getElementById("nextBtn");
+    const submitBtn = document.getElementById("submitBtn");
+    const stepInput = document.getElementById("currentStepInput");
+
+    function updateStepView() {
+      for (let i = 1; i <= totalSteps; i++) {
+        const pane = document.getElementById("step-" + i);
+        if (pane) pane.style.display = i === currentStep ? "block" : "none";
       }
 
-      document.querySelectorAll('.form-step').forEach(el => el.classList.remove('active'));
-      document.getElementById('step-' + stepNum).classList.add('active');
+      document.querySelectorAll(".step-item").forEach((el, idx) => {
+        const n = idx + 1;
+        el.className = "step-item " + (n < currentStep ? "done" : n === currentStep ? "active" : "");
+      });
 
-      for (let i = 1; i <= 5; i++) {
-        const b = document.getElementById('badge-' + i);
-        if (i < stepNum) {
-          b.className = 'step-item completed';
-        } else if (i === stepNum) {
-          b.className = 'step-item active';
-        } else {
-          b.className = 'step-item';
-        }
+      prevBtn.style.display = currentStep > 1 ? "block" : "none";
+      if (currentStep === totalSteps) {
+        nextBtn.style.display = "none";
+        submitBtn.style.display = "block";
+      } else {
+        nextBtn.style.display = "block";
+        submitBtn.style.display = "none";
       }
-
-      window.scrollTo({ top: 0, behavior: 'smooth' });
+      stepInput.value = currentStep;
+      window.scrollTo({ top: 0, behavior: "smooth" });
     }
+
+    nextBtn.addEventListener("click", () => {
+      // Validazione rapida campi obbligatori del pane corrente
+      const curPane = document.getElementById("step-" + currentStep);
+      const reqInputs = curPane.querySelectorAll("input[required], select[required]");
+      for (const input of reqInputs) {
+        if (!input.checkValidity()) {
+          input.reportValidity();
+          return;
+        }
+      }
+      if (currentStep < totalSteps) {
+        currentStep++;
+        updateStepView();
+      }
+    });
+
+    prevBtn.addEventListener("click", () => {
+      if (currentStep > 1) {
+        currentStep--;
+        updateStepView();
+      }
+    });
+
+    updateStepView();
   </script>
 </body>
 </html>`;
 
-  return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+  return new Response(html, {
+    headers: { "Content-Type": "text/html; charset=utf-8" }
+  });
 }
 
-function renderSuccessPage(minore, email) {
+function renderSuccessPage(nomeSocio) {
   const html = `<!DOCTYPE html>
 <html lang="it">
 <head>
   <meta charset="UTF-8">
-  <title>Iscrizione Ricevuta con Successo | Cervelli in Affitto APS</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@500;700;800&display=swap" rel="stylesheet">
+  <title>Domanda Ricevuta • Cervelli in Affitto APS</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
   <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
       font-family: 'Plus Jakarta Sans', sans-serif;
-      background: #F4F4F5;
-      padding: 30px 16px;
+      background: #F9FAFB;
+      color: #1F2937;
+      min-height: 100vh;
       display: flex;
       align-items: center;
       justify-content: center;
-      min-height: 90vh;
+      padding: 20px;
     }
-    .box {
-      max-width: 540px;
-      background: #FFFFFF;
+    .card-success {
+      background: #FFF;
+      border: 1px solid #E5E7EB;
       border-radius: 16px;
-      border: 1px solid #E4E4E7;
-      padding: 36px 28px;
+      padding: 40px 32px;
+      max-width: 540px;
       text-align: center;
-      box-shadow: 0 10px 30px rgba(0,0,0,0.06);
+      box-shadow: 0 10px 25px -5px rgba(0,0,0,0.05);
     }
-    .icon {
+    .icon-success {
       width: 64px;
       height: 64px;
-      background: #ECFDF5;
-      color: #059669;
+      background: #10B98120;
+      color: #10B981;
       border-radius: 50%;
       display: flex;
       align-items: center;
       justify-content: center;
-      font-size: 32px;
-      margin: 0 auto 20px auto;
+      margin: 0 auto 20px;
     }
-    h1 { font-size: 22px; font-weight: 800; color: #18181B; margin-bottom: 8px; }
-    p { font-size: 14px; color: #52525B; line-height: 1.6; margin-bottom: 16px; }
-    .highlight {
-      background: #FDF2F4;
-      border-left: 4px solid #D98295;
-      padding: 12px;
-      border-radius: 6px;
-      font-size: 13px;
-      color: #831843;
-      text-align: left;
+    h1 {
+      font-size: 22px;
+      font-weight: 700;
+      color: #111827;
+      margin-bottom: 12px;
+    }
+    p {
+      font-size: 14px;
+      color: #4B5563;
+      line-height: 1.6;
       margin-bottom: 24px;
     }
-    .btn {
-      display: inline-block;
-      background: #121214;
-      color: #FFFFFF;
-      text-decoration: none;
-      padding: 12px 24px;
+    .info-box {
+      background: #F3F4F6;
       border-radius: 8px;
-      font-weight: 700;
+      padding: 16px;
       font-size: 13px;
+      text-align: left;
+      line-height: 1.6;
+      margin-bottom: 24px;
+    }
+    .btn-home {
+      display: inline-block;
+      background: #D98295;
+      color: #121214;
+      font-weight: 700;
+      font-size: 13.5px;
+      padding: 11px 22px;
+      border-radius: 8px;
+      text-decoration: none;
     }
   </style>
 </head>
 <body>
-  <div class="box">
-    <div class="icon">&check;</div>
-    <h1>Richiesta Inviata con Successo!</h1>
-    <p>Abbiamo registrato la domanda di ammissione e l'iscrizione di <strong>${minore}</strong>.</p>
-    <div class="highlight">
-      La richiesta &egrave; ora registrata nel gestionale dell'associazione in attesa della ratifica da parte del Consiglio Direttivo con l'assegnazione del Numero Tessera e della copertura assicurativa UILT.
+  <div class="card-success">
+    <div class="icon-success">
+      <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
     </div>
-    <a href="/" class="btn">Torna alla Pagina Principale</a>
+    <h1>Richiesta Inviata con Successo!</h1>
+    <p>Grazie per aver compilato la richiesta di iscrizione per <strong>${nomeSocio}</strong>.</p>
+    <div class="info-box">
+      <strong>Cosa succede ora?</strong><br>
+      1. Il Consiglio Direttivo di <em>Cervelli in Affitto APS</em> delibererà l'ammissione a socio.<br>
+      2. Riceverai un'email di conferma con il numero di tessera APS e le istruzioni per il perfezionamento del tesseramento UILT.
+    </div>
+    <a href="/" class="btn-home">Torna alla Pagina Iniziale</a>
   </div>
 </body>
 </html>`;
-  return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+
+  return new Response(html, {
+    headers: { "Content-Type": "text/html; charset=utf-8" }
+  });
 }
 
-function renderErrorPage(messaggio) {
-  return `<!DOCTYPE html>
-<html lang="it">
-<head>
-  <meta charset="UTF-8">
-  <title>Attenzione | Cervelli in Affitto APS</title>
-  <style>
-    body { font-family: sans-serif; background: #F8F9FA; padding: 30px; text-align: center; }
-    .box { max-width: 500px; margin: 40px auto; background: #fff; padding: 30px; border-radius: 10px; border: 1px solid #E4E4E7; }
-    h2 { color: #DC2626; margin-bottom: 12px; }
-    p { font-size: 14px; color: #4B5563; line-height: 1.5; margin-bottom: 20px; }
-    a { display: inline-block; background: #121214; color: #fff; padding: 10px 20px; text-decoration: none; border-radius: 6px; font-size: 13px; }
-  </style>
-</head>
-<body>
-  <div class="box">
-    <h2>Attenzione</h2>
-    <p>${messaggio}</p>
-    <a href="javascript:history.back()">Torna indietro e correggi</a>
-  </div>
-</body>
-</html>`;
+/* =========================================================================
+   PORTALE PUBBLICO: SALVATAGGIO DATI SU CLOUDFLARE D1
+   ========================================================================= */
+
+async function handleIscrizionePost(request, env, url) {
+  try {
+    const formData = await request.formData();
+
+    const minoreNome = (formData.get("minore_nome") || "").toString().trim();
+    const minoreCognome = (formData.get("minore_cognome") || "").toString().trim();
+    const minoreCf = (formData.get("minore_cf") || "").toString().trim().toUpperCase();
+    const minoreNascita = (formData.get("minore_data_nascita") || "").toString().trim();
+    const minoreLuogo = (formData.get("minore_luogo_nascita") || "").toString().trim();
+    const minoreIndirizzo = (formData.get("minore_indirizzo") || "").toString().trim();
+
+    const tutoreNome = (formData.get("tutore_nome") || "").toString().trim();
+    const tutoreCognome = (formData.get("tutore_cognome") || "").toString().trim();
+    const tutoreCf = (formData.get("tutore_cf") || "").toString().trim().toUpperCase();
+    const tutoreRuolo = (formData.get("tutore_ruolo") || "Genitore").toString().trim();
+    const tutoreTelefono = (formData.get("tutore_telefono") || "").toString().trim();
+    const tutoreEmail = (formData.get("tutore_email") || "").toString().trim().toLowerCase();
+
+    const delega1Nome = (formData.get("delega1_nome") || "").toString().trim();
+    const delega1Tel = (formData.get("delega1_telefono") || "").toString().trim();
+    const delega1Rel = (formData.get("delega1_relazione") || "").toString().trim();
+
+    const delega2Nome = (formData.get("delega2_nome") || "").toString().trim();
+    const delega2Tel = (formData.get("delega2_telefono") || "").toString().trim();
+    const delega2Rel = (formData.get("delega2_relazione") || "").toString().trim();
+
+    const accettaStatuto = formData.get("accettazione_statuto") === "1" ? 1 : 0;
+    const consensoPrivacy = formData.get("consenso_privacy") === "1" ? 1 : 0;
+    const consensoFoto = formData.get("consenso_foto_video") === "1" ? 1 : 0;
+    const consensoNews = formData.get("consenso_newsletter") === "1" ? 1 : 0;
+
+    if (!minoreNome || !minoreCognome || !minoreCf) {
+      return new Response("Dati del minore incompleti.", { status: 400 });
+    }
+
+    // Assicura l'esistenza del corso di riferimento
+    await env.DB.prepare(`
+      INSERT OR IGNORE INTO attivita_eventi (id, tipo, titolo, descrizione, anno_sociale, attivo)
+      VALUES (?, 'corso', 'Laboratorio Teatrale Bambini e Ragazzi', 'Corso propedeutico di teatro per minori', 2026, 1)
+    `).bind(DEFAULT_CORSO_ID).run();
+
+    // 1. Inserimento Tutore (o recupero se già presente)
+    let tutoreId = null;
+    if (tutoreCf) {
+      const existingTutore = await env.DB.prepare("SELECT id FROM tutori WHERE codice_fiscale = ?").bind(tutoreCf).first();
+      if (existingTutore) {
+        tutoreId = existingTutore.id;
+        await env.DB.prepare(`
+          UPDATE tutori SET nome = ?, cognome = ?, telefono = ?, email = ?, grado_parentela = ? WHERE id = ?
+        `).bind(tutoreNome, tutoreCognome, tutoreTelefono, tutoreEmail, tutoreRuolo, tutoreId).run();
+      } else {
+        tutoreId = "tut-" + Date.now();
+        await env.DB.prepare(`
+          INSERT INTO tutori (id, nome, cognome, codice_fiscale, telefono, email, grado_parentela)
+          VALUES (?, ?, ?, ?, ?, ?, ?)
+        `).bind(tutoreId, tutoreNome, tutoreCognome, tutoreCf, tutoreTelefono, tutoreEmail, tutoreRuolo).run();
+      }
+    }
+
+    // 2. Inserimento Minore come Socio Ordinario (in attesa di delibera)
+    let socioId = null;
+    const existingSocio = await env.DB.prepare("SELECT id FROM soci WHERE codice_fiscale = ?").bind(minoreCf).first();
+    if (existingSocio) {
+      socioId = existingSocio.id;
+      await env.DB.prepare(`
+        UPDATE soci 
+        SET nome = ?, cognome = ?, data_nascita = ?, luogo_nascita = ?, residenza_indirizzo = ?, tutore_id = ?, updated_at = datetime('now')
+        WHERE id = ?
+      `).bind(minoreNome, minoreCognome, minoreNascita, minoreLuogo, minoreIndirizzo, tutoreId, socioId).run();
+    } else {
+      socioId = "soc-" + Date.now();
+      await env.DB.prepare(`
+        INSERT INTO soci (
+          id, tipo_socio, is_minore, tutore_id, nome, cognome, codice_fiscale,
+          data_nascita, luogo_nascita, residenza_indirizzo, email, telefono,
+          stato_richiesta, anno_adesione, data_domanda
+        ) VALUES (
+          ?, 'ordinario', 1, ?, ?, ?, ?,
+          ?, ?, ?, ?, ?,
+          'in_attesa', 2026, datetime('now')
+        )
+      `).bind(
+        socioId, tutoreId, minoreNome, minoreCognome, minoreCf,
+        minoreNascita, minoreLuogo, minoreIndirizzo, tutoreEmail, tutoreTelefono
+      ).run();
+    }
+
+    // 3. Iscrizione al Corso Teatrale
+    await env.DB.prepare(`
+      INSERT OR REPLACE INTO iscrizioni_corsi (id, socio_id, attivita_id, stato_iscrizione, data_iscrizione)
+      VALUES (?, ?, ?, 'confermata', datetime('now'))
+    `).bind("isc-" + socioId, socioId, DEFAULT_CORSO_ID).run();
+
+    // 4. Inserimento Deleghe
+    if (delega1Nome) {
+      await env.DB.prepare(`
+        INSERT INTO deleghe_ritiro (id, socio_minore_id, nome, cognome, telefono, relazione)
+        VALUES (?, ?, ?, '', ?, ?)
+      `).bind("del1-" + socioId, socioId, delega1Nome, delega1Tel, delega1Rel).run();
+    }
+    if (delega2Nome) {
+      await env.DB.prepare(`
+        INSERT INTO deleghe_ritiro (id, socio_minore_id, nome, cognome, telefono, relazione)
+        VALUES (?, ?, ?, '', ?, ?)
+      `).bind("del2-" + socioId, socioId, delega2Nome, delega2Tel, delega2Rel).run();
+    }
+
+    // 5. Consensi Privacy & Statuto
+    await env.DB.prepare(`
+      INSERT OR REPLACE INTO consensi_privacy (
+        id, socio_id, accettazione_statuto, consenso_trattamento_dati,
+        consenso_foto_video, consenso_newsletter, data_consenso
+      ) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+    `).bind("cons-" + socioId, socioId, accettaStatuto, consensoPrivacy, consensoFoto, consensoNews).run();
+
+    return new Response(null, {
+      status: 302,
+      headers: {
+        Location: `/?success=1&socio=${encodeURIComponent(minoreNome + " " + minoreCognome)}`
+      }
+    });
+  } catch (err) {
+    console.error("Errore salvataggio domanda:", err);
+    return new Response("Errore durante il salvataggio dei dati: " + err.message, { status: 500 });
+  }
 }
