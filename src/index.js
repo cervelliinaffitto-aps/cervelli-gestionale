@@ -248,19 +248,19 @@ async function getAdminSession(request, env) {
 
   try {
     const row = await env.DB.prepare(`
-      SELECT s.id as session_id, s.utente_id, u.nome, u.cognome, u.email, u.ruolo
+      SELECT s.token, s.scadenza, u.id, u.nome, u.cognome, u.email, u.ruolo
       FROM sessioni_admin s
       JOIN utenti_gestionale u ON s.utente_id = u.id
-      WHERE s.token = ? AND datetime(s.scadenza) > datetime('now')
+      WHERE s.token = ? AND s.scadenza > datetime('now')
       LIMIT 1
     `).bind(token).first();
 
     if (!row) return null;
 
     return {
-      session_id: row.session_id,
+      token: row.token,
       user: {
-        id: row.utente_id,
+        id: row.id,
         nome: row.nome,
         cognome: row.cognome,
         email: row.email,
@@ -352,10 +352,11 @@ async function handleLoginPost(request, env) {
 
     const token = generateSecureToken();
 
+    // Inserimento sessione allineato esattamente alle colonne della tabella sessioni_admin
     await env.DB.prepare(`
-      INSERT INTO sessioni_admin (utente_id, token, scadenza, creata_il)
-      VALUES (?, ?, datetime('now', '+${SESSION_DURATION_HOURS} hours'), datetime('now'))
-    `).bind(user.id, token).run();
+      INSERT INTO sessioni_admin (token, utente_id, scadenza)
+      VALUES (?, ?, datetime('now', '+${SESSION_DURATION_HOURS} hours'))
+    `).bind(token, user.id).run();
 
     const cookieValue = `${SESSION_COOKIE_NAME}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_DURATION_HOURS * 3600}; Secure`;
 
@@ -372,7 +373,16 @@ async function handleLoginPost(request, env) {
   }
 }
 
-function handleLogout(request, env) {
+async function handleLogout(request, env) {
+  const cookies = parseCookies(request.headers.get("Cookie"));
+  const token = cookies[SESSION_COOKIE_NAME] || cookies["cervelli_admin_session"];
+  if (token) {
+    try {
+      await env.DB.prepare("DELETE FROM sessioni_admin WHERE token = ?").bind(token).run();
+    } catch (e) {
+      console.error("Errore logout sessione:", e);
+    }
+  }
   const cookieValue = `${SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0; Secure`;
   return new Response(null, {
     status: 302,
@@ -2227,7 +2237,6 @@ function renderPublicWizard(step, isSuccess, searchParams) {
 
   <script>
     function goToStep(num) {
-      // Validazione step corrente prima di avanzare
       if (num === 2) {
         if (!document.getElementById('minore_nome').value || !document.getElementById('minore_cognome').value || !document.getElementById('minore_cf').value) {
           alert('Compila tutti i campi obbligatori del minore.');
