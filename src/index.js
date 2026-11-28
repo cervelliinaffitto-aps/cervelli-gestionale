@@ -1,20 +1,45 @@
 /**
- * Cervelli in Affitto APS - Piattaforma Gestionale
- * - Portale Pubblico: Modulo Iscrizione Corsi Minori & Domanda Socio (Wizard a 5 step)
- * - Area Riservata (/admin): Dashboard Generale, Pagine HUB Macro-Aree e Delibera CD
- * - Builder del Tema & Identità Visiva (Macro-Area 4.2) collegato a Cloudflare D1
- * Affiliato UILT - Unione Italiana Libero Teatro
+ * Cervelli in Affitto APS - Piattaforma Gestionale Integrata
+ * - Portale Pubblico: Modulo Iscrizione Corsi Minori & Domanda Socio (Wizard a 5 Step)
+ * - Area Riservata: Login Super Admin, Dashboard Generale con Hub Macro-Aree (Bibbia v2.4)
+ * - Macro-Area 4.2: Builder Tema & Identità Visiva (Palette Colori, Logo, Font, Dati D1)
+ *
+ * Dominio: cervelliinaffitto-aps.it
+ * Autore: Cervelli in Affitto APS / Lovable Platform
  */
 
-const DEFAULT_CORSO_ID = "corso-teatro-ragazzi-2026";
-const COOKIE_NAME = "cervelli_admin_session";
-const PBKDF2_SALT = "cervelli-aps-security-salt-2026";
+/* =========================================================================
+   CONFIGURAZIONI E COSTANTI DI SICUREZZA
+   ========================================================================= */
+
+const SESSION_COOKIE_NAME = "cervelli_admin_sess";
+const SESSION_DURATION_HOURS = 12;
+const PBKDF2_SALT = "cervelli_aps_secure_salt_2026_uilt";
+
+// Configurazione predefinita del tema (usata se la tabella D1 non è ancora popolata)
+const DEFAULT_THEME = {
+  nome_associazione: "Cervelli in Affitto APS",
+  dominio_ufficiale: "cervelliinaffitto-aps.it",
+  colore_primario: "#D98295",      // Rosa Cervello teatrale
+  colore_secondario: "#E8E7E9",    // Argento Maschere
+  colore_scuro: "#121214",         // Nero Ribalta
+  colore_sfondo: "#18181B",        // Grigio scuro per card admin
+  colore_accento: "#10B981",       // Verde per stati completati/attivi
+  colore_testo: "#FAFAFA",         // Bianco crema per testi
+  scala_font: "normale",           // normale, compatta, grande
+  url_logo: "https://lh3.googleusercontent.com/d/1h-xfyBoxK5TuAsx-FamJIXf3nFh7FVoO",
+  email_contatto: "info@cervelliinaffitto-aps.it"
+};
+
+/* =========================================================================
+   HANDLER PRINCIPALE DI ENTRATA (WORKER FETCH)
+   ========================================================================= */
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // 1. Endpoint di test rapido per verificare il database
+    // Endpoint diagnostico per verificare tabelle e connessione D1
     if (url.pathname === "/api/test-db") {
       try {
         const { results } = await env.DB.prepare(
@@ -31,85 +56,82 @@ export default {
       }
     }
 
-    // 2. Area Amministrativa e di Gestione (/admin)
+    // Rotte dell'Area Amministrativa e Gestionale (/admin e sottomenu)
     if (url.pathname.startsWith("/admin")) {
       return handleAdminRoutes(request, env, url);
     }
 
-    // 3. Portale Pubblico: Invio Modulo Minori
-    if (url.pathname === "/iscrizione-minori" && request.method === "POST") {
-      return handleIscrizionePost(request, env, url);
-    }
-
-    // 4. Portale Pubblico: Visualizzazione Wizard 5 Step (legge i colori e il logo da D1)
-    if (url.pathname === "/" || url.pathname === "/iscrizione-minori") {
-      const step = parseInt(url.searchParams.get("step") || "1", 10);
-      const isSuccess = url.searchParams.get("success") === "1";
-      const settings = await getImpostazioni(env);
-      return renderPublicWizard(step, isSuccess, url.searchParams, settings);
-    }
-
-    return new Response("Pagina non trovata", { status: 404 });
+    // Rotte del Portale Pubblico (Modulo Iscrizione Corsi Minori & Domanda Socio)
+    return handlePublicRoutes(request, env, url, ctx);
   }
 };
 
 /* =========================================================================
-   GESTIONE IMPOSTAZIONI TEMA E IDENTITÀ D1
+   CARICAMENTO DINAMICO DELLE IMPOSTAZIONI DAL DATABASE D1
    ========================================================================= */
 
-async function getImpostazioni(env) {
-  const defaults = {
-    nome_aps: "Cervelli in Affitto APS",
-    dominio_ufficiale: "cervellinaffitto-aps.it",
-    logo_url: "",
-    colore_primario: "#D98295",
-    colore_sfondo: "#121214",
-    colore_card: "#18181B",
-    colore_macro_1: "#D98295",
-    colore_macro_2: "#60A5FA",
-    colore_macro_3: "#F59E0B",
-    colore_macro_4: "#A78BFA",
-    colore_macro_5: "#34D399",
-    scala_caratteri: "normale",
-    email_contatto: "info@cervellinaffitto-aps.it"
-  };
-
+async function getThemeSettings(env) {
   try {
-    const { results } = await env.DB.prepare("SELECT chiave, valore FROM impostazioni_gestionale").all();
-    if (results && results.length > 0) {
-      results.forEach(row => {
-        if (row.valore !== undefined && row.valore !== null && row.valore !== "") {
-          defaults[row.chiave] = row.valore;
-        }
-      });
-    }
-  } catch (e) {
-    console.warn("Impostazioni non trovate in D1, uso valori di default:", e);
-  }
+    const { results } = await env.DB.prepare(
+      "SELECT chiave, valore FROM impostazioni_gestionale"
+    ).all();
 
-  return defaults;
+    if (!results || results.length === 0) {
+      return { ...DEFAULT_THEME };
+    }
+
+    const config = { ...DEFAULT_THEME };
+    for (const row of results) {
+      if (row.valore !== null && row.valore !== undefined) {
+        config[row.chiave] = row.valore;
+      }
+    }
+    return config;
+  } catch (err) {
+    console.warn("Tabella impostazioni_gestionale non ancora disponibile, uso valori di fallback:", err.message);
+    return { ...DEFAULT_THEME };
+  }
 }
+
+/* =========================================================================
+   SALVATAGGIO CONFIGURAZIONI TEMA SU D1 (POST DA ADMIN BUILDER TEMA)
+   ========================================================================= */
 
 async function handleSalvaTemaPost(request, env, user) {
   try {
-    const formData = await request.formData();
-    const chiavi = [
-      'nome_aps', 'dominio_ufficiale', 'email_contatto', 'logo_url',
-      'colore_primario', 'colore_sfondo', 'colore_card',
-      'colore_macro_1', 'colore_macro_2', 'colore_macro_3', 'colore_macro_4', 'colore_macro_5',
-      'scala_caratteri'
+    const form = await request.formData();
+
+    const chiaviPermesse = [
+      "nome_associazione",
+      "dominio_ufficiale",
+      "colore_primario",
+      "colore_secondario",
+      "colore_scuro",
+      "colore_sfondo",
+      "colore_accento",
+      "colore_testo",
+      "scala_font",
+      "url_logo",
+      "email_contatto"
     ];
 
-    const statements = chiavi.map(chiave => {
-      const val = (formData.get(chiave) || "").toString().trim();
-      return env.DB.prepare(`
-        INSERT INTO impostazioni_gestionale (chiave, valore, updated_at)
-        VALUES (?, ?, CURRENT_TIMESTAMP)
-        ON CONFLICT(chiave) DO UPDATE SET valore = excluded.valore, updated_at = CURRENT_TIMESTAMP
-      `).bind(chiave, val);
-    });
+    const statements = [];
+    for (const chiave of chiaviPermesse) {
+      const val = form.get(chiave);
+      if (val !== null && val !== undefined) {
+        statements.push(
+          env.DB.prepare(
+            `INSERT INTO impostazioni_gestionale (chiave, valore, data_aggiornamento)
+             VALUES (?, ?, datetime('now'))
+             ON CONFLICT(chiave) DO UPDATE SET valore=excluded.valore, data_aggiornamento=datetime('now')`
+          ).bind(chiave, val.toString().trim())
+        );
+      }
+    }
 
-    await env.DB.batch(statements);
+    if (statements.length > 0) {
+      await env.DB.batch(statements);
+    }
 
     return new Response(null, {
       status: 302,
@@ -215,195 +237,159 @@ async function hashPassword(password) {
     ["encrypt", "decrypt"]
   );
 
-  const rawKey = await crypto.subtle.exportKey("raw", derivedKey);
-  const hashArray = Array.from(new Uint8Array(rawKey));
-  return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
+  const exported = await crypto.subtle.exportKey("raw", derivedKey);
+  return Array.from(new Uint8Array(exported))
+    .map(b => b.toString(16).padStart(2, "0"))
+    .join("");
 }
 
-function generateSessionToken() {
+function generateSecureToken() {
   const bytes = new Uint8Array(32);
   crypto.getRandomValues(bytes);
-  return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
+  return Array.from(bytes).map(b => b.toString(16).padStart(2, "0")).join("");
 }
 
 async function getAdminSession(request, env) {
-  const cookieHeader = request.headers.get("Cookie") || "";
-  const match = cookieHeader.match(new RegExp(`${COOKIE_NAME}=([^;]+)`));
-  if (!match) return null;
+  const cookieHeader = request.headers.get("Cookie");
+  if (!cookieHeader) return null;
 
-  const token = match[1];
+  const cookies = Object.fromEntries(
+    cookieHeader.split(";").map(c => {
+      const parts = c.trim().split("=");
+      return [parts[0], parts.slice(1).join("=")];
+    })
+  );
+
+  const token = cookies[SESSION_COOKIE_NAME];
+  if (!token) return null;
+
   try {
-    const session = await env.DB.prepare(`
-      SELECT s.token, s.scadenza, u.id, u.email, u.nome, u.cognome, u.ruolo
+    const row = await env.DB.prepare(`
+      SELECT s.id as session_id, s.utente_id, u.nome, u.cognome, u.email, u.ruolo
       FROM sessioni_admin s
       JOIN utenti_gestionale u ON s.utente_id = u.id
-      WHERE s.token = ? AND s.scadenza > datetime('now')
+      WHERE s.token = ? AND datetime(s.scadenza) > datetime('now')
+      LIMIT 1
     `).bind(token).first();
 
-    if (!session) return null;
+    if (!row) return null;
 
     return {
-      token: session.token,
+      session_id: row.session_id,
       user: {
-        id: session.id,
-        email: session.email,
-        nome: session.nome,
-        cognome: session.cognome,
-        ruolo: session.ruolo
+        id: row.utente_id,
+        nome: row.nome,
+        cognome: row.cognome,
+        email: row.email,
+        ruolo: row.ruolo
       }
     };
-  } catch (e) {
-    console.error("Errore verifica sessione:", e);
+  } catch (err) {
+    console.error("Errore verifica sessione:", err);
     return null;
   }
 }
 
 async function handleSetupPost(request, env) {
   try {
-    const formData = await request.formData();
-    const nome = (formData.get("nome") || "").toString().trim();
-    const cognome = (formData.get("cognome") || "").toString().trim();
-    const email = (formData.get("email") || "").toString().trim().toLowerCase();
-    const password = (formData.get("password") || "").toString();
+    const countRow = await env.DB.prepare(
+      "SELECT COUNT(*) as count FROM utenti_gestionale WHERE ruolo = 'super_admin'"
+    ).first();
+
+    if (countRow && countRow.count > 0) {
+      return new Response("Setup già completato. Effettua il login.", { status: 403 });
+    }
+
+    const form = await request.formData();
+    const nome = form.get("nome")?.trim();
+    const cognome = form.get("cognome")?.trim();
+    const email = form.get("email")?.trim().toLowerCase();
+    const password = form.get("password");
 
     if (!nome || !cognome || !email || !password) {
       return renderSetupPage("Tutti i campi sono obbligatori.");
     }
 
     if (password.length < 8) {
-      return renderSetupPage("La password deve avere almeno 8 caratteri.");
+      return renderSetupPage("La password deve contenere almeno 8 caratteri.");
     }
 
-    const checkAdmin = await env.DB.prepare(
-      "SELECT id FROM utenti_gestionale WHERE ruolo = 'super_admin' LIMIT 1"
-    ).first();
+    const passwordHash = await hashPassword(password);
 
-    if (checkAdmin) {
-      return new Response(null, { status: 302, headers: { Location: "/admin/login" } });
-    }
-
-    const passHash = await hashPassword(password);
-
-    const result = await env.DB.prepare(`
-      INSERT INTO utenti_gestionale (nome, cognome, email, password_hash, ruolo, attivo)
-      VALUES (?, ?, ?, ?, 'super_admin', 1)
-    `).bind(nome, cognome, email, passHash).run();
-
-    const userId = result.meta.last_row_id;
-    const sessionToken = generateSessionToken();
     await env.DB.prepare(`
-      INSERT INTO sessioni_admin (token, utente_id, scadenza)
-      VALUES (?, ?, datetime('now', '+7 days'))
-    `).bind(sessionToken, userId).run();
+      INSERT INTO utenti_gestionale (nome, cognome, email, password_hash, ruolo, attivo, creato_il)
+      VALUES (?, ?, ?, ?, 'super_admin', 1, datetime('now'))
+    `).bind(nome, cognome, email, passwordHash).run();
 
     return new Response(null, {
       status: 302,
-      headers: {
-        Location: "/admin?view=dashboard",
-        "Set-Cookie": `${COOKIE_NAME}=${sessionToken}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800; Secure`
-      }
+      headers: { Location: "/admin?setup=success" }
     });
-  } catch (e) {
-    console.error("Errore setup admin:", e);
-    return renderSetupPage(`Errore: ${e.message}`);
+  } catch (err) {
+    console.error("Errore setup:", err);
+    return renderSetupPage("Errore durante la creazione del Super Admin: " + err.message);
   }
 }
 
 async function handleLoginPost(request, env) {
   try {
-    const formData = await request.formData();
-    const email = (formData.get("email") || "").toString().trim().toLowerCase();
-    const password = (formData.get("password") || "").toString();
+    const form = await request.formData();
+    const email = form.get("email")?.trim().toLowerCase();
+    const password = form.get("password");
 
     if (!email || !password) {
-      return renderLoginPage("Inserisci email e password.");
+      return renderLoginPage("Inserisci sia l'email che la password.");
     }
-
-    const passHash = await hashPassword(password);
 
     const user = await env.DB.prepare(`
-      SELECT id, nome, cognome, email, ruolo, attivo
+      SELECT id, nome, cognome, email, password_hash, ruolo, attivo
       FROM utenti_gestionale
-      WHERE email = ? AND password_hash = ?
-    `).bind(email, passHash).first();
+      WHERE email = ? AND attivo = 1
+      LIMIT 1
+    `).bind(email).first();
 
     if (!user) {
-      return renderLoginPage("Credenziali non valide o utente inesistente.");
+      return renderLoginPage("Credenziali non valide o utente non attivo.");
     }
 
-    if (user.attivo !== 1) {
-      return renderLoginPage("Questo account è disattivato. Contatta l'amministratore.");
+    const inputHash = await hashPassword(password);
+    if (inputHash !== user.password_hash) {
+      return renderLoginPage("Credenziali non valide.");
     }
 
-    const sessionToken = generateSessionToken();
+    const token = generateSecureToken();
+
     await env.DB.prepare(`
-      INSERT INTO sessioni_admin (token, utente_id, scadenza)
-      VALUES (?, ?, datetime('now', '+7 days'))
-    `).bind(sessionToken, user.id).run();
+      INSERT INTO sessioni_admin (utente_id, token, scadenza, creata_il)
+      VALUES (?, ?, datetime('now', '+${SESSION_DURATION_HOURS} hours'), datetime('now'))
+    `).bind(user.id, token).run();
+
+    const cookieValue = `${SESSION_COOKIE_NAME}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_DURATION_HOURS * 3600}; Secure`;
 
     return new Response(null, {
       status: 302,
       headers: {
-        Location: "/admin?view=dashboard",
-        "Set-Cookie": `${COOKIE_NAME}=${sessionToken}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800; Secure`
+        "Location": "/admin?view=dashboard",
+        "Set-Cookie": cookieValue
       }
     });
-  } catch (e) {
-    console.error("Errore login admin:", e);
-    return renderLoginPage(`Errore di sistema: ${e.message}`);
-  }
-}
-
-async function handleDeliberaPost(request, env, user) {
-  try {
-    const formData = await request.formData();
-    const socioId = (formData.get("socio_id") || "").toString().trim();
-    const dataDelibera = (formData.get("data_delibera") || "").toString().trim();
-    const numeroVerbale = (formData.get("numero_verbale") || "").toString().trim();
-    let numeroTessera = (formData.get("numero_tessera") || "").toString().trim();
-
-    if (!socioId || !dataDelibera || !numeroVerbale) {
-      return new Response(null, {
-        status: 302,
-        headers: { Location: "/admin?view=domande&msg=err_campi" }
-      });
-    }
-
-    if (!numeroTessera) {
-      const year = new Date().getFullYear();
-      const countRow = await env.DB.prepare(
-        "SELECT COUNT(*) as c FROM soci WHERE stato_richiesta = 'approvato'"
-      ).first();
-      const progressive = ((countRow ? countRow.c : 0) + 1).toString().padStart(3, "0");
-      numeroTessera = `${year}-${progressive}`;
-    }
-
-    await env.DB.prepare(`
-      UPDATE soci 
-      SET 
-        stato_richiesta = 'approvato',
-        data_delibera = ?,
-        numero_verbale = ?,
-        numero_tessera_aps = ?,
-        updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `).bind(dataDelibera, numeroVerbale, numeroTessera, socioId).run();
-
-    return new Response(null, {
-      status: 302,
-      headers: { Location: "/admin?view=domande&msg=delibera_ok" }
-    });
-  } catch (e) {
-    console.error("Errore ratifica delibera:", e);
-    return new Response("Errore delibera: " + e.message, { status: 500 });
+  } catch (err) {
+    console.error("Errore durante il login:", err);
+    return renderLoginPage("Errore di sistema durante l'accesso.");
   }
 }
 
 async function handleLogout(request, env) {
   const cookieHeader = request.headers.get("Cookie") || "";
-  const match = cookieHeader.match(new RegExp(`${COOKIE_NAME}=([^;]+)`));
-  if (match) {
-    const token = match[1];
+  const cookies = Object.fromEntries(
+    cookieHeader.split(";").map(c => {
+      const parts = c.trim().split("=");
+      return [parts[0], parts.slice(1).join("=")];
+    })
+  );
+
+  const token = cookies[SESSION_COOKIE_NAME];
+  if (token) {
     try {
       await env.DB.prepare("DELETE FROM sessioni_admin WHERE token = ?").bind(token).run();
     } catch (e) {
@@ -411,1635 +397,1362 @@ async function handleLogout(request, env) {
     }
   }
 
+  const deleteCookie = `${SESSION_COOKIE_NAME}=; Path=/; HttpOnly; Max-Age=0; SameSite=Lax`;
   return new Response(null, {
     status: 302,
     headers: {
-      Location: "/admin/login",
-      "Set-Cookie": `${COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0; Secure`
+      "Location": "/admin",
+      "Set-Cookie": deleteCookie
     }
   });
 }
 
 /* =========================================================================
-   STRUTTURA E ARCHITETTURA UFFICIALE DELLE MACRO-AREE (BIBBIA)
+   DELIBERA DEL CONSIGLIO DIRETTIVO E ASSEGNAZIONE TESSERA APS
    ========================================================================= */
 
-const MENU_SECTIONS = [
+async function handleDeliberaPost(request, env, user) {
+  try {
+    const form = await request.formData();
+    const socioId = form.get("socio_id");
+    const dataDelibera = form.get("data_delibera");
+    const numeroVerbale = form.get("numero_verbale")?.trim();
+    const numeroTessera = form.get("numero_tessera")?.trim();
+    const dataSaldoQuota = form.get("data_saldo_quota");
+    const modalitaPagamento = form.get("modalita_pagamento") || "contanti";
+
+    if (!socioId || !dataDelibera || !numeroVerbale || !numeroTessera) {
+      return new Response("Tutti i campi di delibera sono obbligatori.", { status: 400 });
+    }
+
+    const statements = [
+      env.DB.prepare(`
+        UPDATE soci
+        SET stato_iscrizione = 'attivo',
+            data_ammissione = ?,
+            delibera_verbale_ammissione = ?,
+            numero_tessera_aps = ?,
+            aggiornato_il = datetime('now')
+        WHERE id = ?
+      `).bind(dataDelibera, numeroVerbale, numeroTessera, socioId),
+
+      env.DB.prepare(`
+        UPDATE quote_sociali
+        SET stato_pagamento = 'saldato',
+            data_pagamento = ?,
+            modalita_pagamento = ?
+        WHERE socio_id = ?
+      `).bind(dataSaldoQuota || dataDelibera, modalitaPagamento, socioId)
+    ];
+
+    await env.DB.batch(statements);
+
+    return new Response(null, {
+      status: 302,
+      headers: { Location: "/admin?view=domande&msg=delibera_completata" }
+    });
+  } catch (err) {
+    console.error("Errore durante la delibera:", err);
+    return new Response("Errore durante il salvataggio della delibera: " + err.message, { status: 500 });
+  }
+}
+
+/* =========================================================================
+   DEFINIZIONE DELLA STRUTTURA UFFICIALE DEL GESTIONALE (BIBBIA v2.4)
+   ========================================================================= */
+
+const MACRO_AREE = [
   {
-    id: "macro-soci",
+    id: "soci",
+    numero: "1",
     titolo: "Soci & Libro Soci",
-    colore: "#D98295", // Rosa Cervello
-    icona: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>`,
-    descrizione: "Gestione delibere di ammissione del Consiglio Direttivo, Libro Soci persistente, anagrafiche minori, tutori e affiliazione UILT.",
-    voci: [
-      { id: "domande", etichetta: "1.1 Domande Ammissione", desc: "Verifica e approvazione con data delibera, verbale CD e numero tessera APS." },
-      { id: "registro-soci", etichetta: "1.2 Registro Libro Soci", desc: "Registro cronologico ufficiale dei soci con filtri di ricerca ed esportazione." },
-      { id: "schede-soci", etichetta: "1.3 Schede Soci & Minori", desc: "Dossier anagrafico completo dei soci, tutori legali e deleghe al ritiro." },
-      { id: "quote-uilt", etichetta: "1.4 Quote & Tessere UILT", desc: "Stato quote annuali APS (1 nov-31 ott), quote UILT (anno solare) e upload tessere." }
+    icona: "users",
+    colore: "#D98295",
+    descrizione: "Gestione domande di ammissione, Libro Soci ufficiale, anagrafiche minori, quote sociali e tesseramento nazionale UILT.",
+    sezioni: [
+      { id: "domande", etichetta: "1.1 Domande Ammissione", desc: "Verifica e delibera delle richieste di nuovi soci o minori dei laboratori." },
+      { id: "libro-soci", etichetta: "1.2 Libro Soci Ufficiale", desc: "Registro anagrafico soci attivi con stato quota APS e data verbale delibera." },
+      { id: "tutori-minori", etichetta: "1.3 Tutori & Minori", desc: "Elenco genitori, deleghe di ritiro per i corsi e contatti per emergenze." },
+      { id: "uilt", etichetta: "1.4 Tesseramento UILT", desc: "Copertura infortuni/RC e caricamento attestati tessera UILT in PDF." }
     ]
   },
   {
-    id: "macro-corsi",
+    id: "corsi",
+    numero: "2",
     titolo: "Attività & Corsi",
-    colore: "#60A5FA", // Blu Teatrale
-    icona: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>`,
+    icona: "graduation-cap",
+    colore: "#38BDF8",
     descrizione: "Laboratori teatrali per bambini, ragazzi e adulti, registri allievi, quote di frequenza e foglio presenze.",
-    voci: [
-      { id: "corsi", etichetta: "2.1 Corsi e Laboratori Teatrali", desc: "Creazione e gestione corsi, docenti, calendario lezioni e quote mensili." },
-      { id: "iscritti-corsi", etichetta: "2.2 Registro Iscritti per Corso", desc: "Elenco iscritti attivi, stato pagamenti quote laboratori e contatti tutori." },
-      { id: "presenze", etichetta: "2.3 Registro Presenze & Lezioni", desc: "Appello digitale delle lezioni per docenti con report esportabile." }
+    sezioni: [
+      { id: "laboratori", etichetta: "2.1 Elenco Corsi & Laboratori", desc: "Corsi teatrali attivi, fasce orarie, sedi di svolgimento e docenti." },
+      { id: "presenze", etichetta: "2.2 Registro Presenze", desc: "Foglio presenze lezioni con spunta allievi presenti ed esportazione PDF." },
+      { id: "quote-corsi", etichetta: "2.3 Quote & Rate Frequenza", desc: "Stato dei pagamenti mensili o quadrimestrali per la frequenza ai laboratori." }
     ]
   },
   {
-    id: "macro-eventi",
+    id: "teatro",
+    numero: "3",
     titolo: "Eventi, Teatro & Casse",
-    colore: "#F59E0B", // Ambra Ribalta
-    icona: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="7" width="20" height="14" rx="2" ry="2"/><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"/></svg>`,
+    icona: "ticket",
+    colore: "#F59E0B",
     descrizione: "Cartellone spettacoli, cene con delitto, eventi sul territorio, gestione prenotazioni e casse distinte.",
-    voci: [
-      { id: "cartellone", etichetta: "3.1 Cartellone & Spettacoli Teatrali", desc: "Gestione repliche teatrali, debutti, locandine e capienza teatri." },
-      { id: "eventi-extra", etichetta: "3.2 Altri Eventi (Cene con Delitto)", desc: "Eventi gastronomici o speciali con form e cassa dedicati." },
-      { id: "prenotazioni", etichetta: "3.3 Prenotazioni & Posti", desc: "Ricerca persistente, modifica prenotazioni con verifica capienza e omaggi." },
-      { id: "cassa-teatro", etichetta: "3.4 Cassa Spettacoli & Ingressi", desc: "Botteghino teatro, emissione biglietti, pagamenti e controllo ingressi." },
-      { id: "cassa-eventi", etichetta: "3.5 Cassa Altri Eventi & Quote", desc: "Cassa flessibile per eventi convenzionati e incassi cene." }
+    sezioni: [
+      { id: "cartellone", etichetta: "3.1 Cartellone Spettacoli", desc: "Stagione teatrale, date di debutto e repliche con mappa posti a sedere." },
+      { id: "altri-eventi", etichetta: "3.2 Cene con Delitto & Eventi", desc: "Eventi gastronomici e animazioni con moduli di iscrizione dedicati." },
+      { id: "prenotazioni", etichetta: "3.3 Gestione Prenotazioni", desc: "Ricerca persistente, modifica capienza, omaggi e ingressi con codice univoco." },
+      { id: "cassa-teatro", etichetta: "3.4 Cassa Spettacoli Teatrali", desc: "Biglietteria sul posto, gestione piantina platea e saldo all'ingresso." },
+      { id: "cassa-eventi", etichetta: "3.5 Cassa Altri Eventi", desc: "Incassi quote eventi esterni, modalità flessibili e causali personalizzate." }
     ]
   },
   {
-    id: "macro-builder",
+    id: "builder",
+    numero: "4",
     titolo: "Builder & Contenuti",
-    colore: "#A78BFA", // Viola Strumenti
-    icona: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>`,
+    icona: "palette",
+    colore: "#10B981",
     descrizione: "Strumenti per personalizzare logo, colori, moduli pubblici, modelli di tessere e comunicazioni email.",
-    voci: [
-      { id: "form-builder", etichetta: "4.1 Form Builder Dinamico", desc: "Crea e modifica i campi dei form pubblici per corsi, soci o eventi." },
+    sezioni: [
+      { id: "form-builder", etichetta: "4.1 Form Builder Dinamico", desc: "Modifica campi, consensi e requisiti dei form pubblici senza toccare il codice." },
       { id: "theme-builder", etichetta: "4.2 Builder Tema & Identità Visiva", desc: "Configura colori, sfondi, logo e layout di portale e gestionale." },
-      { id: "tessera-builder", etichetta: "4.3 Builder Tessera APS", desc: "Modello grafico della tessera associativa digitale e parametri di stampa." },
-      { id: "email-builder", etichetta: "4.4 Template Email & Comunicazioni", desc: "Modifica i testi delle email automatiche di conferma e promemoria." }
+      { id: "card-builder", etichetta: "4.3 Builder Tessera APS", desc: "Layout grafico della tessera associativa digitale stampabile o scaricabile." },
+      { id: "email-templates", etichetta: "4.4 Template Email & Comunicazioni", desc: "Modelli automatici per conferme iscrizione, delibere e solleciti quote." }
     ]
   },
   {
-    id: "macro-sistema",
+    id: "sistema",
+    numero: "5",
     titolo: "Sistema & Utenti",
-    colore: "#34D399", // Smeraldo Sicurezza
-    icona: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>`,
-    descrizione: "Controllo accessi per ruoli (Super Admin, Cassiere, Docente), dati fiscali APS, registro log e backup D1.",
-    voci: [
-      { id: "utenti-ruoli", etichetta: "5.1 Utenti Gestionale & Ruoli", desc: "Gestione operatori interni, password e permessi per macro-area." },
-      { id: "registro-attivita", etichetta: "5.2 Registro Attività & Log", desc: "Tracciamento cronologico immutabile delle operazioni amministrative." },
-      { id: "dati-aps", etichetta: "5.3 Dati Fiscali APS & Impostazioni", desc: "CF, affiliazione UILT, sede legale, email mittente Resend e footer." },
-      { id: "backup-dati", etichetta: "5.4 Esportazioni & Backup", desc: "Esportazione completa in CSV/JSON dei dati per massima sicurezza." }
+    icona: "shield",
+    colore: "#818CF8",
+    descrizione: "Gestione accessi direttivo e operatori, permessi granulari, sicurezza database, log e backup.",
+    sezioni: [
+      { id: "utenti", etichetta: "5.1 Gestione Utenti & Ruoli", desc: "Accessi Super Admin, Direttivo, Cassa e Operatori con permessi differenziati." },
+      { id: "log-audit", etichetta: "5.2 Registro Eventi & Audit", desc: "Storico modifiche per trasparenza interna e conformità al Terzo Settore." },
+      { id: "backup-dati", etichetta: "5.3 Backup & Esportazione Dati", desc: "Esportazione completa in CSV/Excel e copie di salvataggio conformi a D1." }
     ]
   }
 ];
 
+function getIconSvg(name, size = 20) {
+  const icons = {
+    "dashboard": `<path d="M3 3h7v7H3z"/><path d="M14 3h7v7h-7z"/><path d="M14 14h7v7h-7z"/><path d="M3 14h7v7H3z"/>`,
+    "users": `<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>`,
+    "graduation-cap": `<path d="M22 10v6M2 10l10-5 10 5-10 5z"/><path d="M6 12v5c0 2 2 3 6 3s6-1 6-3v-5"/>`,
+    "ticket": `<rect x="2" y="6" width="20" height="12" rx="2"/><line x1="6" y1="12" x2="18" y2="12"/><line x1="12" y1="6" x2="12" y2="18"/>`,
+    "palette": `<circle cx="13.5" cy="6.5" r=".5"/><circle cx="17.5" cy="10.5" r=".5"/><circle cx="8.5" cy="7.5" r=".5"/><circle cx="6.5" cy="12.5" r=".5"/><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.926 0 1.648-.746 1.648-1.688 0-.437-.18-.835-.437-1.125-.29-.289-.438-.652-.438-1.125a1.64 1.64 0 0 1 1.668-1.668h1.996c3.051 0 5.555-2.503 5.555-5.554C21.965 6.012 17.461 2 12 2z"/>`,
+    "shield": `<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>`
+  };
+  const body = icons[name] || icons["dashboard"];
+  return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${body}</svg>`;
+}
+
 /* =========================================================================
-   CARICAMENTO DATI E VISTE HTML AREA AMMINISTRATIVA
+   RENDERING AREA AMMINISTRATIVA (DASHBOARD, HUB E BUILDER TEMA)
    ========================================================================= */
 
-async function renderAdminDashboard(env, utente, url) {
+async function renderAdminDashboard(env, user, url) {
   const currentView = url.searchParams.get("view") || "dashboard";
-  const msgParam = url.searchParams.get("msg");
-  const settings = await getImpostazioni(env);
+  const msg = url.searchParams.get("msg");
+  const theme = await getThemeSettings(env);
 
-  // Applica i colori dinamici delle macro-aree salvati in D1
-  if (MENU_SECTIONS[0]) MENU_SECTIONS[0].colore = settings.colore_macro_1 || "#D98295";
-  if (MENU_SECTIONS[1]) MENU_SECTIONS[1].colore = settings.colore_macro_2 || "#60A5FA";
-  if (MENU_SECTIONS[2]) MENU_SECTIONS[2].colore = settings.colore_macro_3 || "#F59E0B";
-  if (MENU_SECTIONS[3]) MENU_SECTIONS[3].colore = settings.colore_macro_4 || "#A78BFA";
-  if (MENU_SECTIONS[4]) MENU_SECTIONS[4].colore = settings.colore_macro_5 || "#34D399";
-
+  // 1. Dati statistici di riepilogo per la Dashboard Generale
+  let stats = { domandeAttesa: 0, sociAttivi: 0, corsiAttivi: 1, incassiTotali: 0 };
   let domande = [];
+
   try {
-    const { results } = await env.DB.prepare(`
+    const dAttesa = await env.DB.prepare(
+      "SELECT COUNT(*) as count FROM soci WHERE stato_iscrizione = 'in_attesa_delibera'"
+    ).first();
+    stats.domandeAttesa = dAttesa?.count || 0;
+
+    const sAttivi = await env.DB.prepare(
+      "SELECT COUNT(*) as count FROM soci WHERE stato_iscrizione = 'attivo'"
+    ).first();
+    stats.sociAttivi = sAttivi?.count || 0;
+
+    domande = await env.DB.prepare(`
       SELECT 
-        s.id as socio_id,
-        s.nome as minore_nome,
-        s.cognome as minore_cognome,
-        s.codice_fiscale as minore_cf,
-        s.data_nascita as minore_nascita,
-        s.luogo_nascita as minore_luogo,
-        s.residenza_indirizzo,
-        s.stato_richiesta,
-        s.data_domanda,
-        s.data_delibera,
-        s.numero_verbale,
-        s.numero_tessera_aps,
-        t.nome as tutore_nome,
-        t.cognome as tutore_cognome,
-        t.codice_fiscale as tutore_cf,
-        t.telefono as tutore_telefono,
-        t.email as tutore_email,
-        t.grado_parentela,
-        ae.titolo as corso_titolo
+        s.id, s.nome, s.cognome, s.codice_fiscale, s.data_nascita, s.luogo_nascita,
+        s.tipo_socio, s.stato_iscrizione, s.creato_il,
+        t.nome as tutore_nome, t.cognome as tutore_cognome, t.telefono as tutore_telefono,
+        t.email as tutore_email, t.grado_parentela,
+        q.importo as quota_importo, q.stato_pagamento as quota_stato
       FROM soci s
       LEFT JOIN tutori t ON s.tutore_id = t.id
-      LEFT JOIN iscrizioni_corsi ic ON ic.socio_id = s.id
-      LEFT JOIN attivita_eventi ae ON ic.attivita_id = ae.id
-      WHERE s.is_minore = 1
-      ORDER BY s.created_at DESC
+      LEFT JOIN quote_sociali q ON q.socio_id = s.id AND q.stagione = '2025/2026'
+      WHERE s.stato_iscrizione = 'in_attesa_delibera'
+      ORDER BY s.creato_il ASC
     `).all();
-    domande = results || [];
-  } catch (e) {
-    console.error("Errore caricamento domande:", e);
+  } catch (err) {
+    console.warn("Errore caricamento statistiche dashboard:", err.message);
   }
 
-  let deleghe = [];
-  try {
-    const { results } = await env.DB.prepare(
-      "SELECT socio_minore_id, nome, cognome, telefono, relazione FROM deleghe_ritiro"
-    ).all();
-    deleghe = results || [];
-  } catch (e) {
-    console.warn("Nessuna delega o errore query:", e);
-  }
-
-  let consensi = [];
-  try {
-    const { results } = await env.DB.prepare(
-      "SELECT socio_id, accettazione_statuto, consenso_trattamento_dati, consenso_foto_video, consenso_newsletter FROM consensi_privacy"
-    ).all();
-    consensi = results || [];
-  } catch (e) {
-    console.warn("Nessun consenso o errore query:", e);
-  }
-
-  const delegheMap = {};
-  deleghe.forEach((d) => {
-    if (!delegheMap[d.socio_minore_id]) delegheMap[d.socio_minore_id] = [];
-    delegheMap[d.socio_minore_id].push(`${d.nome} ${d.cognome} (${d.relazione || "Delegato"} - ${d.telefono || ""})`);
-  });
-
-  const consensiMap = {};
-  consensi.forEach((c) => {
-    consensiMap[c.socio_id] = c;
-  });
-
-  const totDomande = domande.length;
-  const inAttesa = domande.filter((d) => d.stato_richiesta === "in_attesa").length;
-  const approvate = domande.filter((d) => d.stato_richiesta === "approvato").length;
-
-  // Assegnazione badge dinamici alle voci
-  MENU_SECTIONS[0].voci[0].badge = inAttesa > 0 ? inAttesa : null;
-
-  // Riconoscimento pagina corrente, titolo, macro-area e colore
-  let currentTitle = "Dashboard Generale";
-  let currentMacro = "Panoramica Associazione";
-  let currentMacroColor = settings.colore_primario || "#D98295";
-  let currentMacroIcon = `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>`;
-  let activeMacroId = null;
-
-  MENU_SECTIONS.forEach((sec) => {
-    if (sec.id === currentView) {
-      currentTitle = `Hub: ${sec.titolo}`;
-      currentMacro = sec.titolo;
-      currentMacroColor = sec.colore;
-      currentMacroIcon = sec.icona;
-      activeMacroId = sec.id;
-    }
-    sec.voci.forEach((v) => {
-      if (v.id === currentView) {
-        currentTitle = v.etichetta;
-        currentMacro = sec.titolo;
-        currentMacroColor = sec.colore;
-        currentMacroIcon = sec.icona;
-        activeMacroId = sec.id;
-      }
-    });
-  });
-
-  // Costruzione della Sidebar HTML
-  const sidebarNavHtml = MENU_SECTIONS.map((sec) => {
-    const isThisMacroHub = sec.id === currentView;
-    const isAnyChildActive = sec.voci.some((v) => v.id === currentView);
-    const isExpanded = isThisMacroHub || isAnyChildActive;
-
-    const subItems = sec.voci.map((v) => {
-      const activeClass = v.id === currentView ? "active" : "";
-      const badgeHtml = v.badge ? `<span class="nav-badge">${v.badge}</span>` : "";
-      return `<a href="/admin?view=${v.id}" class="nav-sub-item ${activeClass}">
-        <span class="sub-dot" style="background: ${sec.colore};"></span>
-        <span class="sub-text">${v.etichetta}</span>
-        ${badgeHtml}
-      </a>`;
-    }).join("");
-
-    return `
-      <div class="nav-group ${isExpanded ? "expanded" : ""}">
-        <div class="nav-group-header">
-          <a href="/admin?view=${sec.id}" class="nav-group-title ${isThisMacroHub ? "macro-active" : ""}">
-            <span class="nav-icon" style="color: ${sec.colore};">${sec.icona}</span>
-            <span class="nav-group-name">${sec.titolo}</span>
-          </a>
-          <button type="button" class="chevron-btn" onclick="this.closest('.nav-group').classList.toggle('expanded')" title="Espandi/Comprimi sottomenu">
-            <svg class="chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
-          </button>
-        </div>
-        <div class="nav-group-sub">
-          ${subItems}
-        </div>
+  // Costruzione della Sidebar Ufficiale
+  let sidebarHtml = `
+    <div class="sidebar-brand">
+      <div class="logo-box">
+        <img src="${theme.url_logo}" alt="Logo" class="brand-img" onerror="this.style.display='none'; document.getElementById('logoSvgFallback').style.display='block';">
+        <div id="logoSvgFallback" style="display:none;">${getIconSvg("shield", 28)}</div>
       </div>
-    `;
-  }).join("");
-
-  let msgNotifica = "";
-  if (msgParam === "delibera_ok") {
-    msgNotifica = `<div class="alert-box alert-success">Delibera Consiglio Direttivo registrata con successo! Il socio è stato approvato e tesserato.</div>`;
-  } else if (msgParam === "err_campi") {
-    msgNotifica = `<div class="alert-box alert-error">Compila tutti i campi obbligatori della delibera (Data, N° Verbale).</div>`;
-  } else if (msgParam === "tema_salvato") {
-    msgNotifica = `<div class="alert-box alert-success">Impostazioni grafiche e identità visiva salvate con successo in Cloudflare D1! Tutti i colori e i loghi sono stati aggiornati.</div>`;
-  } else if (msgParam === "err_salvataggio") {
-    msgNotifica = `<div class="alert-box alert-error">Errore durante il salvataggio su D1: ${url.searchParams.get("err") || "Errore sconosciuto"}</div>`;
-  }
-
-  // Costruzione del Contenuto Principale (Workspace)
-  let mainContentHtml = "";
-
-  // CASO 1: DASHBOARD GENERALE
-  if (currentView === "dashboard") {
-    mainContentHtml = `
-      <div class="stats-grid">
-        <div class="stat-card">
-          <div class="stat-label">DOMANDE IN ATTESA CD</div>
-          <div class="stat-value" style="color: #F59E0B;">${inAttesa}</div>
-          <div class="stat-sub">Richieste di ammissione da deliberare</div>
-        </div>
-        <div class="stat-card">
-          <div class="stat-label">SOCI ATTIVI &amp; TESSERATI</div>
-          <div class="stat-value" style="color: #10B981;">${approvate}</div>
-          <div class="stat-sub">Soci con tessera APS attiva</div>
-        </div>
-        <div class="stat-card">
-          <div class="stat-label">ATTIVITÀ &amp; LABORATORI</div>
-          <div class="stat-value" style="color: #06B6D4;">1</div>
-          <div class="stat-sub">Corsi di teatro attivi</div>
-        </div>
-        <div class="stat-card">
-          <div class="stat-label">SPETTACOLI &amp; CASSA</div>
-          <div class="stat-value" style="color: var(--brand-coral);">0 €</div>
-          <div class="stat-sub">Incassi del mese corrente</div>
-        </div>
+      <div>
+        <div class="brand-title">${theme.nome_associazione}</div>
+        <div class="brand-badge">${user.ruolo === 'super_admin' ? 'SUPER ADMIN' : user.ruolo.toUpperCase()}</div>
       </div>
+    </div>
 
-      <div class="dashboard-hub-section">
-        <div class="section-header-clean">
-          <h2>Centro di Controllo • Tutte le Macro-Aree</h2>
-          <p>Naviga rapidamente tra i settori del gestionale approvati nella Bibbia</p>
-        </div>
+    <div class="sidebar-menu">
+      <div class="menu-section-title">AREA GESTIONALE</div>
+      <a href="/admin?view=dashboard" class="menu-item-root ${currentView === 'dashboard' ? 'active' : ''}">
+        <span class="icon">${getIconSvg("dashboard", 18)}</span>
+        <span class="text">Dashboard Generale</span>
+      </a>
 
-        <div class="hub-cards-grid">
-          ${MENU_SECTIONS.map((sec) => `
-            <a href="/admin?view=${sec.id}" class="hub-card" style="--card-accent: ${sec.colore};">
-              <div class="hub-card-top">
-                <div class="hub-card-icon" style="background: ${sec.colore}18; color: ${sec.colore};">
-                  ${sec.icona}
-                </div>
-                <span class="hub-card-badge" style="border-color: ${sec.colore}40; color: ${sec.colore};">
-                  ${sec.voci.length} sezioni
-                </span>
-              </div>
-              <h3 class="hub-card-title">${sec.titolo}</h3>
-              <p class="hub-card-desc">${sec.descrizione}</p>
-              <div class="hub-card-footer" style="color: ${sec.colore};">
-                <span>Apri panoramica</span>
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>
-              </div>
+      <div class="menu-section-title" style="margin-top: 18px;">MACRO-AREE BIBBIA</div>
+  `;
+
+  for (const macro of MACRO_AREE) {
+    const isMacroActive = currentView.startsWith(macro.id) || macro.sezioni.some(s => s.id === currentView);
+    sidebarHtml += `
+      <div class="macro-group ${isMacroActive ? 'open' : ''}">
+        <a href="/admin?view=${macro.id}-hub" class="macro-header ${isMacroActive ? 'active' : ''}">
+          <span class="icon" style="color: ${macro.colore};">${getIconSvg(macro.icona, 18)}</span>
+          <span class="text">${macro.titolo}</span>
+          <span class="arrow">${isMacroActive ? '▾' : '▸'}</span>
+        </a>
+        <div class="macro-subitems">
+          ${macro.sezioni.map(sez => `
+            <a href="/admin?view=${sez.id}" class="subitem ${currentView === sez.id ? 'active' : ''}">
+              <span class="subitem-dot"></span>
+              <span class="text">${sez.etichetta}</span>
             </a>
           `).join("")}
         </div>
       </div>
     `;
   }
-  // CASO 2: HUB DI UNA MACRO-AREA (Tessere quadrate con descrizione e link diretti)
-  else if (currentView.startsWith("macro-")) {
-    const sec = MENU_SECTIONS.find((s) => s.id === currentView);
-    if (sec) {
-      mainContentHtml = `
-        <div class="macro-hub-intro">
-          <p class="macro-hub-desc">${sec.descrizione}</p>
-        </div>
 
-        <div class="hub-cards-grid">
-          ${sec.voci.map((v) => {
-            const badgeLive = v.badge ? `<span class="badge-pill bg-amber" style="margin-left: auto;">${v.badge} in attesa</span>` : "";
-            return `
-              <a href="/admin?view=${v.id}" class="hub-card" style="--card-accent: ${sec.colore};">
-                <div class="hub-card-top">
-                  <div class="hub-card-icon" style="background: ${sec.colore}18; color: ${sec.colore};">
-                    ${sec.icona}
-                  </div>
-                  ${badgeLive}
-                </div>
-                <h3 class="hub-card-title">${v.etichetta}</h3>
-                <p class="hub-card-desc">${v.desc}</p>
-                <div class="hub-card-footer" style="color: ${sec.colore};">
-                  <span>Accedi alla sezione</span>
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>
-                </div>
-              </a>
-            `;
-          }).join("")}
-        </div>
-      `;
-    }
-  }
-  // CASO 3: SEZIONE 1.1 DOMANDE DI AMMISSIONE (TABELLA OPERATIVA & DELIBERE)
-  else if (currentView === "domande") {
-    const righeDomande = domande.length === 0
-      ? `<tr><td colspan="7" style="text-align: center; padding: 36px; color: #71717A;">Nessuna domanda ricevuta al momento.</td></tr>`
-      : domande.map((d) => {
-          const dList = delegheMap[d.socio_id] || [];
-          const delegheText = dList.length > 0
-            ? dList.map((x) => `<span class="tag-delegato">${x}</span>`).join("<br>")
-            : `<span style="color: #9CA3AF; font-size: 11px;">Nessuna delega</span>`;
+  sidebarHtml += `</div>`;
 
-          const cons = consensiMap[d.socio_id];
-          const fotoVideoTag = cons && cons.consenso_foto_video === 1
-            ? `<span class="badge-pill bg-green">Foto/Video: SI</span>`
-            : `<span class="badge-pill bg-gray">Foto/Video: NO</span>`;
+  // Costruzione del corpo centrale in base alla vista selezionata
+  let mainContentHtml = "";
 
-          const isApprovata = d.stato_richiesta === "approvato";
-          const badgeStato = isApprovata
-            ? `<span class="badge-pill bg-green">Socio Approvato</span>`
-            : `<span class="badge-pill bg-amber">In Attesa Delibera</span>`;
-
-          const moduloAzione = isApprovata
-            ? `<div class="delibera-info">
-                 <div>Data: <strong>${d.data_delibera || "N.D."}</strong></div>
-                 <div>Verbale: <strong>${d.numero_verbale || "N.D."}</strong></div>
-                 <div>Tessera APS: <strong class="tessera-highlight">#${d.numero_tessera_aps || "N.D."}</strong></div>
-               </div>`
-            : `<form method="POST" action="/admin/delibera" class="form-delibera">
-                 <input type="hidden" name="socio_id" value="${d.socio_id}">
-                 <div class="form-row">
-                   <label>Data Delibera:
-                     <input type="date" name="data_delibera" value="${new Date().toISOString().slice(0, 10)}" required>
-                   </label>
-                   <label>Verbale N°:
-                     <input type="text" name="numero_verbale" placeholder="Es. 04/2026" required>
-                   </label>
-                 </div>
-                 <div class="form-row" style="margin-top: 6px;">
-                   <label>N° Tessera APS:
-                     <input type="text" name="numero_tessera" placeholder="Es. 2026-001 (vuoto = auto)">
-                   </label>
-                   <button type="submit" class="btn-delibera">Approva &amp; Tessera</button>
-                 </div>
-               </form>`;
-
-          return `
-            <tr>
-              <td>
-                <strong>${d.minore_nome} ${d.minore_cognome}</strong><br>
-                <span class="text-sub">CF: ${d.minore_cf}</span><br>
-                <span class="text-sub">Nascita: ${d.minore_nascita || "N.D."} (${d.minore_luogo || "N.D."})</span>
-              </td>
-              <td>
-                <strong>${d.tutore_nome || "N.D."} ${d.tutore_cognome || ""}</strong> (${d.grado_parentela || "Genitore"})<br>
-                <span class="text-sub">CF: ${d.tutore_cf || "N.D."}</span><br>
-                <span class="text-sub">Tel: ${d.tutore_telefono || "N.D."}</span><br>
-                <span class="text-sub">Email: ${d.tutore_email || "N.D."}</span>
-              </td>
-              <td>
-                <strong>${d.corso_titolo || "Laboratorio Teatrale"}</strong><br>
-                <span class="text-sub">Data domanda: ${d.data_domanda ? d.data_domanda.slice(0, 10) : "Oggi"}</span>
-              </td>
-              <td>${delegheText}</td>
-              <td>
-                <span class="badge-pill bg-green">Statuto: SI</span>
-                <span class="badge-pill bg-green">Privacy: SI</span><br>
-                ${fotoVideoTag}
-              </td>
-              <td>${badgeStato}</td>
-              <td>${moduloAzione}</td>
-            </tr>
-          `;
-        }).join("");
-
+  if (currentView === "dashboard") {
     mainContentHtml = `
+      <div class="page-header">
+        <div class="page-title-box">
+          <span class="page-icon">${getIconSvg("dashboard", 24)}</span>
+          <div>
+            <h1>Dashboard Generale</h1>
+            <p class="breadcrumbs">Pannello Gestionale &gt; Panoramica Associazione &gt; Dashboard Generale</p>
+          </div>
+        </div>
+      </div>
+
       <div class="stats-grid">
         <div class="stat-card">
-          <div class="stat-label">DOMANDE RICEVUTE</div>
-          <div class="stat-value">${totDomande}</div>
+          <div class="stat-label">DOMANDE IN ATTESA CD</div>
+          <div class="stat-value" style="color: #F59E0B;">${stats.domandeAttesa}</div>
+          <div class="stat-desc">Richieste di ammissione da deliberare</div>
         </div>
         <div class="stat-card">
-          <div class="stat-label">IN ATTESA DI DELIBERA CD</div>
-          <div class="stat-value" style="color: #F59E0B;">${inAttesa}</div>
+          <div class="stat-label">SOCI ATTIVI & TESSERATI</div>
+          <div class="stat-value" style="color: #10B981;">${stats.sociAttivi}</div>
+          <div class="stat-desc">Soci con tessera APS attiva</div>
         </div>
         <div class="stat-card">
-          <div class="stat-label">SOCI APPROVATI &amp; TESSERATI</div>
-          <div class="stat-value" style="color: #10B981;">${approvate}</div>
+          <div class="stat-label">ATTIVITÀ & LABORATORI</div>
+          <div class="stat-value" style="color: #38BDF8;">${stats.corsiAttivi}</div>
+          <div class="stat-desc">Corsi di teatro attivi</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">SPETTACOLI & CASSA</div>
+          <div class="stat-value" style="color: #D98295;">${stats.incassiTotali} €</div>
+          <div class="stat-desc">Incassi del mese corrente</div>
         </div>
       </div>
 
-      <div class="card-table">
-        <div class="card-header-table">
-          <div>
-            <h3>Libro Soci • Domande di Ammissione e Iscrizioni Minori</h3>
-            <p>Affiliazione UILT • Flusso Ufficiale Delibere Consiglio Direttivo APS</p>
-          </div>
-        </div>
+      <div class="hub-header" style="margin-top: 36px; margin-bottom: 16px;">
+        <h2>Centro di Controllo • Tutte le Macro-Aree</h2>
+        <p style="color: #A1A1AA; font-size: 13px;">Naviga rapidamente tra i settori del gestionale approvati nella Bibbia</p>
+      </div>
 
-        <div class="table-responsive">
-          <table>
-            <thead>
-              <tr>
-                <th>Allievo Minore</th>
-                <th>Genitore / Tutore</th>
-                <th>Corso Selezionato</th>
-                <th>Deleghe al Ritiro</th>
-                <th>Consensi Privacy</th>
-                <th>Stato Domanda</th>
-                <th style="min-width: 250px;">Azione Delibera Consiglio Direttivo</th>
-              </tr>
-            </thead>
-            <tbody>
-              ${righeDomande}
-            </tbody>
-          </table>
-        </div>
+      <div class="hub-cards-grid">
+        ${MACRO_AREE.map(macro => `
+          <div class="hub-card" style="border-top: 3px solid ${macro.colore};">
+            <div class="hub-card-header">
+              <span class="hub-icon" style="color: ${macro.colore};">${getIconSvg(macro.icona, 24)}</span>
+              <span class="hub-count">${macro.sezioni.length} sezioni</span>
+            </div>
+            <h3 class="hub-title">${macro.titolo}</h3>
+            <p class="hub-desc">${macro.descrizione}</p>
+            <div class="hub-action">
+              <a href="/admin?view=${macro.id}-hub" style="color: ${macro.colore};">Apri panoramica <span>&rsaquo;</span></a>
+            </div>
+          </div>
+        `).join("")}
       </div>
     `;
   }
-  // CASO: BUILDER TEMA & IDENTITÀ VISIVA (SEZIONE 4.2)
-  else if (currentView === "theme-builder") {
+  else if (currentView.endsWith("-hub")) {
+    const macroId = currentView.replace("-hub", "");
+    const macro = MACRO_AREE.find(m => m.id === macroId) || MACRO_AREE[0];
+
     mainContentHtml = `
+      <div class="page-header">
+        <div class="page-title-box">
+          <span class="page-icon" style="color: ${macro.colore};">${getIconSvg(macro.icona, 24)}</span>
+          <div>
+            <h1>Macro-Area ${macro.numero}: ${macro.titolo}</h1>
+            <p class="breadcrumbs">Pannello Gestionale &gt; ${macro.titolo} &gt; Panoramica Sotto-Sezioni</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="hub-intro-card">
+        <div class="intro-icon" style="background: ${macro.colore}22; color: ${macro.colore};">
+          ${getIconSvg(macro.icona, 32)}
+        </div>
+        <div>
+          <h2>${macro.titolo}</h2>
+          <p style="color: #D4D4D8; font-size: 14px; margin-top: 4px;">${macro.descrizione}</p>
+        </div>
+      </div>
+
+      <h3 style="font-size: 16px; margin: 28px 0 16px; color: #FFF;">Sotto-Sezioni Operative</h3>
+      <div class="sections-list-grid">
+        ${macro.sezioni.map(sez => `
+          <div class="section-card">
+            <div class="section-header">
+              <span class="section-dot" style="background: ${macro.colore};"></span>
+              <h4>${sez.etichetta}</h4>
+            </div>
+            <p class="section-desc">${sez.desc}</p>
+            <a href="/admin?view=${sez.id}" class="btn-open-section">Accedi alla sezione &rsaquo;</a>
+          </div>
+        `).join("")}
+      </div>
+    `;
+  }
+  else if (currentView === "theme-builder") {
+    // 4.2 BUILDER TEMA & IDENTITÀ VISIVA (OPERATIVO)
+    mainContentHtml = `
+      <div class="page-header">
+        <div class="page-title-box">
+          <span class="page-icon" style="color: #10B981;">${getIconSvg("palette", 24)}</span>
+          <div>
+            <h1>4.2 Builder Tema & Identità Visiva</h1>
+            <p class="breadcrumbs">Pannello Gestionale &gt; Builder & Contenuti &gt; 4.2 Builder Tema</p>
+          </div>
+        </div>
+      </div>
+
+      ${msg === 'tema_salvato' ? `
+        <div class="alert-success">
+          <strong>Configurazione salvata con successo!</strong> Le impostazioni visive e il logo sono state aggiornate sia per il gestionale sia per il modulo pubblico.
+        </div>
+      ` : ''}
+
+      ${msg === 'err_salvataggio' ? `
+        <div class="alert-error">
+          <strong>Errore durante il salvataggio:</strong> ${url.searchParams.get("err") || "Verificare i dati e riprovare."}
+        </div>
+      ` : ''}
+
       <form method="POST" action="/admin/salva-tema" class="theme-builder-form">
-        <div class="theme-grid">
-          <!-- SEZIONE A: IDENTITÀ APS & LOGO -->
-          <div class="card-table" style="margin-bottom: 24px;">
-            <div class="card-header-table">
-              <div>
-                <h3>Identità Ufficiale dell'Associazione</h3>
-                <p>Nome, dominio e collegamenti ufficiali visibili in intestazioni e comunicazioni</p>
-              </div>
+        <div class="form-grid-2">
+          
+          <!-- Sezione Brand & Logo -->
+          <div class="builder-card">
+            <h3 class="card-heading">Dati Istituzionali & Logo Ufficiale</h3>
+            <p class="card-hint">I dati dell'associazione e l'immagine del logo che compaiono nell'header, nei moduli e nel footer.</p>
+
+            <div class="form-group" style="margin-top: 16px;">
+              <label>Nome Ufficiale Associazione</label>
+              <input type="text" name="nome_associazione" value="${theme.nome_associazione}" required>
             </div>
-            <div style="padding: 24px; display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 20px;">
-              <div class="form-group-clean">
-                <label style="display: block; font-size: 13px; font-weight: 600; margin-bottom: 6px; color: #E4E4E7;">Denominazione APS</label>
-                <input type="text" name="nome_aps" value="${settings.nome_aps || ''}" required class="input-clean">
-              </div>
-              <div class="form-group-clean">
-                <label style="display: block; font-size: 13px; font-weight: 600; margin-bottom: 6px; color: #E4E4E7;">Dominio Web Ufficiale</label>
-                <input type="text" name="dominio_ufficiale" value="${settings.dominio_ufficiale || ''}" required class="input-clean">
-              </div>
-              <div class="form-group-clean">
-                <label style="display: block; font-size: 13px; font-weight: 600; margin-bottom: 6px; color: #E4E4E7;">Email Ufficiale di Contatto</label>
-                <input type="email" name="email_contatto" value="${settings.email_contatto || ''}" required class="input-clean">
-              </div>
-              <div class="form-group-clean">
-                <label style="display: block; font-size: 13px; font-weight: 600; margin-bottom: 6px; color: #E4E4E7;">URL Immagine Logo Ufficiale (PNG trasparente)</label>
-                <input type="url" name="logo_url" id="input_logo_url" value="${settings.logo_url || ''}" placeholder="https://..." class="input-clean" oninput="aggiornaAnteprimaLogo(this.value)">
-                <span style="font-size: 11px; color: #A1A1AA; margin-top: 4px; display: block;">Inserisci il link diretto al file immagine PNG trasparente del logo</span>
-              </div>
+
+            <div class="form-group">
+              <label>Dominio Web Ufficiale</label>
+              <input type="text" name="dominio_ufficiale" value="${theme.dominio_ufficiale}" required>
             </div>
-            <div style="padding: 0 24px 24px 24px;">
-              <div style="display: flex; align-items: center; gap: 16px; background: #09090B; padding: 16px; border-radius: 8px; border: 1px dashed #3F3F46;">
-                <div id="preview_logo_box" style="width: 64px; height: 64px; display: flex; align-items: center; justify-content: center; background: #18181B; border-radius: 8px; border: 1px solid #27272A; overflow: hidden;">
-                  ${settings.logo_url ? `<img src="${settings.logo_url}" alt="Anteprima Logo" style="max-width: 100%; max-height: 100%; object-fit: contain;">` : `<span style="font-size: 10px; color: #71717A; text-align: center;">Nessun logo</span>`}
-                </div>
-                <div>
-                  <div style="font-weight: 600; font-size: 14px; color: #FAFAFA;">Anteprima Logo Ufficiale</div>
-                  <div style="font-size: 12px; color: #A1A1AA;">Il logo comparirà nella barra di navigazione e nell'intestazione dei moduli pubblici.</div>
-                </div>
+
+            <div class="form-group">
+              <label>Email Ufficiale di Contatto</label>
+              <input type="email" name="email_contatto" value="${theme.email_contatto}" required>
+            </div>
+
+            <div class="form-group">
+              <label>URL Immagine Logo (PNG Trasparente)</label>
+              <input type="url" name="url_logo" id="inputUrlLogo" value="${theme.url_logo}" required oninput="document.getElementById('previewLogoImg').src = this.value">
+            </div>
+
+            <div class="logo-preview-box">
+              <div class="preview-title">Anteprima Logo su Sfondo Scuro:</div>
+              <div class="preview-canvas">
+                <img id="previewLogoImg" src="${theme.url_logo}" alt="Logo Preview" style="max-height: 80px; max-width: 100%;">
               </div>
             </div>
           </div>
 
-          <!-- SEZIONE B: PALETTE GENERALE -->
-          <div class="card-table" style="margin-bottom: 24px;">
-            <div class="card-header-table">
-              <div>
-                <h3>Palette Colori Principale &amp; Sfondi</h3>
-                <p>Colori base del tema teatrale usati per sfondi, card e pulsanti primari</p>
+          <!-- Sezione Palette Colori -->
+          <div class="builder-card">
+            <h3 class="card-heading">Palette Colori Teatrale (HEX)</h3>
+            <p class="card-hint">Tutti i componenti del portale pubblico e del gestionale attingono a questi colori.</p>
+
+            <div class="color-picker-row">
+              <div class="color-preview" style="background: ${theme.colore_primario};"></div>
+              <div class="color-info">
+                <label>Colore Primario (Rosa Cervello)</label>
+                <input type="text" name="colore_primario" value="${theme.colore_primario}" class="color-hex-input" required>
               </div>
+              <input type="color" value="${theme.colore_primario}" class="native-picker" onchange="this.previousElementSibling.querySelector('input').value = this.value; this.parentElement.querySelector('.color-preview').style.background = this.value;">
             </div>
-            <div style="padding: 24px; display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 20px;">
-              <div class="color-picker-box">
-                <label>Colore Primario Accenti (Rosa Corallo)</label>
-                <div class="color-input-wrapper">
-                  <input type="color" name="colore_primario" id="cp_primario" value="${settings.colore_primario || '#D98295'}" class="picker-native" onchange="document.getElementById('txt_primario').value = this.value; aggiornaLiveTheme();">
-                  <input type="text" id="txt_primario" value="${settings.colore_primario || '#D98295'}" class="input-hex" oninput="document.getElementById('cp_primario').value = this.value; aggiornaLiveTheme();">
-                </div>
+
+            <div class="color-picker-row">
+              <div class="color-preview" style="background: ${theme.colore_secondario};"></div>
+              <div class="color-info">
+                <label>Colore Secondario (Argento Maschere)</label>
+                <input type="text" name="colore_secondario" value="${theme.colore_secondario}" class="color-hex-input" required>
               </div>
-              <div class="color-picker-box">
-                <label>Colore Sfondo Generale</label>
-                <div class="color-input-wrapper">
-                  <input type="color" name="colore_sfondo" id="cp_sfondo" value="${settings.colore_sfondo || '#121214'}" class="picker-native" onchange="document.getElementById('txt_sfondo').value = this.value; aggiornaLiveTheme();">
-                  <input type="text" id="txt_sfondo" value="${settings.colore_sfondo || '#121214'}" class="input-hex" oninput="document.getElementById('cp_sfondo').value = this.value; aggiornaLiveTheme();">
-                </div>
+              <input type="color" value="${theme.colore_secondario}" class="native-picker" onchange="this.previousElementSibling.querySelector('input').value = this.value; this.parentElement.querySelector('.color-preview').style.background = this.value;">
+            </div>
+
+            <div class="color-picker-row">
+              <div class="color-preview" style="background: ${theme.colore_scuro};"></div>
+              <div class="color-info">
+                <label>Colore Scuro Header & Footer (Nero Ribalta)</label>
+                <input type="text" name="colore_scuro" value="${theme.colore_scuro}" class="color-hex-input" required>
               </div>
-              <div class="color-picker-box">
-                <label>Colore Sfondo Card &amp; Riquadri</label>
-                <div class="color-input-wrapper">
-                  <input type="color" name="colore_card" id="cp_card" value="${settings.colore_card || '#18181B'}" class="picker-native" onchange="document.getElementById('txt_card').value = this.value; aggiornaLiveTheme();">
-                  <input type="text" id="txt_card" value="${settings.colore_card || '#18181B'}" class="input-hex" oninput="document.getElementById('cp_card').value = this.value; aggiornaLiveTheme();">
-                </div>
+              <input type="color" value="${theme.colore_scuro}" class="native-picker" onchange="this.previousElementSibling.querySelector('input').value = this.value; this.parentElement.querySelector('.color-preview').style.background = this.value;">
+            </div>
+
+            <div class="color-picker-row">
+              <div class="color-preview" style="background: ${theme.colore_accento};"></div>
+              <div class="color-info">
+                <label>Colore Accento & Notifiche (Verde Attivo)</label>
+                <input type="text" name="colore_accento" value="${theme.colore_accento}" class="color-hex-input" required>
               </div>
+              <input type="color" value="${theme.colore_accento}" class="native-picker" onchange="this.previousElementSibling.querySelector('input').value = this.value; this.parentElement.querySelector('.color-preview').style.background = this.value;">
+            </div>
+
+            <div class="form-group" style="margin-top: 20px;">
+              <label>Scala Dimensione Caratteri (Leggibilità)</label>
+              <select name="scala_font" style="width: 100%; background: #09090B; border: 1px solid #3F3F46; color: #FFF; padding: 10px; border-radius: 8px;">
+                <option value="compatta" ${theme.scala_font === 'compatta' ? 'selected' : ''}>Compatta (Ideale per tabelle dense)</option>
+                <option value="normale" ${theme.scala_font === 'normale' ? 'selected' : ''}>Normale (Bilanciata standard UX)</option>
+                <option value="grande" ${theme.scala_font === 'grande' ? 'selected' : ''}>Grande (Caratteri maggiorati per massima leggibilità)</option>
+              </select>
             </div>
           </div>
 
-          <!-- SEZIONE C: COLORI DISTINTIVI DELLE 5 MACRO-AREE -->
-          <div class="card-table" style="margin-bottom: 24px;">
-            <div class="card-header-table">
-              <div>
-                <h3>Colori Distintivi delle 5 Macro-Aree</h3>
-                <p>Ogni settore del gestionale ha il proprio accento cromatico visibile nella sidebar e nelle schede HUB</p>
-              </div>
-            </div>
-            <div style="padding: 24px; display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 18px;">
-              <div class="color-picker-box">
-                <label>1. Soci &amp; Libro Soci</label>
-                <div class="color-input-wrapper">
-                  <input type="color" name="colore_macro_1" id="cp_m1" value="${settings.colore_macro_1 || '#D98295'}" class="picker-native" onchange="document.getElementById('txt_m1').value = this.value; aggiornaLiveTheme();">
-                  <input type="text" id="txt_m1" value="${settings.colore_macro_1 || '#D98295'}" class="input-hex" oninput="document.getElementById('cp_m1').value = this.value; aggiornaLiveTheme();">
-                </div>
-              </div>
-              <div class="color-picker-box">
-                <label>2. Attività &amp; Corsi</label>
-                <div class="color-input-wrapper">
-                  <input type="color" name="colore_macro_2" id="cp_m2" value="${settings.colore_macro_2 || '#60A5FA'}" class="picker-native" onchange="document.getElementById('txt_m2').value = this.value; aggiornaLiveTheme();">
-                  <input type="text" id="txt_m2" value="${settings.colore_macro_2 || '#60A5FA'}" class="input-hex" oninput="document.getElementById('cp_m2').value = this.value; aggiornaLiveTheme();">
-                </div>
-              </div>
-              <div class="color-picker-box">
-                <label>3. Eventi, Teatro &amp; Casse</label>
-                <div class="color-input-wrapper">
-                  <input type="color" name="colore_macro_3" id="cp_m3" value="${settings.colore_macro_3 || '#F59E0B'}" class="picker-native" onchange="document.getElementById('txt_m3').value = this.value; aggiornaLiveTheme();">
-                  <input type="text" id="txt_m3" value="${settings.colore_macro_3 || '#F59E0B'}" class="input-hex" oninput="document.getElementById('cp_m3').value = this.value; aggiornaLiveTheme();">
-                </div>
-              </div>
-              <div class="color-picker-box">
-                <label>4. Builder &amp; Contenuti</label>
-                <div class="color-input-wrapper">
-                  <input type="color" name="colore_macro_4" id="cp_m4" value="${settings.colore_macro_4 || '#A78BFA'}" class="picker-native" onchange="document.getElementById('txt_m4').value = this.value; aggiornaLiveTheme();">
-                  <input type="text" id="txt_m4" value="${settings.colore_macro_4 || '#A78BFA'}" class="input-hex" oninput="document.getElementById('cp_m4').value = this.value; aggiornaLiveTheme();">
-                </div>
-              </div>
-              <div class="color-picker-box">
-                <label>5. Sistema &amp; Utenti</label>
-                <div class="color-input-wrapper">
-                  <input type="color" name="colore_macro_5" id="cp_m5" value="${settings.colore_macro_5 || '#34D399'}" class="picker-native" onchange="document.getElementById('txt_m5').value = this.value; aggiornaLiveTheme();">
-                  <input type="text" id="txt_m5" value="${settings.colore_macro_5 || '#34D399'}" class="input-hex" oninput="document.getElementById('cp_m5').value = this.value; aggiornaLiveTheme();">
-                </div>
-              </div>
-            </div>
-          </div>
+        </div>
 
-          <!-- SEZIONE D: TIPOGRAFIA E SCALA CARATTERI -->
-          <div class="card-table" style="margin-bottom: 24px;">
-            <div class="card-header-table">
-              <div>
-                <h3>Dimensione Caratteri &amp; Densità Visiva</h3>
-                <p>Regola la grandezza dei testi dell'intera interfaccia gestionale per il massimo comfort</p>
-              </div>
-            </div>
-            <div style="padding: 24px; display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px;">
-              <label class="radio-card ${settings.scala_caratteri === 'compatta' ? 'selected' : ''}">
-                <input type="radio" name="scala_caratteri" value="compatta" ${settings.scala_caratteri === 'compatta' ? 'checked' : ''} onchange="aggiornaRadioCards(this)">
-                <div class="radio-card-body">
-                  <div class="radio-card-title">Compatta (13px)</div>
-                  <div class="radio-card-desc">Massima quantità di dati a schermo su monitor e desktop.</div>
-                </div>
-              </label>
-              <label class="radio-card ${(!settings.scala_caratteri || settings.scala_caratteri === 'normale') ? 'selected' : ''}">
-                <input type="radio" name="scala_caratteri" value="normale" ${(!settings.scala_caratteri || settings.scala_caratteri === 'normale') ? 'checked' : ''} onchange="aggiornaRadioCards(this)">
-                <div class="radio-card-body">
-                  <div class="radio-card-title">Normale (14.5px)</div>
-                  <div class="radio-card-desc">Standard consigliato per equilibrio e perfetta leggibilità.</div>
-                </div>
-              </label>
-              <label class="radio-card ${settings.scala_caratteri === 'grande' ? 'selected' : ''}">
-                <input type="radio" name="scala_caratteri" value="grande" ${settings.scala_caratteri === 'grande' ? 'checked' : ''} onchange="aggiornaRadioCards(this)">
-                <div class="radio-card-body">
-                  <div class="radio-card-title">Grande / Alta Leggibilità (16px)</div>
-                  <div class="radio-card-desc">Testi grandi, campi ampi e massimo contrasto visivo.</div>
-                </div>
-              </label>
-            </div>
-          </div>
-
-          <!-- SEZIONE E: ANTEPRIMA DAL VIVO (LIVE PREVIEW) -->
-          <div class="card-table" style="margin-bottom: 24px;">
-            <div class="card-header-table">
-              <div>
-                <h3>Anteprima Dal Vivo • Componenti del Gestionale</h3>
-                <p>Verifica l'armonia dei colori prima di salvare le modifiche su D1</p>
-              </div>
-            </div>
-            <div style="padding: 24px;">
-              <div id="live_preview_container" style="background: ${settings.colore_sfondo || '#121214'}; padding: 24px; border-radius: 12px; border: 1px solid #27272A; display: flex; flex-wrap: wrap; gap: 20px; align-items: center;">
-                <div id="live_preview_card" style="background: ${settings.colore_card || '#18181B'}; border: 1px solid #27272A; border-radius: 10px; padding: 18px; width: 280px;">
-                  <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 12px;">
-                    <div id="live_preview_icon_box" style="width: 36px; height: 36px; border-radius: 8px; background: ${(settings.colore_macro_1 || '#D98295')}22; color: ${settings.colore_macro_1 || '#D98295'}; display: flex; align-items: center; justify-content: center; font-weight: 700;">★</div>
-                    <div style="font-weight: 700; font-size: 14px; color: #FAFAFA;">Esempio Scheda Hub</div>
-                  </div>
-                  <div style="font-size: 12px; color: #A1A1AA; line-height: 1.4; margin-bottom: 14px;">Così appariranno le card e i testi nelle pagine del tuo gestionale.</div>
-                  <div id="live_preview_badge" style="display: inline-block; font-size: 11px; font-weight: 700; padding: 3px 10px; border-radius: 9999px; background: ${(settings.colore_primario || '#D98295')}22; color: ${settings.colore_primario || '#D98295'}; border: 1px solid ${(settings.colore_primario || '#D98295')}44;">Notifica Live</div>
-                </div>
-
-                <div style="display: flex; flex-direction: column; gap: 12px;">
-                  <button type="button" id="live_preview_btn" style="background: ${settings.colore_primario || '#D98295'}; color: #121214; font-weight: 700; padding: 10px 20px; border-radius: 8px; border: none; cursor: pointer;">
-                    Pulsante Primario
-                  </button>
-                  <div style="font-size: 13px; color: #A1A1AA;">
-                    Testo secondario con <strong style="color: #FAFAFA;">grassetto evidenziato</strong>.
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <!-- BARRA AZIONI SALVATAGGIO IN FONDO -->
-          <div style="display: flex; align-items: center; justify-content: flex-end; gap: 16px; padding: 20px; background: #18181B; border: 1px solid #27272A; border-radius: 12px;">
-            <a href="/admin?view=macro-builder" class="btn-secondary" style="text-decoration: none;">Annulla modifiche</a>
-            <button type="submit" class="btn-primary" style="padding: 12px 28px; font-size: 15px; font-weight: 700; cursor: pointer;">
-              Salva Configurazione Tema su Database D1
-            </button>
-          </div>
+        <div class="builder-actions-bar">
+          <a href="/admin?view=builder-hub" class="btn-secondary">Annulla</a>
+          <button type="submit" class="btn-primary">Salva Configurazione Tema su Database D1</button>
         </div>
       </form>
-
-      <script>
-        function aggiornaAnteprimaLogo(url) {
-          const box = document.getElementById('preview_logo_box');
-          if (url && url.startsWith('http')) {
-            box.innerHTML = '<img src="' + url + '" alt="Logo" style="max-width: 100%; max-height: 100%; object-fit: contain;" onerror="this.outerHTML=\\'<span style=\\\\'font-size:10px;color:#EF4444;\\\\'>Errore link</span>\\'">';
-          } else {
-            box.innerHTML = '<span style="font-size: 10px; color: #71717A; text-align: center;">Nessun logo</span>';
-          }
-        }
-
-        function aggiornaRadioCards(radio) {
-          document.querySelectorAll('.radio-card').forEach(function(el) { el.classList.remove('selected'); });
-          if (radio.checked) {
-            radio.closest('.radio-card').classList.add('selected');
-          }
-        }
-
-        function aggiornaLiveTheme() {
-          const primario = document.getElementById('txt_primario').value;
-          const sfondo = document.getElementById('txt_sfondo').value;
-          const card = document.getElementById('txt_card').value;
-          const m1 = document.getElementById('txt_m1').value;
-
-          const container = document.getElementById('live_preview_container');
-          const pCard = document.getElementById('live_preview_card');
-          const pBtn = document.getElementById('live_preview_btn');
-          const pBadge = document.getElementById('live_preview_badge');
-          const pIcon = document.getElementById('live_preview_icon_box');
-
-          if (container) container.style.background = sfondo;
-          if (pCard) pCard.style.background = card;
-          if (pBtn) pBtn.style.background = primario;
-          if (pBadge) {
-            pBadge.style.color = primario;
-            pBadge.style.borderColor = primario + '44';
-            pBadge.style.background = primario + '22';
-          }
-          if (pIcon) {
-            pIcon.style.color = m1;
-            pIcon.style.background = m1 + '22';
-          }
-        }
-      </script>
     `;
   }
-  // CASO 4: ALTRE VOCI SOTTOMENU NON ANCORA COLLEGATE A D1
-  else {
+  else if (currentView === "domande") {
+    // 1.1 DOMANDE DI AMMISSIONE (OPERATIVO)
     mainContentHtml = `
-      <div class="placeholder-card">
-        <div class="placeholder-icon" style="background: ${currentMacroColor}20; color: ${currentMacroColor};">
-          ${currentMacroIcon}
+      <div class="page-header">
+        <div class="page-title-box">
+          <span class="page-icon" style="color: #D98295;">${getIconSvg("users", 24)}</span>
+          <div>
+            <h1>1.1 Domande di Ammissione</h1>
+            <p class="breadcrumbs">Pannello Gestionale &gt; Soci &amp; Libro Soci &gt; Domande di Ammissione</p>
+          </div>
         </div>
-        <h2>${currentTitle}</h2>
-        <div class="placeholder-meta">
-          <span class="tag-macro" style="background: ${currentMacroColor}15; color: ${currentMacroColor}; border: 1px solid ${currentMacroColor}40;">
-            Macro-Area: ${currentMacro}
-          </span>
-          <span class="tag-status">Struttura Sidebar Ufficiale della Bibbia</span>
+      </div>
+
+      ${msg === 'delibera_completata' ? `
+        <div class="alert-success">
+          <strong>Delibera registrata con successo!</strong> Il socio è stato ammesso, il numero di tessera APS assegnato e la quota registrata.
         </div>
-        <p class="placeholder-desc">
-          Questa sezione è già perfettamente inserita e mappata nella struttura del gestionale. 
-          Nei prossimi passaggi della roadmap collegheremo la configurazione D1 per gestire i contenuti e i dati direttamente da qui.
-        </p>
-        <div class="placeholder-roadmap">
-          <h4>Prossimi Step Immediati da Roadmap:</h4>
-          <ul>
-            <li><strong>Passo 2:</strong> Tabella D1 Configurazione &amp; Dati Fiscali dell'APS (Completato)</li>
-            <li><strong>Passo 3:</strong> Sezione 4.2 Builder Tema &amp; Identità Visiva (Attivo)</li>
-            <li><strong>Passo 4:</strong> Sezione 4.1 Form Builder Dinamico per creare e modificare i moduli soci/corsi</li>
-          </ul>
+      ` : ''}
+
+      <div class="table-card">
+        <div class="table-header">
+          <div class="table-title">Richieste in attesa di delibera del Direttivo (${domande?.results?.length || 0})</div>
+          <span class="badge-pending">Da Deliberare</span>
         </div>
-        <div style="margin-top: 24px; display: flex; gap: 12px; justify-content: center;">
-          <a href="/admin?view=${activeMacroId || 'dashboard'}" class="btn-secondary" style="text-decoration: none;">
-            Torna all'Hub ${currentMacro}
-          </a>
-          <a href="/admin?view=theme-builder" class="btn-primary" style="display: inline-block; text-decoration: none;">
-            Vai a 4.2 Builder Tema
-          </a>
+
+        ${(!domande?.results || domande.results.length === 0) ? `
+          <div class="empty-state">
+            <p>Nessuna domanda di ammissione in attesa al momento.</p>
+          </div>
+        ` : `
+          <div class="table-responsive">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>Data Richiesta</th>
+                  <th>Aspirante Socio</th>
+                  <th>Codice Fiscale</th>
+                  <th>Tipologia</th>
+                  <th>Tutore / Contatti</th>
+                  <th>Quota Sociale</th>
+                  <th style="text-align: right;">Azione Consiglio Direttivo</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${domande.results.map(d => `
+                  <tr>
+                    <td>${new Date(d.creato_il).toLocaleDateString('it-IT')}</td>
+                    <td>
+                      <strong>${d.nome} ${d.cognome}</strong>
+                      <div class="sub-cell">Nato il ${d.data_nascita || 'N/D'} a ${d.luogo_nascita || 'N/D'}</div>
+                    </td>
+                    <td><code>${d.codice_fiscale}</code></td>
+                    <td><span class="tag-tipo">${d.tipo_socio?.toUpperCase()}</span></td>
+                    <td>
+                      ${d.tutore_nome ? `
+                        <div><strong>${d.tutore_nome} ${d.tutore_cognome}</strong> (${d.grado_parentela})</div>
+                        <div class="sub-cell">${d.tutore_telefono || ''} • ${d.tutore_email || ''}</div>
+                      ` : '<span style="color: #71717A;">Maggiorenne</span>'}
+                    </td>
+                    <td>
+                      <strong>${d.quota_importo || 20} €</strong>
+                      <div class="sub-cell">${d.quota_stato === 'saldato' ? 'Saldato' : 'In attesa'}</div>
+                    </td>
+                    <td style="text-align: right;">
+                      <button class="btn-action" onclick="apriModaleDelibera('${d.id}', '${d.nome} ${d.cognome}', '${d.tipo_socio}')">
+                        Approva &amp; Tessera
+                      </button>
+                    </td>
+                  </tr>
+                `).join("")}
+              </tbody>
+            </table>
+          </div>
+        `}
+      </div>
+
+      <!-- Modale Delibera del Consiglio Direttivo -->
+      <div id="modaleDelibera" class="modal-backdrop" style="display: none;">
+        <div class="modal-card">
+          <div class="modal-header">
+            <h3>Delibera Consiglio Direttivo</h3>
+            <button class="modal-close" onclick="chiudiModaleDelibera()">&times;</button>
+          </div>
+          <p class="modal-subtitle">Ammissione a socio di: <strong id="modalNomeSocio"></strong></p>
+
+          <form method="POST" action="/admin/delibera">
+            <input type="hidden" name="socio_id" id="modalSocioId">
+            
+            <div class="form-group">
+              <label>Data Riunione Consiglio Direttivo *</label>
+              <input type="date" name="data_delibera" value="${new Date().toISOString().split('T')[0]}" required>
+            </div>
+
+            <div class="form-group">
+              <label>Numero Verbale delibera CD *</label>
+              <input type="text" name="numero_verbale" placeholder="Es. Verbale CD n. 03/2026" required>
+            </div>
+
+            <div class="form-group">
+              <label>Numero Tessera APS da Assegnare *</label>
+              <input type="text" name="numero_tessera" placeholder="Es. APS-2026-042" required>
+            </div>
+
+            <div class="form-row-2">
+              <div class="form-group">
+                <label>Data Saldo Quota Sociale</label>
+                <input type="date" name="data_saldo_quota" value="${new Date().toISOString().split('T')[0]}" required>
+              </div>
+              <div class="form-group">
+                <label>Modalità di Pagamento</label>
+                <select name="modalita_pagamento" style="width: 100%; background: #09090B; border: 1px solid #3F3F46; color: #FFF; padding: 10px; border-radius: 8px;">
+                  <option value="contanti">Contanti in Sede</option>
+                  <option value="bonifico">Bonifico Bancario</option>
+                  <option value="pos">POS / Carta</option>
+                  <option value="satispay">Satispay</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="modal-actions">
+              <button type="button" class="btn-secondary" onclick="chiudiModaleDelibera()">Annulla</button>
+              <button type="submit" class="btn-primary">Conferma Ammissione Ufficiale</button>
+            </div>
+          </form>
+        </div>
+      </div>
+    `;
+  }
+  else {
+    // Segnaposto modulare per le sezioni future
+    mainContentHtml = `
+      <div class="page-header">
+        <div class="page-title-box">
+          <span class="page-icon" style="color: #10B981;">${getIconSvg("dashboard", 24)}</span>
+          <div>
+            <h1>${currentView.toUpperCase().replace("-", " ")}</h1>
+            <p class="breadcrumbs">Pannello Gestionale &gt; Sezione Operativa</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="hub-intro-card" style="text-align: center; justify-content: center; padding: 48px 24px;">
+        <div style="max-width: 540px;">
+          <div style="font-size: 36px; margin-bottom: 12px;">⚙️</div>
+          <h2 style="margin-bottom: 10px;">${currentView.toUpperCase().replace("-", " ")}</h2>
+          <p style="color: #A1A1AA; font-size: 14px; line-height: 1.6;">
+            Questa sezione è già perfettamente inserita e mappata nella struttura del gestionale. 
+            Nel prossimo passaggio collegheremo i dati specifici di questa schermata.
+          </p>
+          <div style="margin-top: 24px;">
+            <a href="/admin?view=theme-builder" class="btn-primary" style="display: inline-block; text-decoration: none;">
+              Vai al Builder Tema & Identità Visiva
+            </a>
+          </div>
         </div>
       </div>
     `;
   }
 
+  // Costruzione della pagina completa con stili CSS dinamici
   const html = `<!DOCTYPE html>
 <html lang="it">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Gestionale Admin • Cervelli in Affitto APS</title>
+  <title>Gestionale Admin • ${theme.nome_associazione}</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
   <style>
     :root {
-      --brand-coral: ${settings.colore_primario || '#D98295'};
-      --brand-silver: #E8E7E9;
-      --brand-black: ${settings.colore_sfondo || '#121214'};
-      --card-bg: ${settings.colore_card || '#18181B'};
-      --card-border: #27272A;
-      --text-muted: #A1A1AA;
-      --base-font-size: ${settings.scala_caratteri === 'grande' ? '16px' : settings.scala_caratteri === 'compatta' ? '13px' : '14.5px'};
+      --coral: ${theme.colore_primario};
+      --silver: ${theme.colore_secondario};
+      --dark: ${theme.colore_scuro};
+      --card-bg: ${theme.colore_sfondo};
+      --accent: ${theme.colore_accento};
+      --text: ${theme.colore_testo};
+      --sidebar-w: 270px;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
       font-family: 'Plus Jakarta Sans', sans-serif;
-      background: #09090B;
-      color: #FAFAFA;
-      font-size: var(--base-font-size);
+      background: var(--dark);
+      color: var(--text);
       min-height: 100vh;
       display: flex;
-      flex-direction: column;
     }
 
-    /* THEME BUILDER STYLES */
-    .input-clean {
-      width: 100%;
+    /* Sidebar Layout */
+    .admin-sidebar {
+      width: var(--sidebar-w);
       background: #09090B;
-      border: 1px solid #27272A;
-      color: #FAFAFA;
-      padding: 10px 14px;
-      border-radius: 8px;
-      font-size: 14px;
-      font-family: inherit;
-      outline: none;
-      transition: border-color 0.2s;
-    }
-    .input-clean:focus {
-      border-color: var(--brand-coral);
-    }
-    .color-picker-box {
-      background: #09090B;
-      border: 1px solid #27272A;
-      border-radius: 8px;
-      padding: 14px;
-    }
-    .color-picker-box label {
-      display: block;
-      font-size: 12px;
-      font-weight: 600;
-      color: #E4E4E7;
-      margin-bottom: 8px;
-    }
-    .color-input-wrapper {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-    }
-    .picker-native {
-      -webkit-appearance: none;
-      border: none;
-      width: 40px;
-      height: 38px;
-      border-radius: 6px;
-      cursor: pointer;
-      background: transparent;
-    }
-    .picker-native::-webkit-color-swatch-wrapper { padding: 0; }
-    .picker-native::-webkit-color-swatch { border: 1px solid #3F3F46; border-radius: 6px; }
-    .input-hex {
-      flex: 1;
-      background: #18181B;
-      border: 1px solid #27272A;
-      color: #FAFAFA;
-      padding: 8px 12px;
-      border-radius: 6px;
-      font-family: monospace;
-      font-size: 13px;
-      text-transform: uppercase;
-    }
-    .radio-card {
-      display: block;
-      background: #09090B;
-      border: 1px solid #27272A;
-      border-radius: 8px;
-      padding: 16px;
-      cursor: pointer;
-      position: relative;
-      transition: all 0.2s;
-    }
-    .radio-card input {
-      position: absolute;
-      top: 16px;
-      right: 16px;
-    }
-    .radio-card.selected {
-      border-color: var(--brand-coral);
-      background: #18181B;
-      box-shadow: 0 0 0 1px var(--brand-coral);
-    }
-    .radio-card-title {
-      font-weight: 700;
-      font-size: 14px;
-      color: #FAFAFA;
-      margin-bottom: 4px;
-    }
-    .radio-card-desc {
-      font-size: 12px;
-      color: #A1A1AA;
-      line-height: 1.4;
-    }
-
-    /* TOP NAVBAR */
-    .topbar {
-      height: 64px;
-      background: #121214;
-      border-bottom: 1px solid var(--card-border);
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 0 20px;
-      position: sticky;
-      top: 0;
-      z-index: 100;
-    }
-    .topbar-left {
-      display: flex;
-      align-items: center;
-      gap: 14px;
-    }
-    .toggle-sidebar-btn {
-      background: transparent;
-      border: 1px solid var(--card-border);
-      color: #FAFAFA;
-      padding: 7px 10px;
-      border-radius: 6px;
-      cursor: pointer;
-      display: flex;
-      align-items: center;
-      transition: all 0.2s;
-    }
-    .toggle-sidebar-btn:hover {
-      background: #27272A;
-      color: var(--brand-coral);
-    }
-    .topbar-brand {
-      font-weight: 700;
-      font-size: 16px;
-      letter-spacing: -0.01em;
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      color: #FFF;
-      text-decoration: none;
-    }
-    .badge-role {
-      font-size: 11px;
-      font-weight: 700;
-      background: var(--brand-coral)22;
-      color: var(--brand-coral);
-      padding: 3px 8px;
-      border-radius: 9999px;
-      border: 1px solid var(--brand-coral)44;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-    }
-    .topbar-right {
-      display: flex;
-      align-items: center;
-      gap: 16px;
-      font-size: 13px;
-    }
-    .user-info {
-      color: var(--text-muted);
-    }
-    .user-info strong {
-      color: #FAFAFA;
-    }
-    .btn-logout {
-      background: transparent;
-      border: 1px solid #3F3F46;
-      color: #E4E4E7;
-      padding: 6px 12px;
-      border-radius: 6px;
-      font-size: 12px;
-      font-weight: 600;
-      cursor: pointer;
-      text-decoration: none;
-      transition: all 0.2s;
-    }
-    .btn-logout:hover {
-      background: #EF444422;
-      border-color: #EF4444;
-      color: #EF4444;
-    }
-
-    /* LAYOUT A DUE COLONNE */
-    .admin-wrapper {
-      display: flex;
-      flex: 1;
-      position: relative;
-    }
-
-    /* SIDEBAR NAVIGAZIONE */
-    .sidebar {
-      width: 290px;
-      background: #121214;
-      border-right: 1px solid var(--card-border);
+      border-right: 1px solid #27272A;
       display: flex;
       flex-direction: column;
       flex-shrink: 0;
-      transition: width 0.25s cubic-bezier(0.4, 0, 0.2, 1);
-      overflow-x: hidden;
-      overflow-y: auto;
-      max-height: calc(100vh - 64px);
       position: sticky;
-      top: 64px;
+      top: 0;
+      height: 100vh;
+      overflow-y: auto;
     }
-    .sidebar.collapsed {
-      width: 68px;
-    }
-    .sidebar-inner {
-      padding: 16px 10px;
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-    }
-
-    /* VOCE DASHBOARD PRINCIPALE */
-    .nav-dashboard-link {
+    .sidebar-brand {
+      padding: 20px;
       display: flex;
       align-items: center;
       gap: 12px;
-      padding: 12px 14px;
-      border-radius: 8px;
-      color: #E4E4E7;
-      text-decoration: none;
-      font-weight: 600;
-      font-size: 13.5px;
+      border-bottom: 1px solid #27272A;
+    }
+    .logo-box {
+      width: 40px;
+      height: 40px;
       background: #18181B;
       border: 1px solid #27272A;
-      margin-bottom: 12px;
-      transition: all 0.2s;
-    }
-    .nav-dashboard-link:hover {
-      background: #27272A;
-      color: #FFF;
-      border-color: var(--brand-coral)66;
-    }
-    .nav-dashboard-link.active {
-      background: var(--brand-coral)18;
-      border-color: var(--brand-coral);
-      color: #FFF;
-    }
-    .nav-dashboard-link.active .nav-icon {
-      color: var(--brand-coral);
-    }
-    .nav-dashboard-text {
-      white-space: nowrap;
-      transition: opacity 0.2s;
-    }
-    .sidebar.collapsed .nav-dashboard-text {
-      opacity: 0;
-      display: none;
-    }
-
-    /* GRUPPI MACRO-AREE */
-    .nav-group {
       border-radius: 8px;
-      background: #18181B55;
-      border: 1px solid #27272A44;
+      display: flex;
+      align-items: center;
+      justify-content: center;
       overflow: hidden;
-      margin-bottom: 6px;
-      transition: all 0.2s;
     }
-    .nav-group:hover {
-      border-color: #27272A;
+    .brand-img {
+      max-width: 100%;
+      max-height: 100%;
+      object-fit: contain;
     }
-    .nav-group-header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 10px 12px;
-      cursor: pointer;
-    }
-    .nav-group-title {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      color: #D4D4D8;
-      text-decoration: none;
-      font-weight: 600;
-      font-size: 13px;
-      flex: 1;
-      white-space: nowrap;
-    }
-    .nav-group-title:hover {
-      color: #FFF;
-    }
-    .nav-group-title.macro-active {
-      color: var(--brand-coral);
+    .brand-title {
+      font-size: 14px;
       font-weight: 700;
+      color: #FFF;
+      line-height: 1.2;
     }
-    .nav-group-name {
-      transition: opacity 0.2s;
+    .brand-badge {
+      display: inline-block;
+      font-size: 10px;
+      font-weight: 700;
+      color: var(--coral);
+      letter-spacing: 0.05em;
+      margin-top: 3px;
     }
-    .sidebar.collapsed .nav-group-name {
-      opacity: 0;
-      display: none;
+    .sidebar-menu {
+      padding: 16px 12px;
+      flex: 1;
     }
-    .chevron-btn {
-      background: transparent;
-      border: none;
+    .menu-section-title {
+      font-size: 11px;
+      font-weight: 700;
       color: #71717A;
-      cursor: pointer;
-      display: flex;
-      align-items: center;
-      padding: 4px;
-      border-radius: 4px;
+      letter-spacing: 0.05em;
+      padding: 0 10px 8px;
     }
-    .chevron-btn:hover {
-      color: #FAFAFA;
-      background: #27272A;
-    }
-    .chevron {
-      transition: transform 0.2s;
-    }
-    .nav-group.expanded .chevron {
-      transform: rotate(180deg);
-    }
-    .sidebar.collapsed .chevron-btn {
-      display: none;
-    }
-
-    /* SOTTOMENU VOCI */
-    .nav-group-sub {
-      display: none;
-      flex-direction: column;
-      padding: 4px 8px 8px 8px;
-      background: #141417;
-      border-top: 1px solid #27272A44;
-    }
-    .nav-group.expanded .nav-group-sub {
-      display: flex;
-    }
-    .sidebar.collapsed .nav-group-sub {
-      display: none !important;
-    }
-    .nav-sub-item {
+    .menu-item-root {
       display: flex;
       align-items: center;
       gap: 10px;
-      padding: 8px 10px;
+      padding: 10px 12px;
+      border-radius: 8px;
+      color: #D4D4D8;
+      text-decoration: none;
+      font-size: 13.5px;
+      font-weight: 600;
+      transition: all 0.15s;
+    }
+    .menu-item-root:hover {
+      background: #18181B;
+      color: #FFF;
+    }
+    .menu-item-root.active {
+      background: var(--coral);
+      color: #121214;
+    }
+    .macro-group {
+      margin-top: 4px;
+    }
+    .macro-header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 9px 12px;
+      border-radius: 8px;
+      color: #A1A1AA;
+      text-decoration: none;
+      font-size: 13px;
+      font-weight: 600;
+      transition: all 0.15s;
+    }
+    .macro-header:hover {
+      background: #18181B;
+      color: #FFF;
+    }
+    .macro-header .arrow {
+      margin-left: auto;
+      font-size: 11px;
+      color: #71717A;
+    }
+    .macro-subitems {
+      display: none;
+      padding-left: 20px;
+      margin-top: 2px;
+    }
+    .macro-group.open .macro-subitems {
+      display: block;
+    }
+    .macro-group.open .macro-header {
+      color: #FFF;
+    }
+    .subitem {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 10px;
       border-radius: 6px;
       color: #A1A1AA;
       text-decoration: none;
       font-size: 12.5px;
       transition: all 0.15s;
-      white-space: nowrap;
     }
-    .nav-sub-item:hover {
-      background: #27272A;
-      color: #FAFAFA;
-    }
-    .nav-sub-item.active {
-      background: #27272A;
+    .subitem:hover {
       color: #FFF;
-      font-weight: 600;
-      border-left: 2px solid var(--brand-coral);
+      background: #18181B;
     }
-    .sub-dot {
+    .subitem.active {
+      color: var(--accent);
+      font-weight: 600;
+      background: #10B98115;
+    }
+    .subitem-dot {
       width: 6px;
       height: 6px;
       border-radius: 50%;
-      flex-shrink: 0;
-    }
-    .nav-badge {
-      margin-left: auto;
-      background: #F59E0B;
-      color: #121214;
-      font-size: 11px;
-      font-weight: 700;
-      padding: 1px 6px;
-      border-radius: 9999px;
+      background: currentColor;
     }
 
-    /* WORKSPACE CONTENUTO PRINCIPALE */
-    .workspace {
+    /* Main Area Layout */
+    .admin-main {
       flex: 1;
-      padding: 28px 32px;
-      overflow-y: auto;
-      max-width: 1400px;
+      display: flex;
+      flex-direction: column;
+      overflow-x: hidden;
+      min-height: 100vh;
     }
-
-    /* HEADER WORKSPACE DINAMICO */
-    .workspace-header {
+    .admin-topbar {
+      height: 60px;
+      border-bottom: 1px solid #27272A;
       display: flex;
       align-items: center;
       justify-content: space-between;
-      margin-bottom: 24px;
-      padding-bottom: 18px;
-      border-bottom: 1px solid var(--card-border);
+      padding: 0 32px;
+      background: #121214;
     }
-    .header-info-group {
+    .topbar-user {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-size: 13px;
+      color: #A1A1AA;
+    }
+    .topbar-user strong { color: #FFF; }
+    .btn-logout {
+      background: transparent;
+      border: 1px solid #3F3F46;
+      color: #D4D4D8;
+      padding: 6px 14px;
+      border-radius: 6px;
+      font-size: 12.5px;
+      text-decoration: none;
+      transition: all 0.15s;
+    }
+    .btn-logout:hover {
+      background: #27272A;
+      color: #FFF;
+    }
+    .admin-content {
+      padding: 32px;
+      flex: 1;
+      max-width: 1400px;
+      width: 100%;
+      margin: 0 auto;
+    }
+
+    /* Common Components */
+    .page-header {
+      margin-bottom: 28px;
+    }
+    .page-title-box {
       display: flex;
       align-items: center;
       gap: 14px;
     }
-    .header-icon-box {
+    .page-icon {
+      background: #18181B;
+      border: 1px solid #27272A;
       width: 44px;
       height: 44px;
       border-radius: 10px;
       display: flex;
       align-items: center;
       justify-content: center;
-      flex-shrink: 0;
     }
-    .page-title {
+    .page-title-box h1 {
       font-size: 22px;
       font-weight: 700;
-      letter-spacing: -0.01em;
       color: #FFF;
+      letter-spacing: -0.01em;
     }
-    .page-breadcrumbs {
+    .breadcrumbs {
       font-size: 12.5px;
-      color: var(--text-muted);
-      margin-top: 2px;
+      color: #71717A;
+      margin-top: 3px;
     }
 
-    /* ALERT MESSAGES */
-    .alert-box {
-      padding: 12px 18px;
-      border-radius: 8px;
-      margin-bottom: 20px;
-      font-size: 13.5px;
-      font-weight: 500;
-    }
-    .alert-success {
-      background: #10B98118;
-      border: 1px solid #10B98144;
-      color: #34D399;
-    }
-    .alert-error {
-      background: #EF444418;
-      border: 1px solid #EF444444;
-      color: #F87171;
-    }
-
-    /* STATISTICHE DASHBOARD */
+    /* Stats Grid */
     .stats-grid {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
       gap: 16px;
-      margin-bottom: 28px;
     }
     .stat-card {
       background: var(--card-bg);
-      border: 1px solid var(--card-border);
-      border-radius: 10px;
-      padding: 18px 20px;
+      border: 1px solid #27272A;
+      border-radius: 12px;
+      padding: 20px;
     }
     .stat-label {
-      font-size: 11px;
+      font-size: 11.5px;
       font-weight: 700;
-      color: var(--text-muted);
+      color: #71717A;
       letter-spacing: 0.05em;
-      margin-bottom: 6px;
     }
     .stat-value {
-      font-size: 28px;
+      font-size: 32px;
       font-weight: 700;
-      letter-spacing: -0.02em;
+      margin: 8px 0 4px;
     }
-    .stat-sub {
-      font-size: 11.5px;
-      color: #71717A;
-      margin-top: 4px;
+    .stat-desc {
+      font-size: 12px;
+      color: #A1A1AA;
     }
 
-    /* SEZIONE HUB A TESSERE (CARDS GRID) */
-    .section-header-clean {
-      margin-bottom: 18px;
-    }
-    .section-header-clean h2 {
-      font-size: 18px;
-      font-weight: 700;
-      color: #FAFAFA;
-    }
-    .section-header-clean p {
-      font-size: 13px;
-      color: var(--text-muted);
-      margin-top: 2px;
-    }
-    .macro-hub-intro {
-      margin-bottom: 24px;
-      background: #18181B;
-      padding: 18px 20px;
-      border-radius: 10px;
-      border: 1px solid #27272A;
-    }
-    .macro-hub-desc {
-      font-size: 14px;
-      color: #E4E4E7;
-      line-height: 1.5;
-    }
+    /* Hub Cards */
     .hub-cards-grid {
       display: grid;
       grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-      gap: 18px;
-      margin-bottom: 30px;
+      gap: 20px;
     }
     .hub-card {
       background: var(--card-bg);
-      border: 1px solid var(--card-border);
+      border: 1px solid #27272A;
       border-radius: 12px;
       padding: 22px;
-      text-decoration: none;
       display: flex;
       flex-direction: column;
-      transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
-      position: relative;
+      transition: transform 0.15s, border-color 0.15s;
     }
     .hub-card:hover {
       transform: translateY(-2px);
-      border-color: var(--card-accent, var(--brand-coral));
-      box-shadow: 0 8px 20px -6px rgba(0,0,0,0.4);
+      border-color: #3F3F46;
     }
-    .hub-card-top {
+    .hub-card-header {
       display: flex;
       align-items: center;
       justify-content: space-between;
       margin-bottom: 14px;
     }
-    .hub-card-icon {
-      width: 40px;
-      height: 40px;
-      border-radius: 10px;
+    .hub-icon {
+      background: #09090B;
+      padding: 8px;
+      border-radius: 8px;
+      border: 1px solid #27272A;
       display: flex;
-      align-items: center;
-      justify-content: center;
     }
-    .hub-card-badge {
-      font-size: 11px;
+    .hub-count {
+      font-size: 11.5px;
+      background: #27272A;
+      color: #D4D4D8;
+      padding: 3px 8px;
+      border-radius: 12px;
       font-weight: 600;
-      border: 1px solid;
-      padding: 2px 8px;
-      border-radius: 9999px;
     }
-    .hub-card-title {
-      font-size: 15px;
+    .hub-title {
+      font-size: 16px;
       font-weight: 700;
       color: #FFF;
       margin-bottom: 8px;
-      line-height: 1.3;
     }
-    .hub-card-desc {
+    .hub-desc {
       font-size: 12.5px;
-      color: var(--text-muted);
-      line-height: 1.45;
-      margin-bottom: 16px;
+      color: #A1A1AA;
+      line-height: 1.5;
       flex: 1;
+      margin-bottom: 18px;
     }
-    .hub-card-footer {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      font-size: 12px;
+    .hub-action a {
+      font-size: 13px;
       font-weight: 600;
-      margin-top: auto;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
     }
 
-    /* TABELLE & CARD LISTE */
-    .card-table {
+    /* Hub Inner View */
+    .hub-intro-card {
       background: var(--card-bg);
-      border: 1px solid var(--card-border);
+      border: 1px solid #27272A;
+      border-radius: 14px;
+      padding: 24px;
+      display: flex;
+      align-items: center;
+      gap: 20px;
+    }
+    .intro-icon {
+      width: 60px;
+      height: 60px;
+      border-radius: 12px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+    .sections-list-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+      gap: 16px;
+    }
+    .section-card {
+      background: var(--card-bg);
+      border: 1px solid #27272A;
+      border-radius: 12px;
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+    }
+    .section-header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+    .section-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+    }
+    .section-header h4 {
+      font-size: 15px;
+      font-weight: 700;
+      color: #FFF;
+    }
+    .section-desc {
+      font-size: 12.5px;
+      color: #A1A1AA;
+      line-height: 1.5;
+      flex: 1;
+      margin-bottom: 16px;
+    }
+    .btn-open-section {
+      background: #27272A;
+      color: #FFF;
+      text-decoration: none;
+      font-size: 12.5px;
+      font-weight: 600;
+      padding: 8px 12px;
+      border-radius: 6px;
+      text-align: center;
+      transition: background 0.15s;
+    }
+    .btn-open-section:hover {
+      background: #3F3F46;
+    }
+
+    /* Table Component */
+    .table-card {
+      background: var(--card-bg);
+      border: 1px solid #27272A;
       border-radius: 12px;
       overflow: hidden;
     }
-    .card-header-table {
-      padding: 18px 22px;
-      border-bottom: 1px solid var(--card-border);
+    .table-header {
+      padding: 18px 24px;
+      border-bottom: 1px solid #27272A;
       display: flex;
       align-items: center;
       justify-content: space-between;
     }
-    .card-header-table h3 {
+    .table-title {
       font-size: 15px;
       font-weight: 700;
       color: #FFF;
     }
-    .card-header-table p {
-      font-size: 12.5px;
-      color: var(--text-muted);
-      margin-top: 2px;
+    .badge-pending {
+      background: #F59E0B22;
+      color: #FBBF24;
+      border: 1px solid #F59E0B;
+      padding: 3px 10px;
+      border-radius: 12px;
+      font-size: 11.5px;
+      font-weight: 600;
     }
     .table-responsive {
       overflow-x: auto;
     }
-    table {
+    .data-table {
       width: 100%;
       border-collapse: collapse;
-      font-size: 13px;
       text-align: left;
+      font-size: 13px;
     }
-    th {
-      background: #141417;
-      color: var(--text-muted);
-      font-weight: 600;
-      padding: 12px 18px;
-      border-bottom: 1px solid var(--card-border);
-      white-space: nowrap;
-    }
-    td {
-      padding: 14px 18px;
-      border-bottom: 1px solid #222226;
-      vertical-align: middle;
-      color: #E4E4E7;
-    }
-    tr:hover td {
-      background: #1C1C20;
-    }
-    .text-sub {
-      color: #A1A1AA;
-      font-size: 11.5px;
-      display: block;
-      margin-top: 2px;
-    }
-    .badge-pill {
-      font-size: 11px;
-      font-weight: 600;
-      padding: 3px 8px;
-      border-radius: 9999px;
-      display: inline-block;
-      margin: 2px 0;
-    }
-    .bg-green { background: #10B98122; color: #34D399; border: 1px solid #10B98144; }
-    .bg-amber { background: #F59E0B22; color: #FBBF24; border: 1px solid #F59E0B44; }
-    .bg-gray { background: #3F3F4644; color: #A1A1AA; border: 1px solid #52525B44; }
-    .tag-delegato {
-      font-size: 11.5px;
-      color: #CBD5E1;
-      display: inline-block;
-      margin-bottom: 2px;
-    }
-
-    /* MODULO DELIBERA CONSIGLIO DIRETTIVO */
-    .form-delibera {
-      background: #121214;
-      border: 1px solid #2E2E33;
-      border-radius: 8px;
-      padding: 10px 12px;
-    }
-    .form-row {
-      display: flex;
-      gap: 8px;
-      align-items: flex-end;
-    }
-    .form-row label {
-      font-size: 10.5px;
+    .data-table th {
+      background: #09090B;
+      padding: 12px 20px;
       color: #A1A1AA;
       font-weight: 600;
-      flex: 1;
+      border-bottom: 1px solid #27272A;
+      font-size: 11.5px;
+      letter-spacing: 0.03em;
     }
-    .form-row input {
-      width: 100%;
-      background: #1C1C20;
-      border: 1px solid #3F3F46;
-      color: #FFF;
-      padding: 5px 8px;
-      border-radius: 5px;
-      font-size: 12px;
-      margin-top: 3px;
-    }
-    .form-row input:focus {
-      outline: none;
-      border-color: var(--brand-coral);
-    }
-    .btn-delibera {
-      background: var(--brand-coral);
-      color: #121214;
-      font-weight: 700;
-      border: none;
-      padding: 6px 12px;
-      border-radius: 5px;
-      font-size: 12px;
-      cursor: pointer;
-      white-space: nowrap;
-      transition: opacity 0.2s;
-    }
-    .btn-delibera:hover {
-      opacity: 0.9;
-    }
-    .delibera-info {
-      font-size: 12px;
-      line-height: 1.5;
+    .data-table td {
+      padding: 14px 20px;
+      border-bottom: 1px solid #27272A;
       color: #D4D4D8;
     }
-    .tessera-highlight {
-      color: #34D399;
+    .data-table tr:last-child td {
+      border-bottom: none;
+    }
+    .sub-cell {
+      font-size: 11.5px;
+      color: #71717A;
+      margin-top: 2px;
+    }
+    .tag-tipo {
+      background: #27272A;
+      color: #E4E4E7;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 11px;
+      font-weight: 600;
+    }
+    .btn-action {
+      background: var(--coral);
+      color: #121214;
+      border: none;
+      padding: 7px 14px;
+      border-radius: 6px;
       font-weight: 700;
+      font-size: 12px;
+      cursor: pointer;
+      transition: opacity 0.15s;
     }
+    .btn-action:hover { opacity: 0.9; }
 
-    /* PLACEHOLDER SCHERMATE IN FASE DI SVILUPPO */
-    .placeholder-card {
-      background: var(--card-bg);
-      border: 1px dashed var(--card-border);
-      border-radius: 12px;
-      padding: 40px 32px;
-      text-align: center;
-      max-width: 680px;
-      margin: 40px auto;
+    /* Builder Tema Form */
+    .theme-builder-form {
+      margin-top: 10px;
     }
-    .placeholder-icon {
-      width: 60px;
-      height: 60px;
-      border-radius: 14px;
+    .form-grid-2 {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
+      gap: 24px;
+    }
+    .builder-card {
+      background: var(--card-bg);
+      border: 1px solid #27272A;
+      border-radius: 12px;
+      padding: 24px;
+    }
+    .card-heading {
+      font-size: 16px;
+      font-weight: 700;
+      color: #FFF;
+      margin-bottom: 4px;
+    }
+    .card-hint {
+      font-size: 12.5px;
+      color: #A1A1AA;
+      margin-bottom: 16px;
+      line-height: 1.4;
+    }
+    .color-picker-row {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      background: #09090B;
+      border: 1px solid #27272A;
+      padding: 10px 14px;
+      border-radius: 8px;
+      margin-bottom: 12px;
+    }
+    .color-preview {
+      width: 32px;
+      height: 32px;
+      border-radius: 6px;
+      border: 1px solid #3F3F46;
+      flex-shrink: 0;
+    }
+    .color-info {
+      flex: 1;
+    }
+    .color-info label {
+      display: block;
+      font-size: 11.5px;
+      color: #A1A1AA;
+      margin-bottom: 2px;
+    }
+    .color-hex-input {
+      background: transparent;
+      border: none;
+      color: #FFF;
+      font-family: monospace;
+      font-size: 13.5px;
+      font-weight: 700;
+      width: 100%;
+    }
+    .color-hex-input:focus { outline: none; }
+    .native-picker {
+      width: 36px;
+      height: 36px;
+      border: none;
+      background: transparent;
+      cursor: pointer;
+    }
+    .logo-preview-box {
+      margin-top: 18px;
+      border-top: 1px solid #27272A;
+      padding-top: 14px;
+    }
+    .preview-title {
+      font-size: 12px;
+      color: #71717A;
+      margin-bottom: 8px;
+    }
+    .preview-canvas {
+      background: #09090B;
+      border: 1px dashed #3F3F46;
+      border-radius: 8px;
+      padding: 16px;
       display: flex;
       align-items: center;
       justify-content: center;
-      margin: 0 auto 18px auto;
+      min-height: 90px;
     }
-    .placeholder-card h2 {
-      font-size: 20px;
-      font-weight: 700;
-      color: #FFF;
-      margin-bottom: 8px;
-    }
-    .placeholder-meta {
+    .builder-actions-bar {
+      margin-top: 24px;
       display: flex;
-      justify-content: center;
-      gap: 10px;
-      margin-bottom: 16px;
-    }
-    .tag-macro {
-      font-size: 11.5px;
-      font-weight: 600;
-      padding: 2px 10px;
-      border-radius: 9999px;
-    }
-    .tag-status {
-      font-size: 11.5px;
-      font-weight: 500;
-      background: #27272A;
-      color: #D4D4D8;
-      padding: 2px 10px;
-      border-radius: 9999px;
-    }
-    .placeholder-desc {
-      font-size: 13.5px;
-      color: var(--text-muted);
-      line-height: 1.6;
-      margin-bottom: 24px;
-    }
-    .placeholder-roadmap {
-      background: #141417;
+      justify-content: flex-end;
+      gap: 12px;
+      background: var(--card-bg);
       border: 1px solid #27272A;
-      border-radius: 8px;
-      padding: 16px;
-      text-align: left;
-      font-size: 12.5px;
-      color: #D4D4D8;
+      padding: 16px 24px;
+      border-radius: 12px;
     }
-    .placeholder-roadmap h4 {
-      font-size: 12.5px;
-      font-weight: 700;
-      color: #FAFAFA;
-      margin-bottom: 8px;
-      text-transform: uppercase;
-      letter-spacing: 0.04em;
+
+    /* Modale Delibera */
+    .modal-backdrop {
+      position: fixed;
+      top: 0; left: 0; width: 100vw; height: 100vh;
+      background: rgba(0,0,0,0.75);
+      backdrop-filter: blur(4px);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 999;
+      padding: 20px;
     }
-    .placeholder-roadmap ul {
-      padding-left: 18px;
-      line-height: 1.7;
+    .modal-card {
+      background: #18181B;
+      border: 1px solid #3F3F46;
+      border-radius: 14px;
+      padding: 28px;
+      width: 100%;
+      max-width: 520px;
+      box-shadow: 0 25px 50px -12px rgba(0,0,0,0.8);
     }
-    .btn-primary {
-      background: var(--brand-coral);
-      color: #121214;
-      font-weight: 700;
-      padding: 8px 18px;
-      border-radius: 6px;
-      text-decoration: none;
+    .modal-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 4px;
+    }
+    .modal-header h3 { font-size: 18px; color: #FFF; font-weight: 700; }
+    .modal-close {
+      background: transparent;
       border: none;
+      color: #71717A;
+      font-size: 24px;
       cursor: pointer;
+    }
+    .modal-subtitle {
       font-size: 13px;
+      color: #A1A1AA;
+      margin-bottom: 20px;
+    }
+    .modal-subtitle strong { color: var(--coral); }
+    .form-group {
+      margin-bottom: 16px;
+      text-align: left;
+    }
+    .form-group label {
+      display: block;
+      font-size: 12px;
+      font-weight: 600;
+      color: #D4D4D8;
+      margin-bottom: 6px;
+    }
+    .form-group input, .form-group select {
+      width: 100%;
+      background: #09090B;
+      border: 1px solid #3F3F46;
+      color: #FFF;
+      padding: 10px 12px;
+      border-radius: 8px;
+      font-size: 13.5px;
+    }
+    .form-group input:focus, .form-group select:focus {
+      outline: none;
+      border-color: var(--coral);
+    }
+    .form-row-2 {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+    .modal-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+      margin-top: 24px;
     }
     .btn-secondary {
       background: #27272A;
       color: #E4E4E7;
-      font-weight: 600;
-      padding: 8px 18px;
-      border-radius: 6px;
-      text-decoration: none;
+      border: none;
+      padding: 10px 18px;
+      border-radius: 8px;
       font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      text-decoration: none;
+    }
+    .btn-primary {
+      background: var(--coral);
+      color: #121214;
+      border: none;
+      padding: 10px 20px;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 700;
+      cursor: pointer;
     }
 
-    @media (max-width: 900px) {
-      .sidebar {
-        position: fixed;
-        left: 0;
-        top: 64px;
-        bottom: 0;
-        z-index: 99;
-        transform: translateX(-100%);
-      }
-      .sidebar.mobile-open {
-        transform: translateX(0);
-      }
-      .workspace {
-        padding: 20px 16px;
-      }
+    /* Alerts */
+    .alert-success {
+      background: #10B9811A;
+      border: 1px solid #10B981;
+      color: #34D399;
+      padding: 12px 18px;
+      border-radius: 8px;
+      font-size: 13px;
+      margin-bottom: 24px;
+    }
+    .alert-error {
+      background: #EF44441A;
+      border: 1px solid #EF4444;
+      color: #F87171;
+      padding: 12px 18px;
+      border-radius: 8px;
+      font-size: 13px;
+      margin-bottom: 24px;
     }
   </style>
 </head>
 <body>
+  <div class="admin-sidebar">
+    ${sidebarHtml}
+  </div>
 
-  <!-- TOP NAVBAR -->
-  <header class="topbar">
-    <div class="topbar-left">
-      <button class="toggle-sidebar-btn" id="toggleSidebar" title="Comprimi o Espandi Sidebar">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
-      </button>
-      <a href="/admin?view=dashboard" class="topbar-brand">
-        ${settings.logo_url ? `<img src="${settings.logo_url}" alt="Logo" style="height: 32px; width: auto; object-fit: contain; border-radius: 4px;" onerror="this.style.display='none'">` : `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="var(--brand-coral)" stroke-width="2.2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>`}
-        <span>${settings.nome_aps || 'Cervelli in Affitto APS'}</span>
-        <span class="badge-role">SUPER ADMIN</span>
-      </a>
+  <div class="admin-main">
+    <div class="admin-topbar">
+      <div style="font-size: 13px; color: #71717A;">
+        Ambiente: <span style="color: #10B981; font-weight: 600;">Produzione • D1 Cloudflare</span>
+      </div>
+      <div class="topbar-user">
+        <span>Connesso: <strong>${user.nome} ${user.cognome}</strong> (${user.email})</span>
+        <a href="/admin/logout" class="btn-logout">Disconnetti</a>
+      </div>
     </div>
-    <div class="topbar-right">
-      <div class="user-info">
-        Collegato: <strong>${utente.nome} ${utente.cognome}</strong>
-      </div>
-      <a href="/admin/logout" class="btn-logout">Disconnetti</a>
-    </div>
-  </header>
 
-  <!-- STRUTTURA A DUE COLONNE -->
-  <div class="admin-wrapper">
-    <!-- COLONNA SINISTRA: SIDEBAR ACCORDION -->
-    <aside class="sidebar" id="adminSidebar">
-      <div class="sidebar-inner">
-        <!-- 0. LINK DIRETTO DASHBOARD GENERALE -->
-        <a href="/admin?view=dashboard" class="nav-dashboard-link ${currentView === 'dashboard' ? 'active' : ''}">
-          <span class="nav-icon" style="color: ${currentView === 'dashboard' ? 'var(--brand-coral)' : '#A1A1AA'};">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
-          </span>
-          <span class="nav-dashboard-text">Dashboard Generale</span>
-        </a>
-
-        <!-- 5 MACRO-AREE UFFICIALI DELLA BIBBIA -->
-        ${sidebarNavHtml}
-      </div>
-    </aside>
-
-    <!-- COLONNA DESTRA: WORKSPACE -->
-    <main class="workspace">
-      <!-- HEADER CONTESTUALE -->
-      <div class="workspace-header">
-        <div class="header-info-group">
-          <div class="header-icon-box" style="background: ${currentMacroColor}18; color: ${currentMacroColor};">
-            ${currentMacroIcon}
-          </div>
-          <div>
-            <h1 class="page-title">${currentTitle}</h1>
-            <div class="page-breadcrumbs">
-              <span>Area Riservata</span> &gt; <span>${currentMacro}</span>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <!-- MESSAGGI DI NOTIFICA -->
-      ${msgNotifica}
-
-      <!-- CONTENUTO DELLA VISTA ATTIVA -->
+    <div class="admin-content">
       ${mainContentHtml}
-    </main>
+    </div>
   </div>
 
   <script>
-    // Gestione espansione e compressione Sidebar
-    const toggleBtn = document.getElementById('toggleSidebar');
-    const sidebar = document.getElementById('adminSidebar');
+    function apriModaleDelibera(id, nome, tipo) {
+      document.getElementById('modalSocioId').value = id;
+      document.getElementById('modalNomeSocio').innerText = nome + ' (' + tipo.toUpperCase() + ')';
+      document.getElementById('modaleDelibera').style.display = 'flex';
+    }
 
-    if (toggleBtn && sidebar) {
-      toggleBtn.addEventListener('click', () => {
-        if (window.innerWidth <= 900) {
-          sidebar.classList.toggle('mobile-open');
-        } else {
-          sidebar.classList.toggle('collapsed');
-        }
-      });
+    function chiudiModaleDelibera() {
+      document.getElementById('modaleDelibera').style.display = 'none';
     }
   </script>
 </body>
@@ -2050,153 +1763,7 @@ async function renderAdminDashboard(env, utente, url) {
   });
 }
 
-/* =========================================================================
-   PAGINE DI AUTENTICAZIONE (SETUP E LOGIN)
-   ========================================================================= */
-
-function renderSetupPage(errorMsg = "") {
-  const html = `<!DOCTYPE html>
-<html lang="it">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Setup Iniziale Super Admin • Cervelli in Affitto APS</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      font-family: 'Plus Jakarta Sans', sans-serif;
-      background: #09090B;
-      color: #FAFAFA;
-      min-height: 100vh;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      padding: 20px;
-    }
-    .setup-card {
-      background: #18181B;
-      border: 1px solid #27272A;
-      border-radius: 12px;
-      max-width: 460px;
-      width: 100%;
-      padding: 32px;
-    }
-    .logo-box {
-      text-align: center;
-      margin-bottom: 24px;
-    }
-    .logo-box svg {
-      width: 48px;
-      height: 48px;
-      stroke: #D98295;
-      margin-bottom: 12px;
-    }
-    h1 {
-      font-size: 20px;
-      font-weight: 700;
-      margin-bottom: 6px;
-      text-align: center;
-    }
-    p.sub {
-      font-size: 13px;
-      color: #A1A1AA;
-      text-align: center;
-      margin-bottom: 24px;
-      line-height: 1.5;
-    }
-    .alert-err {
-      background: #EF444415;
-      border: 1px solid #EF444444;
-      color: #F87171;
-      padding: 10px 14px;
-      border-radius: 6px;
-      font-size: 13px;
-      margin-bottom: 20px;
-    }
-    .form-group {
-      margin-bottom: 16px;
-    }
-    label {
-      display: block;
-      font-size: 12.5px;
-      font-weight: 600;
-      color: #D4D4D8;
-      margin-bottom: 6px;
-    }
-    input {
-      width: 100%;
-      background: #09090B;
-      border: 1px solid #27272A;
-      color: #FAFAFA;
-      padding: 10px 14px;
-      border-radius: 6px;
-      font-size: 14px;
-      outline: none;
-    }
-    input:focus {
-      border-color: #D98295;
-    }
-    .btn-submit {
-      width: 100%;
-      background: #D98295;
-      color: #121214;
-      font-weight: 700;
-      padding: 12px;
-      border: none;
-      border-radius: 6px;
-      font-size: 14px;
-      cursor: pointer;
-      margin-top: 10px;
-    }
-    .btn-submit:hover {
-      opacity: 0.9;
-    }
-  </style>
-</head>
-<body>
-  <div class="setup-card">
-    <div class="logo-box">
-      <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
-      <h1>Primo Avvio Gestionale</h1>
-      <p class="sub">Configura il primo account <strong>Super Admin</strong> con accesso totale a tutte le macro-aree.</p>
-    </div>
-
-    ${errorMsg ? `<div class="alert-err">${errorMsg}</div>` : ""}
-
-    <form method="POST" action="/admin/setup">
-      <div style="display: flex; gap: 12px;">
-        <div class="form-group" style="flex: 1;">
-          <label>Nome</label>
-          <input type="text" name="nome" placeholder="Giacomo" required autofocus>
-        </div>
-        <div class="form-group" style="flex: 1;">
-          <label>Cognome</label>
-          <input type="text" name="cognome" placeholder="Garofani" required>
-        </div>
-      </div>
-      <div class="form-group">
-        <label>Email Ufficiale</label>
-        <input type="email" name="email" placeholder="admin@cervellinaffitto-aps.it" required>
-      </div>
-      <div class="form-group">
-        <label>Password di Accesso (minimo 8 caratteri)</label>
-        <input type="password" name="password" required>
-      </div>
-      <button type="submit" class="btn-submit">Crea Account Super Admin &amp; Accedi</button>
-    </form>
-  </div>
-</body>
-</html>`;
-
-  return new Response(html, {
-    headers: { "Content-Type": "text/html; charset=utf-8" }
-  });
-}
-
-function renderLoginPage(errorMsg = "") {
+function renderLoginPage(errorMsg = null) {
   const html = `<!DOCTYPE html>
 <html lang="it">
 <head>
@@ -2210,7 +1777,7 @@ function renderLoginPage(errorMsg = "") {
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
       font-family: 'Plus Jakarta Sans', sans-serif;
-      background: #09090B;
+      background: #121214;
       color: #FAFAFA;
       min-height: 100vh;
       display: flex;
@@ -2218,120 +1785,257 @@ function renderLoginPage(errorMsg = "") {
       justify-content: center;
       padding: 20px;
     }
-    .login-card {
+    .auth-card {
       background: #18181B;
       border: 1px solid #27272A;
-      border-radius: 12px;
-      max-width: 420px;
+      border-radius: 16px;
+      padding: 40px 32px;
       width: 100%;
-      padding: 32px;
+      max-width: 420px;
+      box-shadow: 0 20px 40px -15px rgba(0,0,0,0.7);
     }
-    .logo-box {
+    .brand-header {
       text-align: center;
-      margin-bottom: 24px;
+      margin-bottom: 28px;
     }
-    .logo-box svg {
-      width: 44px;
-      height: 44px;
-      stroke: #D98295;
-      margin-bottom: 12px;
-    }
-    h1 {
-      font-size: 19px;
+    .brand-title {
+      font-size: 20px;
       font-weight: 700;
-      margin-bottom: 4px;
-      text-align: center;
+      color: #FFF;
+      letter-spacing: -0.01em;
+      margin-top: 10px;
     }
-    p.sub {
-      font-size: 13px;
+    .brand-sub {
       color: #A1A1AA;
-      text-align: center;
-      margin-bottom: 24px;
+      font-size: 13px;
+      margin-top: 4px;
     }
-    .alert-err {
-      background: #EF444415;
-      border: 1px solid #EF444444;
+    .error-box {
+      background: #EF444422;
+      border: 1px solid #EF4444;
       color: #F87171;
       padding: 10px 14px;
-      border-radius: 6px;
+      border-radius: 8px;
       font-size: 13px;
       margin-bottom: 20px;
-      line-height: 1.4;
     }
     .form-group {
-      margin-bottom: 16px;
+      margin-bottom: 18px;
+      text-align: left;
     }
     label {
       display: block;
       font-size: 12.5px;
       font-weight: 600;
-      color: #D4D4D8;
+      color: #E4E4E7;
       margin-bottom: 6px;
     }
     input {
       width: 100%;
       background: #09090B;
-      border: 1px solid #27272A;
-      color: #FAFAFA;
-      padding: 10px 14px;
-      border-radius: 6px;
+      border: 1px solid #3F3F46;
+      color: #FFF;
+      padding: 11px 14px;
+      border-radius: 8px;
       font-size: 14px;
-      outline: none;
+      transition: border-color 0.2s;
     }
     input:focus {
+      outline: none;
       border-color: #D98295;
+      box-shadow: 0 0 0 2px #D9829533;
     }
     .btn-submit {
       width: 100%;
       background: #D98295;
       color: #121214;
       font-weight: 700;
-      padding: 12px;
-      border: none;
-      border-radius: 6px;
       font-size: 14px;
+      padding: 12px;
+      border-radius: 8px;
+      border: none;
       cursor: pointer;
-      margin-top: 10px;
+      margin-top: 8px;
+      transition: opacity 0.2s;
     }
-    .btn-submit:hover {
-      opacity: 0.9;
-    }
-    .link-home {
+    .btn-submit:hover { opacity: 0.9; }
+    .back-link {
       display: block;
       text-align: center;
-      margin-top: 20px;
+      margin-top: 24px;
       color: #71717A;
       font-size: 12.5px;
       text-decoration: none;
     }
-    .link-home:hover {
-      color: #FAFAFA;
-    }
+    .back-link:hover { color: #A1A1AA; }
   </style>
 </head>
 <body>
-  <div class="login-card">
-    <div class="logo-box">
-      <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
-      <h1>Cervelli in Affitto APS</h1>
-      <p class="sub">Area Riservata • Pannello Amministrativo</p>
+  <div class="auth-card">
+    <div class="brand-header">
+      <svg width="42" height="42" viewBox="0 0 24 24" fill="none" stroke="#D98295" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+      <h1 class="brand-title">Cervelli in Affitto APS</h1>
+      <p class="brand-sub">Area Riservata • Pannello Amministrativo</p>
     </div>
 
-    ${errorMsg ? `<div class="alert-err">${errorMsg}</div>` : ""}
+    ${errorMsg ? `<div class="error-box">${errorMsg}</div>` : ''}
 
     <form method="POST" action="/admin/login">
       <div class="form-group">
         <label>Email</label>
-        <input type="email" name="email" placeholder="admin@cervellinaffitto-aps.it" required autofocus>
+        <input type="email" name="email" placeholder="tua-email@personale.it" required autofocus>
       </div>
       <div class="form-group">
         <label>Password</label>
-        <input type="password" name="password" required>
+        <input type="password" name="password" placeholder="••••••••••••" required>
       </div>
       <button type="submit" class="btn-submit">Accedi al Gestionale</button>
     </form>
 
-    <a href="/" class="link-home">&larr; Torna al Portale Pubblico</a>
+    <a href="/" class="back-link">← Torna al Portale Pubblico</a>
+  </div>
+</body>
+</html>`;
+
+  return new Response(html, {
+    headers: { "Content-Type": "text/html; charset=utf-8" }
+  });
+}
+
+function renderSetupPage(errorMsg = null) {
+  const html = `<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Primo Avvio • Configurazione Super Admin</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Plus Jakarta Sans', sans-serif;
+      background: #121214;
+      color: #FAFAFA;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    .setup-card {
+      background: #18181B;
+      border: 1px solid #27272A;
+      border-radius: 16px;
+      padding: 40px 32px;
+      width: 100%;
+      max-width: 480px;
+      box-shadow: 0 20px 40px -15px rgba(0,0,0,0.7);
+    }
+    .brand-header {
+      text-align: center;
+      margin-bottom: 28px;
+    }
+    .brand-title {
+      font-size: 22px;
+      font-weight: 700;
+      color: #FFF;
+      letter-spacing: -0.01em;
+      margin-top: 10px;
+    }
+    .brand-sub {
+      color: #A1A1AA;
+      font-size: 13px;
+      margin-top: 4px;
+    }
+    .error-box {
+      background: #EF444422;
+      border: 1px solid #EF4444;
+      color: #F87171;
+      padding: 10px 14px;
+      border-radius: 8px;
+      font-size: 13px;
+      margin-bottom: 20px;
+    }
+    .form-group {
+      margin-bottom: 16px;
+      text-align: left;
+    }
+    .form-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+    label {
+      display: block;
+      font-size: 12.5px;
+      font-weight: 600;
+      color: #E4E4E7;
+      margin-bottom: 6px;
+    }
+    input {
+      width: 100%;
+      background: #09090B;
+      border: 1px solid #3F3F46;
+      color: #FFF;
+      padding: 11px 14px;
+      border-radius: 8px;
+      font-size: 14px;
+      transition: border-color 0.2s;
+    }
+    input:focus {
+      outline: none;
+      border-color: #D98295;
+      box-shadow: 0 0 0 2px #D9829533;
+    }
+    .btn-submit {
+      width: 100%;
+      background: #D98295;
+      color: #121214;
+      font-weight: 700;
+      font-size: 14px;
+      padding: 12px;
+      border-radius: 8px;
+      border: none;
+      cursor: pointer;
+      margin-top: 12px;
+      transition: opacity 0.2s;
+    }
+    .btn-submit:hover { opacity: 0.9; }
+  </style>
+</head>
+<body>
+  <div class="setup-card">
+    <div class="brand-header">
+      <svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="#D98295" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+      <h1 class="brand-title">Primo Avvio Gestionale</h1>
+      <p class="brand-sub">Creazione Account Super Admin • Cervelli in Affitto APS</p>
+    </div>
+
+    ${errorMsg ? `<div class="error-box">${errorMsg}</div>` : ''}
+
+    <form method="POST" action="/admin/setup">
+      <div class="form-row">
+        <div class="form-group">
+          <label>Nome *</label>
+          <input type="text" name="nome" placeholder="Giacomo" required>
+        </div>
+        <div class="form-group">
+          <label>Cognome *</label>
+          <input type="text" name="cognome" placeholder="Garofani" required>
+        </div>
+      </div>
+      <div class="form-group">
+        <label>Email Ufficiale Super Admin *</label>
+        <input type="email" name="email" placeholder="garofanigiacomo@hotmail.it" required>
+      </div>
+      <div class="form-group">
+        <label>Password Super Admin (minimo 8 caratteri) *</label>
+        <input type="password" name="password" minlength="8" required>
+      </div>
+      <button type="submit" class="btn-submit">Crea Account Super Admin</button>
+    </form>
   </div>
 </body>
 </html>`;
@@ -2342,36 +2046,147 @@ function renderLoginPage(errorMsg = "") {
 }
 
 /* =========================================================================
-   PORTALE PUBBLICO (WIZARD A 5 STEP)
+   PORTALE PUBBLICO: WIZARD ISCRIZIONE CORSI MINORI & DOMANDA SOCIO
    ========================================================================= */
 
-function renderPublicWizard(step, isSuccess, params, settings = {}) {
-  if (isSuccess) {
-    return renderSuccessPage(params.get("socio") || "Socio");
+async function handlePublicRoutes(request, env, url, ctx) {
+  if (request.method === "POST" && (url.pathname === "/" || url.pathname === "/iscrizione")) {
+    return handleIscrizionePost(request, env, ctx);
   }
+  const theme = await getThemeSettings(env);
+  return renderPublicForm(theme);
+}
 
-  const stepTitles = [
-    "Dati Anagrafici Minore",
-    "Genitore / Tutore Legale",
-    "Deleghe al Ritiro",
-    "Statuto & Consensi",
-    "Riepilogo & Firma"
-  ];
+async function handleIscrizionePost(request, env, ctx) {
+  try {
+    const form = await request.formData();
 
+    const minoreNome = form.get("minore_nome")?.trim();
+    const minoreCognome = form.get("minore_cognome")?.trim();
+    const minoreCF = form.get("minore_cf")?.trim().toUpperCase();
+    const minoreNascita = form.get("minore_nascita");
+    const minoreLuogo = form.get("minore_luogo")?.trim();
+    const noteMediche = form.get("note_mediche")?.trim() || null;
+
+    const tutoreNome = form.get("tutore_nome")?.trim();
+    const tutoreCognome = form.get("tutore_cognome")?.trim();
+    const tutoreCF = form.get("tutore_cf")?.trim().toUpperCase();
+    const tutoreTelefono = form.get("tutore_telefono")?.trim();
+    const tutoreEmail = form.get("tutore_email")?.trim().toLowerCase();
+    const tutoreResidenza = form.get("tutore_residenza")?.trim();
+    const gradoParentela = form.get("grado_parentela") || "Genitore";
+
+    const delega1Nome = form.get("delega1_nome")?.trim();
+    const delega1Cognome = form.get("delega1_cognome")?.trim();
+    const delega1Tel = form.get("delega1_telefono")?.trim();
+    const delega1Rel = form.get("delega1_relazione")?.trim();
+
+    const accStatuto = form.get("accettazione_statuto") ? 1 : 0;
+    const consPrivacy = form.get("consenso_privacy") ? 1 : 0;
+    const consFoto = form.get("consenso_foto_video") ? 1 : 0;
+
+    if (!minoreNome || !minoreCognome || !minoreCF || !tutoreNome || !tutoreCognome || !tutoreEmail || !tutoreTelefono) {
+      return new Response("Campi anagrafici obbligatori mancanti.", { status: 400 });
+    }
+    if (!accStatuto || !consPrivacy) {
+      return new Response("Accettazione dello statuto e consenso privacy obbligatori.", { status: 400 });
+    }
+
+    let tutoreId;
+    const existingTutore = await env.DB.prepare(
+      "SELECT id FROM tutori WHERE codice_fiscale = ? OR email = ? LIMIT 1"
+    ).bind(tutoreCF, tutoreEmail).first();
+
+    if (existingTutore) {
+      tutoreId = existingTutore.id;
+    } else {
+      const resTutore = await env.DB.prepare(`
+        INSERT INTO tutori (nome, cognome, codice_fiscale, telefono, email, residenza, grado_parentela, creato_il)
+        VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+      `).bind(tutoreNome, tutoreCognome, tutoreCF, tutoreTelefono, tutoreEmail, tutoreResidenza, gradoParentela).run();
+      tutoreId = resTutore.meta.last_row_id;
+    }
+
+    let socioId;
+    const existingSocio = await env.DB.prepare(
+      "SELECT id FROM soci WHERE codice_fiscale = ? LIMIT 1"
+    ).bind(minoreCF).first();
+
+    if (existingSocio) {
+      socioId = existingSocio.id;
+      await env.DB.prepare(`
+        UPDATE soci
+        SET tutore_id = ?, note_mediche = ?, aggiornato_il = datetime('now')
+        WHERE id = ?
+      `).bind(tutoreId, noteMediche, socioId).run();
+    } else {
+      const resSocio = await env.DB.prepare(`
+        INSERT INTO soci (
+          tipo_socio, stato_iscrizione, nome, cognome, codice_fiscale,
+          data_nascita, luogo_nascita, tutore_id, note_mediche, creato_il, aggiornato_il
+        ) VALUES (
+          'ordinario', 'in_attesa_delibera', ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now')
+        )
+      `).bind(minoreNome, minoreCognome, minoreCF, minoreNascita, minoreLuogo, tutoreId, noteMediche).run();
+      socioId = resSocio.meta.last_row_id;
+    }
+
+    await env.DB.prepare(`
+      INSERT INTO quote_sociali (socio_id, stagione, tipo_quota, importo, stato_pagamento)
+      VALUES (?, '2025/2026', 'ordinario', 20.00, 'in_attesa')
+    `).bind(socioId).run();
+
+    await env.DB.prepare(`
+      INSERT INTO consensi_privacy (socio_id, consenso_gdpr, consenso_foto_video, data_consenso, ip_registrazione)
+      VALUES (?, ?, ?, datetime('now'), ?)
+    `).bind(socioId, consPrivacy, consFoto, request.headers.get("CF-Connecting-IP") || "0.0.0.0").run();
+
+    let corso = await env.DB.prepare(
+      "SELECT id FROM attivita_eventi WHERE tipologia = 'corso' AND attivo = 1 LIMIT 1"
+    ).first();
+
+    if (!corso) {
+      const resCorso = await env.DB.prepare(`
+        INSERT INTO attivita_eventi (titolo, tipologia, anno_sociale, attivo, creato_il)
+        VALUES ('Laboratorio Teatrale Bambini & Ragazzi', 'corso', '2025/2026', 1, datetime('now'))
+      `).run();
+      corso = { id: resCorso.meta.last_row_id };
+    }
+
+    await env.DB.prepare(`
+      INSERT INTO iscrizioni_corsi (socio_id, attivita_id, stato_frequenza, data_iscrizione)
+      VALUES (?, ?, 'confermata', datetime('now'))
+    `).bind(socioId, corso.id).run();
+
+    if (delega1Nome && delega1Cognome) {
+      await env.DB.prepare(`
+        INSERT INTO deleghe_ritiro (socio_id, tutore_id, nome, cognome, telefono, relazione, creato_il)
+        VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+      `).bind(socioId, tutoreId, delega1Nome, delega1Cognome, delega1Tel || null, delega1Rel || null).run();
+    }
+
+    return renderSuccessPage(minoreNome);
+  } catch (err) {
+    console.error("Errore salvataggio domanda:", err);
+    return new Response("Errore durante il salvataggio della domanda: " + err.message, { status: 500 });
+  }
+}
+
+function renderPublicForm(theme) {
   const html = `<!DOCTYPE html>
 <html lang="it">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Iscrizione Corsi & Domanda Socio • Cervelli in Affitto APS</title>
+  <title>Iscrizione Corsi & Domanda Socio • ${theme.nome_associazione}</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
   <style>
     :root {
-      --coral: ${settings.colore_primario || '#D98295'};
-      --silver: #E8E7E9;
-      --dark: ${settings.colore_sfondo || '#121214'};
+      --coral: ${theme.colore_primario};
+      --silver: ${theme.colore_secondario};
+      --dark: ${theme.colore_scuro};
       --card-bg: #FFFFFF;
       --text: #1F2937;
       --border: #E5E7EB;
@@ -2398,198 +2213,155 @@ function renderPublicWizard(step, isSuccess, params, settings = {}) {
       letter-spacing: -0.01em;
     }
     .brand-sub {
-      color: #9CA3AF;
+      color: var(--silver);
       font-size: 13px;
       margin-top: 4px;
     }
-    .wizard-container {
+    .form-container {
       max-width: 680px;
       width: 100%;
-      margin: 24px auto 40px auto;
+      margin: 32px auto;
       padding: 0 16px;
       flex: 1;
+    }
+    .wizard-card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 32px 28px;
+      box-shadow: 0 10px 25px -5px rgba(0,0,0,0.05);
     }
     .stepper {
       display: flex;
       justify-content: space-between;
+      margin-bottom: 28px;
       position: relative;
-      margin-bottom: 30px;
     }
     .stepper::before {
       content: "";
       position: absolute;
-      top: 14px;
-      left: 10px;
-      right: 10px;
+      top: 15px;
+      left: 20px;
+      right: 20px;
       height: 2px;
-      background: var(--border);
+      background: #E5E7EB;
       z-index: 1;
     }
     .step-item {
       position: relative;
       z-index: 2;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      gap: 6px;
-    }
-    .step-circle {
-      width: 30px;
-      height: 30px;
-      border-radius: 50%;
       background: #FFF;
-      border: 2px solid var(--border);
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      border: 2px solid #D1D5DB;
       display: flex;
       align-items: center;
       justify-content: center;
-      font-weight: 600;
       font-size: 13px;
+      font-weight: 700;
       color: #6B7280;
     }
-    .step-item.active .step-circle {
+    .step-item.active {
+      border-color: var(--coral);
+      color: var(--coral);
+      background: #FFF;
+    }
+    .step-item.completed {
       border-color: var(--coral);
       background: var(--coral);
-      color: #FFF;
+      color: #121214;
     }
-    .step-item.completed .step-circle {
-      border-color: #10B981;
-      background: #10B981;
-      color: #FFF;
-    }
-    .step-label {
-      font-size: 11px;
-      color: #6B7280;
-      font-weight: 500;
-      text-align: center;
-    }
-    .step-item.active .step-label {
-      color: var(--dark);
-      font-weight: 700;
-    }
-    .card {
-      background: var(--card-bg);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 28px;
-      box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
-    }
-    .card-title {
+    .step-section { display: none; }
+    .step-section.active { display: block; }
+    .step-title {
       font-size: 18px;
       font-weight: 700;
-      color: var(--dark);
-      margin-bottom: 6px;
+      color: #111827;
+      margin-bottom: 8px;
     }
-    .card-desc {
-      font-size: 13px;
-      color: #6B7280;
-      margin-bottom: 24px;
+    .step-desc {
+      font-size: 13.5px;
+      color: #4B5563;
+      margin-bottom: 22px;
       line-height: 1.5;
     }
     .form-group {
-      margin-bottom: 18px;
-    }
-    .form-row {
-      display: flex;
-      gap: 14px;
-    }
-    .form-row .form-group {
-      flex: 1;
+      margin-bottom: 16px;
     }
     label {
       display: block;
-      font-size: 12.5px;
+      font-size: 13px;
       font-weight: 600;
       color: #374151;
       margin-bottom: 6px;
     }
-    input[type="text"], input[type="email"], input[type="tel"], input[type="date"], select {
+    input, select, textarea {
       width: 100%;
-      padding: 10px 12px;
-      border: 1px solid var(--border);
-      border-radius: 6px;
+      background: #FFF;
+      border: 1px solid #D1D5DB;
+      color: #111827;
+      padding: 10px 14px;
+      border-radius: 8px;
       font-size: 14px;
-      font-family: inherit;
-      color: var(--text);
+      transition: border-color 0.15s;
+    }
+    input:focus, select:focus, textarea:focus {
       outline: none;
-      transition: border-color 0.2s;
-    }
-    input:focus, select:focus {
       border-color: var(--coral);
-      box-shadow: 0 0 0 1px var(--coral);
     }
-    .checkbox-group {
+    .form-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+    }
+    .checkbox-box {
+      background: #F9FAFB;
+      border: 1px solid #E5E7EB;
+      border-radius: 8px;
+      padding: 12px 14px;
+      margin-bottom: 14px;
       display: flex;
       align-items: flex-start;
       gap: 10px;
-      margin-bottom: 14px;
     }
-    .checkbox-group input {
-      margin-top: 3px;
+    .checkbox-box input[type="checkbox"] {
+      width: 18px;
+      height: 18px;
+      margin-top: 2px;
+      flex-shrink: 0;
     }
-    .checkbox-group label {
-      font-size: 12.5px;
-      font-weight: 400;
-      color: #4B5563;
+    .checkbox-label {
+      font-size: 13px;
+      color: #374151;
       line-height: 1.4;
-      margin: 0;
     }
-    .btn-group {
+    .step-actions {
       display: flex;
       justify-content: space-between;
       margin-top: 28px;
       padding-top: 18px;
-      border-top: 1px solid var(--border);
+      border-top: 1px solid #E5E7EB;
     }
-    .btn {
-      padding: 10px 20px;
-      border-radius: 6px;
-      font-size: 14px;
-      font-weight: 600;
-      cursor: pointer;
-      text-decoration: none;
-      border: none;
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-    }
-    .btn-next {
+    .btn-step {
       background: var(--coral);
       color: #121214;
-      margin-left: auto;
-    }
-    .btn-prev {
-      background: #F3F4F6;
-      color: #4B5563;
-    }
-    .btn-submit {
-      background: #10B981;
-      color: #FFF;
       font-weight: 700;
-      padding: 12px 28px;
-    }
-    .delega-box {
-      border: 1px dashed #D1D5DB;
-      padding: 16px;
+      font-size: 14px;
+      padding: 11px 22px;
       border-radius: 8px;
-      margin-bottom: 16px;
-      background: #F9FAFB;
+      border: none;
+      cursor: pointer;
     }
-    .delega-box h4 {
-      font-size: 13px;
+    .btn-back {
+      background: #E5E7EB;
+      color: #374151;
       font-weight: 600;
-      color: #4B5563;
-      margin-bottom: 12px;
-    }
-    .doc-preview {
-      background: #F3F4F6;
-      border: 1px solid #E5E7EB;
-      padding: 14px;
-      border-radius: 6px;
-      font-size: 12px;
-      color: #4B5563;
-      margin-bottom: 16px;
-      max-height: 120px;
-      overflow-y: auto;
+      font-size: 14px;
+      padding: 11px 20px;
+      border-radius: 8px;
+      border: none;
+      cursor: pointer;
     }
     .review-row {
       display: flex;
@@ -2598,270 +2370,237 @@ function renderPublicWizard(step, isSuccess, params, settings = {}) {
       border-bottom: 1px solid #F3F4F6;
       font-size: 13px;
     }
-    .review-label {
-      color: #6B7280;
-    }
-    .review-val {
-      font-weight: 600;
-      color: #111827;
-    }
+    .review-label { color: #6B7280; }
+    .review-val { font-weight: 600; color: #111827; }
     footer.pub-footer {
       background: var(--dark);
-      color: #9CA3AF;
-      font-size: 12px;
-      padding: 20px;
+      color: var(--silver);
       text-align: center;
+      padding: 24px 20px;
+      font-size: 12px;
       margin-top: auto;
+      border-top: 1px solid #27272A;
     }
   </style>
 </head>
 <body>
-
   <header class="pub-header">
-    <div style="max-width: 600px; margin: 0 auto; display: flex; flex-direction: column; align-items: center; gap: 6px;">
-      ${settings.logo_url ? `<img src="${settings.logo_url}" alt="Logo" style="max-height: 52px; width: auto; object-fit: contain; margin-bottom: 4px;" onerror="this.style.display='none'">` : ''}
-      <div class="brand-title">${settings.nome_aps || 'Cervelli in Affitto APS'}</div>
-      <div class="brand-sub">Affiliata UILT • Laboratori Teatrali Bambini &amp; Ragazzi</div>
-    </div>
+    <div class="brand-title">${theme.nome_associazione}</div>
+    <div class="brand-sub">Portale Istituzionale • Richiesta Ammissione Socio &amp; Corsi Teatrali</div>
   </header>
 
-  <div class="wizard-container">
-    <div class="stepper">
-      ${stepTitles.map((t, idx) => {
-        const stepNum = idx + 1;
-        const stateClass = stepNum === step ? "active" : stepNum < step ? "completed" : "";
-        return `
-          <div class="step-item ${stateClass}">
-            <div class="step-circle">${stepNum < step ? "✓" : stepNum}</div>
-            <div class="step-label">${t}</div>
-          </div>
-        `;
-      }).join("")}
-    </div>
+  <div class="form-container">
+    <div class="wizard-card">
+      <div class="stepper">
+        <div class="step-item active" id="dot1">1</div>
+        <div class="step-item" id="dot2">2</div>
+        <div class="step-item" id="dot3">3</div>
+        <div class="step-item" id="dot4">4</div>
+        <div class="step-item" id="dot5">5</div>
+      </div>
 
-    <form id="iscrizioneForm" method="POST" action="/iscrizione-minori">
-      <!-- STEP 1: DATI MINORE -->
-      <div class="card" id="step-1" style="display: ${step === 1 ? 'block' : 'none'};">
-        <h2 class="card-title">1. Dati Anagrafici del Minore</h2>
-        <p class="card-desc">Inserisci i dati dell'allievo/a che parteciperà al laboratorio teatrale.</p>
+      <form id="iscrizioneForm" method="POST" action="/iscrizione">
         
-        <div class="form-row">
-          <div class="form-group">
-            <label>Nome Minore *</label>
-            <input type="text" name="minore_nome" required>
+        <!-- STEP 1: ALLIEVO MINORE -->
+        <div class="step-section active" id="step1">
+          <h2 class="step-title">1. Dati Anagrafici del Minore (Aspirante Socio)</h2>
+          <p class="step-desc">I minori iscritti ai corsi teatrali sono soci ordinari dell'associazione con copertura assicurativa UILT.</p>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label>Nome Minore *</label>
+              <input type="text" name="minore_nome" required>
+            </div>
+            <div class="form-group">
+              <label>Cognome Minore *</label>
+              <input type="text" name="minore_cognome" required>
+            </div>
           </div>
+
           <div class="form-group">
-            <label>Cognome Minore *</label>
-            <input type="text" name="minore_cognome" required>
+            <label>Codice Fiscale Minore *</label>
+            <input type="text" name="minore_cf" placeholder="Es. RSSMRA15A01A944X" maxlength="16" required style="text-transform: uppercase;">
           </div>
-        </div>
 
-        <div class="form-row">
-          <div class="form-group">
-            <label>Data di Nascita *</label>
-            <input type="date" name="minore_nascita" required>
+          <div class="form-row">
+            <div class="form-group">
+              <label>Data di Nascita *</label>
+              <input type="date" name="minore_nascita" required>
+            </div>
+            <div class="form-group">
+              <label>Comune o Stato Estero di Nascita *</label>
+              <input type="text" name="minore_luogo" placeholder="Es. Bologna" required>
+            </div>
           </div>
+
           <div class="form-group">
-            <label>Luogo di Nascita *</label>
-            <input type="text" name="minore_luogo" placeholder="Es. Bologna" required>
+            <label>Eventuali allergie o note rilevanti (facoltativo)</label>
+            <textarea name="note_mediche" rows="2" placeholder="Indicazioni utili per gli operatori teatrali..."></textarea>
           </div>
-        </div>
 
-        <div class="form-group">
-          <label>Codice Fiscale Minore *</label>
-          <input type="text" name="minore_cf" placeholder="RSSMRA..." style="text-transform: uppercase;" required>
-        </div>
-
-        <div class="form-group">
-          <label>Indirizzo di Residenza *</label>
-          <input type="text" name="residenza_indirizzo" placeholder="Via, Numero, Città, CAP" required>
-        </div>
-
-        <div class="form-group">
-          <label>Laboratorio Teatrale Richiesto *</label>
-          <select name="corso_id" required>
-            <option value="corso-teatro-ragazzi-2026">Laboratorio Teatrale Bambini &amp; Ragazzi (2026)</option>
-          </select>
-        </div>
-
-        <div class="btn-group">
-          <button type="button" class="btn btn-next" onclick="goToStep(2)">Avanti: Genitore / Tutore &rarr;</button>
-        </div>
-      </div>
-
-      <!-- STEP 2: TUTORE LEGALE -->
-      <div class="card" id="step-2" style="display: ${step === 2 ? 'block' : 'none'};">
-        <h2 class="card-title">2. Dati del Genitore o Tutore Legale</h2>
-        <p class="card-desc">Dati dell'esercente la responsabilità genitoriale che sottoscrive l'iscrizione.</p>
-
-        <div class="form-row">
-          <div class="form-group">
-            <label>Nome Tutore *</label>
-            <input type="text" name="tutore_nome">
-          </div>
-          <div class="form-group">
-            <label>Cognome Tutore *</label>
-            <input type="text" name="tutore_cognome">
+          <div class="step-actions">
+            <div></div>
+            <button type="button" class="btn-step" onclick="goToStep(2)">Avanti: Dati Genitore &rsaquo;</button>
           </div>
         </div>
 
-        <div class="form-row">
-          <div class="form-group">
-            <label>Codice Fiscale Tutore *</label>
-            <input type="text" name="tutore_cf" style="text-transform: uppercase;">
+        <!-- STEP 2: GENITORE / TUTORE -->
+        <div class="step-section" id="step2">
+          <h2 class="step-title">2. Dati del Genitore o Legale Rappresentante</h2>
+          <p class="step-desc">Recapiti ufficiali del tutore per delibera CD, comunicazioni istituzionali ed emergenze.</p>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label>Nome Genitore *</label>
+              <input type="text" name="tutore_nome" required>
+            </div>
+            <div class="form-group">
+              <label>Cognome Genitore *</label>
+              <input type="text" name="tutore_cognome" required>
+            </div>
           </div>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label>Codice Fiscale Genitore *</label>
+              <input type="text" name="tutore_cf" maxlength="16" required style="text-transform: uppercase;">
+            </div>
+            <div class="form-group">
+              <label>Grado di Parentela *</label>
+              <select name="grado_parentela">
+                <option value="Madre">Madre</option>
+                <option value="Padre">Padre</option>
+                <option value="Tutore Legale">Tutore Legale / Affidatario</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label>Telefono Cellulare *</label>
+              <input type="tel" name="tutore_telefono" placeholder="Es. 340 1234567" required>
+            </div>
+            <div class="form-group">
+              <label>Email Ufficiale *</label>
+              <input type="email" name="tutore_email" placeholder="nome@email.it" required>
+            </div>
+          </div>
+
           <div class="form-group">
-            <label>Grado di Parentela *</label>
-            <select name="grado_parentela">
-              <option value="Madre">Madre</option>
-              <option value="Padre">Padre</option>
-              <option value="Tutore Legale">Tutore Legale / Affidatario</option>
-            </select>
+            <label>Indirizzo di Residenza *</label>
+            <input type="text" name="tutore_residenza" placeholder="Via, Numero, CAP, Città" required>
+          </div>
+
+          <div class="step-actions">
+            <button type="button" class="btn-back" onclick="goToStep(1)">&lsaquo; Indietro</button>
+            <button type="button" class="btn-step" onclick="goToStep(3)">Avanti: Deleghe Ritiro &rsaquo;</button>
           </div>
         </div>
 
-        <div class="form-row">
-          <div class="form-group">
-            <label>Telefono Cellulare *</label>
-            <input type="tel" name="tutore_telefono" placeholder="+39 ...">
-          </div>
-          <div class="form-group">
-            <label>Indirizzo Email *</label>
-            <input type="email" name="tutore_email" placeholder="nome@esempio.it">
-          </div>
-        </div>
+        <!-- STEP 3: DELEGHE DI RITIRO (FACOLTATIVO) -->
+        <div class="step-section" id="step3">
+          <h2 class="step-title">3. Deleghe per il Ritiro dell'Allievo (Facoltativo)</h2>
+          <p class="step-desc">Persone maggiorenni autorizzate a prelevare il minore al termine delle attività teatrali oltre ai genitori.</p>
 
-        <div class="btn-group">
-          <button type="button" class="btn btn-prev" onclick="goToStep(1)">&larr; Indietro</button>
-          <button type="button" class="btn btn-next" onclick="goToStep(3)">Avanti: Deleghe Ritiro &rarr;</button>
-        </div>
-      </div>
-
-      <!-- STEP 3: DELEGHE AL RITIRO -->
-      <div class="card" id="step-3" style="display: ${step === 3 ? 'block' : 'none'};">
-        <h2 class="card-title">3. Deleghe al Ritiro del Minore (Facoltative)</h2>
-        <p class="card-desc">Indica fino a due persone maggiorenni autorizzate a ritirare il minore al termine delle lezioni.</p>
-
-        <div class="delega-box">
-          <h4>Delega N° 1</h4>
           <div class="form-row">
             <div class="form-group">
               <label>Nome Delegato</label>
-              <input type="text" name="delega1_nome" placeholder="Nome">
+              <input type="text" name="delega1_nome" placeholder="Es. Nonno / Zio">
             </div>
             <div class="form-group">
               <label>Cognome Delegato</label>
-              <input type="text" name="delega1_cognome" placeholder="Cognome">
+              <input type="text" name="delega1_cognome">
             </div>
           </div>
+
           <div class="form-row">
             <div class="form-group">
-              <label>Relazione / Grado di Parentela</label>
-              <input type="text" name="delega1_relazione" placeholder="Es. Nonno, Zio, Amico di famiglia">
+              <label>Telefono Delegato</label>
+              <input type="tel" name="delega1_telefono">
             </div>
             <div class="form-group">
-              <label>Telefono</label>
-              <input type="tel" name="delega1_telefono" placeholder="+39 ...">
+              <label>Relazione di Parentela</label>
+              <input type="text" name="delega1_relazione" placeholder="Es. Nonna / Babysitter">
             </div>
+          </div>
+
+          <div class="step-actions">
+            <button type="button" class="btn-back" onclick="goToStep(2)">&lsaquo; Indietro</button>
+            <button type="button" class="btn-step" onclick="goToStep(4)">Avanti: Statuto & Privacy &rsaquo;</button>
           </div>
         </div>
 
-        <div class="delega-box">
-          <h4>Delega N° 2 (Opzionale)</h4>
-          <div class="form-row">
-            <div class="form-group">
-              <label>Nome Delegato</label>
-              <input type="text" name="delega2_nome">
-            </div>
-            <div class="form-group">
-              <label>Cognome Delegato</label>
-              <input type="text" name="delega2_cognome">
-            </div>
+        <!-- STEP 4: STATUTO & PRIVACY -->
+        <div class="step-section" id="step4">
+          <h2 class="step-title">4. Norme Sociali, Statuto e Consensi</h2>
+          <p class="step-desc">Dichiarazioni necessarie per la richiesta formale di ammissione all'APS teatrale e tutela minori.</p>
+
+          <div class="checkbox-box">
+            <input type="checkbox" name="accettazione_statuto" id="chkStatuto" required>
+            <label for="chkStatuto" class="checkbox-label">
+              <strong>Richiesta di Ammissione & Statuto APS *</strong><br>
+              In qualità di esercente la responsabilità genitoriale, richiedo formalmente l'ammissione a socio ordinario di Cervelli in Affitto APS per il minore, dichiarando di conoscere e rispettare lo Statuto e i regolamenti associativi.
+            </label>
           </div>
-          <div class="form-row">
-            <div class="form-group">
-              <label>Relazione</label>
-              <input type="text" name="delega2_relazione">
-            </div>
-            <div class="form-group">
-              <label>Telefono</label>
-              <input type="tel" name="delega2_telefono">
-            </div>
+
+          <div class="checkbox-box">
+            <input type="checkbox" name="consenso_privacy" id="chkPrivacy" required>
+            <label for="chkPrivacy" class="checkbox-label">
+              <strong>Trattamento Dati Personali (GDPR) *</strong><br>
+              Autorizzo il trattamento dei dati personali del minore e del genitore per le finalità istituzionali dell'APS, la tenuta del Libro Soci e il tesseramento assicurativo nazionale UILT.
+            </label>
+          </div>
+
+          <div class="checkbox-box">
+            <input type="checkbox" name="consenso_foto_video" id="chkFoto">
+            <label for="chkFoto" class="checkbox-label">
+              <strong>Liberatoria Foto e Video (Facoltativo)</strong><br>
+              Autorizzo la ripresa di immagini e video durante i laboratori e i saggi teatrali a esclusivo uso di archivio, rassegne culturali e canali social ufficiali dell'associazione (senza cessione a terzi a scopo di lucro).
+            </label>
+          </div>
+
+          <div class="step-actions">
+            <button type="button" class="btn-back" onclick="goToStep(3)">&lsaquo; Indietro</button>
+            <button type="button" class="btn-step" onclick="goToStep(5)">Avanti: Riepilogo & Invia &rsaquo;</button>
           </div>
         </div>
 
-        <div class="btn-group">
-          <button type="button" class="btn btn-prev" onclick="goToStep(2)">&larr; Indietro</button>
-          <button type="button" class="btn btn-next" onclick="goToStep(4)">Avanti: Consensi &rarr;</button>
-        </div>
-      </div>
+        <!-- STEP 5: RIEPILOGO & CONFERMA -->
+        <div class="step-section" id="step5">
+          <h2 class="step-title">5. Riepilogo Domanda di Ammissione</h2>
+          <p class="step-desc">Verifica la correttezza dei dati prima dell'invio formale al Consiglio Direttivo.</p>
 
-      <!-- STEP 4: STATUTO & PRIVACY -->
-      <div class="card" id="step-4" style="display: ${step === 4 ? 'block' : 'none'};">
-        <h2 class="card-title">4. Statuto Sociale &amp; Consensi Obbligatori</h2>
-        <p class="card-desc">L'iscrizione ai corsi comporta la richiesta di ammissione a Socio Ordinario dell'APS, affiliata UILT.</p>
+          <div id="reviewContainer" style="margin-bottom: 24px;"></div>
 
-        <div class="doc-preview">
-          <strong>Estratto Statuto Sociale e Affiliazione UILT:</strong><br>
-          Il richiedente dichiara di condividere le finalità dell'Associazione di Promozione Sociale Cervelli in Affitto e si impegna a osservarne lo Statuto, i regolamenti interni e le deliberazioni degli organi sociali. L'ammissione è subordinata alla ratifica del Consiglio Direttivo e include la copertura assicurativa UILT.
-        </div>
+          <div style="background: #ECFDF5; border: 1px solid #A7F3D0; padding: 14px; border-radius: 8px; font-size: 13px; color: #065F46; margin-bottom: 20px;">
+            ℹ️ <strong>Cosa succede dopo:</strong> La richiesta verrà sottoposta alla delibera del Consiglio Direttivo. Riceverai conferma via email con le istruzioni per il saldo della quota sociale annuale e l'accesso all'area personale.
+          </div>
 
-        <div class="checkbox-group">
-          <input type="checkbox" id="check_statuto" name="accettazione_statuto" value="1" required>
-          <label for="check_statuto"><strong>Dichiaro di aver preso visione dello Statuto</strong> dell'APS e di accettarne integralmente le disposizioni (Obbligatorio per ammissione socio). *</label>
+          <div class="step-actions">
+            <button type="button" class="btn-back" onclick="goToStep(4)">&lsaquo; Indietro</button>
+            <button type="submit" class="btn-step" style="background: #10B981; color: #FFF;">Invia Domanda Ufficiale</button>
+          </div>
         </div>
 
-        <div class="checkbox-group">
-          <input type="checkbox" id="check_privacy" name="consenso_privacy" value="1" required>
-          <label for="check_privacy"><strong>Consenso Privacy GDPR:</strong> Autorizzo il trattamento dei dati personali del minore e del genitore per le finalità associative e assicurative UILT. *</label>
-        </div>
-
-        <div class="checkbox-group">
-          <input type="checkbox" id="check_foto" name="consenso_foto_video" value="1">
-          <label for="check_foto"><strong>Liberatoria Foto e Video:</strong> Autorizzo la realizzazione di foto e registrazioni video delle attività didattiche e dei saggi teatrali a uso documentativo e promozionale dell'APS (Facoltativo).</label>
-        </div>
-
-        <div class="checkbox-group">
-          <input type="checkbox" id="check_news" name="consenso_newsletter" value="1">
-          <label for="check_news">Desidero ricevere comunicazioni su spettacoli, rassegne ed eventi teatrali dell'APS.</label>
-        </div>
-
-        <div class="btn-group">
-          <button type="button" class="btn btn-prev" onclick="goToStep(3)">&larr; Indietro</button>
-          <button type="button" class="btn btn-next" onclick="populateReview(); goToStep(5)">Avanti: Riepilogo &rarr;</button>
-        </div>
-      </div>
-
-      <!-- STEP 5: RIEPILOGO & INVIO -->
-      <div class="card" id="step-5" style="display: ${step === 5 ? 'block' : 'none'};">
-        <h2 class="card-title">5. Riepilogo Domanda &amp; Sottoscrizione</h2>
-        <p class="card-desc">Verifica i dati inseriti prima di inoltrare ufficialmente la richiesta al Consiglio Direttivo.</p>
-
-        <div id="reviewContainer"></div>
-
-        <div style="background: #ECFDF5; border: 1px solid #A7F3D0; padding: 14px; border-radius: 8px; margin-top: 20px; font-size: 12.5px; color: #065F46;">
-          <strong>Cosa succede dopo l'invio?</strong><br>
-          La domanda verrà protocollata nel registro ammissioni e sottoposta alla prima seduta utile del Consiglio Direttivo per l'assegnazione del numero di tessera APS e la registrazione nel circuito UILT.
-        </div>
-
-        <div class="btn-group">
-          <button type="button" class="btn btn-prev" onclick="goToStep(4)">&larr; Modifica Dati</button>
-          <button type="submit" class="btn btn-submit">Conferma &amp; Invia Domanda Ufficiale</button>
-        </div>
-      </div>
-    </form>
+      </form>
+    </div>
   </div>
 
   <footer class="pub-footer">
-    Cervelli in Affitto APS • Sede Legale: Bologna • Dominio: cervellinaffitto-aps.it • Affiliato UILT
+    ${theme.nome_associazione} • Sede Legale: Bologna • Dominio: ${theme.dominio_ufficiale} • Affiliato UILT
   </footer>
 
   <script>
     function goToStep(s) {
-      for (let i = 1; i <= 5; i++) {
-        const el = document.getElementById('step-' + i);
-        if (el) el.style.display = (i === s) ? 'block' : 'none';
+      if (s === 5) {
+        populateReview();
       }
+      const sections = document.querySelectorAll('.step-section');
+      sections.forEach((sec, idx) => {
+        sec.classList.remove('active');
+        if (idx + 1 === s) sec.classList.add('active');
+      });
+
       const circles = document.querySelectorAll('.step-item');
       circles.forEach((item, idx) => {
         const num = idx + 1;
@@ -2889,12 +2628,12 @@ function renderPublicWizard(step, isSuccess, params, settings = {}) {
         { label: "Consenso Foto/Video", val: f.get("consenso_foto_video") ? "Autorizzato" : "Non autorizzato" }
       ];
 
-      container.innerHTML = items.map(it => `
-        <div class="review-row">
-          <span class="review-label">\${it.label}</span>
-          <span class="review-val">\${it.val}</span>
-        </div>
-      `).join("");
+      container.innerHTML = items.map(function(it) {
+        return "<div class=\"review-row\">" +
+          "<span class=\"review-label\">" + it.label + "</span>" +
+          "<span class=\"review-val\">" + it.val + "</span>" +
+        "</div>";
+      }).join("");
     }
   </script>
 </body>
@@ -2911,7 +2650,7 @@ function renderSuccessPage(nomeSocio) {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Iscrizione Ricevuta • Cervelli in Affitto APS</title>
+  <title>Richiesta Registrata • Cervelli in Affitto APS</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -2919,7 +2658,7 @@ function renderSuccessPage(nomeSocio) {
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
       font-family: 'Plus Jakarta Sans', sans-serif;
-      background: #09090B;
+      background: #121214;
       color: #FAFAFA;
       min-height: 100vh;
       display: flex;
@@ -2930,74 +2669,49 @@ function renderSuccessPage(nomeSocio) {
     .success-card {
       background: #18181B;
       border: 1px solid #27272A;
-      border-radius: 12px;
-      max-width: 520px;
-      width: 100%;
+      border-radius: 16px;
       padding: 40px 32px;
+      width: 100%;
+      max-width: 520px;
       text-align: center;
+      box-shadow: 0 20px 40px -15px rgba(0,0,0,0.7);
     }
-    .check-icon {
+    .success-icon {
       width: 64px;
       height: 64px;
       background: #10B98122;
-      border: 1px solid #10B98144;
-      color: #34D399;
+      color: #10B981;
       border-radius: 50%;
       display: flex;
       align-items: center;
       justify-content: center;
-      margin: 0 auto 20px auto;
-      font-size: 28px;
+      margin: 0 auto 20px;
+      border: 2px solid #10B981;
     }
-    h1 {
-      font-size: 22px;
-      font-weight: 700;
-      margin-bottom: 12px;
-      color: #FFF;
-    }
-    p {
-      font-size: 14px;
-      color: #A1A1AA;
-      line-height: 1.6;
-      margin-bottom: 24px;
-    }
-    .next-box {
-      background: #121214;
-      border: 1px solid #27272A;
-      border-radius: 8px;
-      padding: 16px;
-      text-align: left;
-      font-size: 13px;
-      color: #D4D4D8;
-      margin-bottom: 28px;
-    }
+    h1 { font-size: 22px; font-weight: 700; color: #FFF; margin-bottom: 12px; }
+    p { font-size: 14px; color: #A1A1AA; line-height: 1.6; margin-bottom: 24px; }
     .btn-home {
       display: inline-block;
       background: #D98295;
       color: #121214;
       font-weight: 700;
-      padding: 12px 28px;
-      border-radius: 6px;
-      text-decoration: none;
       font-size: 14px;
+      padding: 12px 24px;
+      border-radius: 8px;
+      text-decoration: none;
     }
   </style>
 </head>
 <body>
   <div class="success-card">
-    <div class="check-icon">✓</div>
+    <div class="success-icon">
+      <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>
+    </div>
     <h1>Richiesta Inviata con Successo!</h1>
     <p>
-      La domanda di ammissione e iscrizione per <strong>${nomeSocio}</strong> è stata registrata correttamente nel sistema di Cervelli in Affitto APS.
+      La domanda di ammissione per <strong>${nomeSocio}</strong> è stata acquisita e inserita all'ordine del giorno del Consiglio Direttivo.<br><br>
+      A seguito della delibera formale riceverai comunicazione via email con la conferma del tesseramento e le indicazioni per la frequenza al laboratorio teatrale.
     </p>
-    <div class="next-box">
-      <strong>Prossimi Passaggi:</strong>
-      <ol style="padding-left: 18px; margin-top: 8px; line-height: 1.6;">
-        <li>Il Consiglio Direttivo esaminerà e delibererà la richiesta nella prima riunione utile.</li>
-        <li>Verrà generato il numero di tessera sociale APS.</li>
-        <li>Riceverai via email la conferma e la tessera assicurativa UILT.</li>
-      </ol>
-    </div>
     <a href="/" class="btn-home">Torna alla Pagina Iniziale</a>
   </div>
 </body>
@@ -3006,120 +2720,4 @@ function renderSuccessPage(nomeSocio) {
   return new Response(html, {
     headers: { "Content-Type": "text/html; charset=utf-8" }
   });
-}
-
-/* =========================================================================
-   BACKEND: SALVATAGGIO ISCRIZIONE MINORI SU D1
-   ========================================================================= */
-
-async function handleIscrizionePost(request, env, url) {
-  try {
-    const formData = await request.formData();
-
-    // Dati Minore
-    const minoreNome = (formData.get("minore_nome") || "").toString().trim();
-    const minoreCognome = (formData.get("minore_cognome") || "").toString().trim();
-    const minoreNascita = (formData.get("minore_nascita") || "").toString().trim();
-    const minoreLuogo = (formData.get("minore_luogo") || "").toString().trim();
-    const minoreCf = (formData.get("minore_cf") || "").toString().trim().toUpperCase();
-    const residenzaIndirizzo = (formData.get("residenza_indirizzo") || "").toString().trim();
-    const corsoId = (formData.get("corso_id") || DEFAULT_CORSO_ID).toString().trim();
-
-    // Dati Tutore
-    const tutoreNome = (formData.get("tutore_nome") || "").toString().trim();
-    const tutoreCognome = (formData.get("tutore_cognome") || "").toString().trim();
-    const tutoreCf = (formData.get("tutore_cf") || "").toString().trim().toUpperCase();
-    const gradoParentela = (formData.get("grado_parentela") || "Genitore").toString().trim();
-    const tutoreTelefono = (formData.get("tutore_telefono") || "").toString().trim();
-    const tutoreEmail = (formData.get("tutore_email") || "").toString().trim().toLowerCase();
-
-    // Deleghe al Ritiro
-    const delega1Nome = (formData.get("delega1_nome") || "").toString().trim();
-    const delega1Cognome = (formData.get("delega1_cognome") || "").toString().trim();
-    const delega1Relazione = (formData.get("delega1_relazione") || "").toString().trim();
-    const delega1Telefono = (formData.get("delega1_telefono") || "").toString().trim();
-
-    const delega2Nome = (formData.get("delega2_nome") || "").toString().trim();
-    const delega2Cognome = (formData.get("delega2_cognome") || "").toString().trim();
-    const delega2Relazione = (formData.get("delega2_relazione") || "").toString().trim();
-    const delega2Telefono = (formData.get("delega2_telefono") || "").toString().trim();
-
-    // Consensi
-    const statuto = formData.get("accettazione_statuto") === "1" ? 1 : 0;
-    const privacy = formData.get("consenso_privacy") === "1" ? 1 : 0;
-    const foto = formData.get("consenso_foto_video") === "1" ? 1 : 0;
-    const newsletter = formData.get("consenso_newsletter") === "1" ? 1 : 0;
-
-    if (!minoreNome || !minoreCognome || !minoreCf || !tutoreNome || !tutoreCognome || !tutoreEmail) {
-      return new Response("Campi obbligatori mancanti.", { status: 400 });
-    }
-
-    // 1. Inserimento o recupero Tutore Legale
-    let tutoreId = null;
-    const existingTutore = await env.DB.prepare(
-      "SELECT id FROM tutori WHERE email = ? OR (codice_fiscale = ? AND codice_fiscale != '')"
-    ).bind(tutoreEmail, tutoreCf).first();
-
-    if (existingTutore) {
-      tutoreId = existingTutore.id;
-    } else {
-      const tutoreRes = await env.DB.prepare(`
-        INSERT INTO tutori (nome, cognome, codice_fiscale, telefono, email, grado_parentela)
-        VALUES (?, ?, ?, ?, ?, ?)
-      `).bind(tutoreNome, tutoreCognome, tutoreCf, tutoreTelefono, tutoreEmail, gradoParentela).run();
-      tutoreId = tutoreRes.meta.last_row_id;
-    }
-
-    // 2. Inserimento Socio Minore (in_attesa di delibera del Direttivo)
-    const socioRes = await env.DB.prepare(`
-      INSERT INTO soci (
-        nome, cognome, codice_fiscale, data_nascita, luogo_nascita,
-        residenza_indirizzo, tutore_id, is_minore, tipologia, stato_richiesta, data_domanda
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, 'ordinario', 'in_attesa', datetime('now'))
-    `).bind(
-      minoreNome, minoreCognome, minoreCf, minoreNascita, minoreLuogo,
-      residenzaIndirizzo, tutoreId
-    ).run();
-
-    const socioId = socioRes.meta.last_row_id;
-
-    // 3. Registrazione Consensi Privacy
-    await env.DB.prepare(`
-      INSERT INTO consensi_privacy (
-        socio_id, accettazione_statuto, consenso_trattamento_dati,
-        consenso_foto_video, consenso_newsletter
-      ) VALUES (?, ?, ?, ?, ?)
-    `).bind(socioId, statuto, privacy, foto, newsletter).run();
-
-    // 4. Registrazione Deleghe al Ritiro (se compilate)
-    if (delega1Nome && delega1Cognome) {
-      await env.DB.prepare(`
-        INSERT INTO deleghe_ritiro (socio_minore_id, nome, cognome, telefono, relazione)
-        VALUES (?, ?, ?, ?, ?)
-      `).bind(socioId, delega1Nome, delega1Cognome, delega1Telefono, delega1Relazione).run();
-    }
-
-    if (delega2Nome && delega2Cognome) {
-      await env.DB.prepare(`
-        INSERT INTO deleghe_ritiro (socio_minore_id, nome, cognome, telefono, relazione)
-        VALUES (?, ?, ?, ?, ?)
-      `).bind(socioId, delega2Nome, delega2Cognome, delega2Telefono, delega2Relazione).run();
-    }
-
-    // 5. Iscrizione al Corso Teatrale (con garanzia presenza attività in D1)
-    await env.DB.prepare(`
-      INSERT OR IGNORE INTO attivita_eventi (id, titolo, tipo, descrizione)
-      VALUES (?, 'Laboratorio Teatrale Bambini & Ragazzi', 'corso', 'Laboratorio teatrale annuale per allievi minori')
-    `).bind(corsoId).run();
-
-    await env.DB.prepare(`
-      INSERT INTO iscrizioni_corsi (socio_id, attivita_id, stato_iscrizione)
-      VALUES (?, ?, 'confermata')
-    `).bind(socioId, corsoId).run();
-
-    return Response.redirect(`${url.origin}/?success=1&socio=${encodeURIComponent(minoreNome)}`, 303);
-  } catch (e) {
-    console.error("Errore salvataggio iscrizione:", e);
-    return new Response(`Errore salvataggio iscrizione: ${e.message}`, { status: 500 });
-  }
 }
