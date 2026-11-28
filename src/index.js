@@ -1,7 +1,8 @@
 /**
  * Cervelli in Affitto APS - Piattaforma Gestionale
  * - Portale Pubblico: Modulo Iscrizione Corsi Minori & Domanda Socio (Wizard a 5 step)
- * - Area Riservata (/admin): Dashboard Generale, Pagine HUB Macro-Aree a Tessere e Delibera CD
+ * - Area Riservata (/admin): Dashboard Generale, Pagine HUB Macro-Aree e Delibera CD
+ * - Builder del Tema & Identità Visiva (Macro-Area 4.2) collegato a Cloudflare D1
  * Affiliato UILT - Unione Italiana Libero Teatro
  */
 
@@ -30,7 +31,7 @@ export default {
       }
     }
 
-    // 2. Sezione Amministrazione (/admin)
+    // 2. Area Amministrativa e di Gestione (/admin)
     if (url.pathname.startsWith("/admin")) {
       return handleAdminRoutes(request, env, url);
     }
@@ -40,16 +41,88 @@ export default {
       return handleIscrizionePost(request, env, url);
     }
 
-    // 4. Portale Pubblico: Visualizzazione Wizard 5 Step
+    // 4. Portale Pubblico: Visualizzazione Wizard 5 Step (legge i colori e il logo da D1)
     if (url.pathname === "/" || url.pathname === "/iscrizione-minori") {
       const step = parseInt(url.searchParams.get("step") || "1", 10);
       const isSuccess = url.searchParams.get("success") === "1";
-      return renderPublicWizard(step, isSuccess, url.searchParams);
+      const settings = await getImpostazioni(env);
+      return renderPublicWizard(step, isSuccess, url.searchParams, settings);
     }
 
     return new Response("Pagina non trovata", { status: 404 });
   }
 };
+
+/* =========================================================================
+   GESTIONE IMPOSTAZIONI TEMA E IDENTITÀ D1
+   ========================================================================= */
+
+async function getImpostazioni(env) {
+  const defaults = {
+    nome_aps: "Cervelli in Affitto APS",
+    dominio_ufficiale: "cervellinaffitto-aps.it",
+    logo_url: "",
+    colore_primario: "#D98295",
+    colore_sfondo: "#121214",
+    colore_card: "#18181B",
+    colore_macro_1: "#D98295",
+    colore_macro_2: "#60A5FA",
+    colore_macro_3: "#F59E0B",
+    colore_macro_4: "#A78BFA",
+    colore_macro_5: "#34D399",
+    scala_caratteri: "normale",
+    email_contatto: "info@cervellinaffitto-aps.it"
+  };
+
+  try {
+    const { results } = await env.DB.prepare("SELECT chiave, valore FROM impostazioni_gestionale").all();
+    if (results && results.length > 0) {
+      results.forEach(row => {
+        if (row.valore !== undefined && row.valore !== null && row.valore !== "") {
+          defaults[row.chiave] = row.valore;
+        }
+      });
+    }
+  } catch (e) {
+    console.warn("Impostazioni non trovate in D1, uso valori di default:", e);
+  }
+
+  return defaults;
+}
+
+async function handleSalvaTemaPost(request, env, user) {
+  try {
+    const formData = await request.formData();
+    const chiavi = [
+      'nome_aps', 'dominio_ufficiale', 'email_contatto', 'logo_url',
+      'colore_primario', 'colore_sfondo', 'colore_card',
+      'colore_macro_1', 'colore_macro_2', 'colore_macro_3', 'colore_macro_4', 'colore_macro_5',
+      'scala_caratteri'
+    ];
+
+    const statements = chiavi.map(chiave => {
+      const val = (formData.get(chiave) || "").toString().trim();
+      return env.DB.prepare(`
+        INSERT INTO impostazioni_gestionale (chiave, valore, updated_at)
+        VALUES (?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(chiave) DO UPDATE SET valore = excluded.valore, updated_at = CURRENT_TIMESTAMP
+      `).bind(chiave, val);
+    });
+
+    await env.DB.batch(statements);
+
+    return new Response(null, {
+      status: 302,
+      headers: { Location: "/admin?view=theme-builder&msg=tema_salvato" }
+    });
+  } catch (e) {
+    console.error("Errore salvataggio tema:", e);
+    return new Response(null, {
+      status: 302,
+      headers: { Location: `/admin?view=theme-builder&msg=err_salvataggio&err=${encodeURIComponent(e.message)}` }
+    });
+  }
+}
 
 /* =========================================================================
    ROUTER AREA AMMINISTRATIVA
@@ -69,6 +142,15 @@ async function handleAdminRoutes(request, env, url) {
   // Logout GET
   if (url.pathname === "/admin/logout") {
     return handleLogout(request, env);
+  }
+
+  // Salvataggio Builder Tema POST (Macro-Area 4.2)
+  if (url.pathname === "/admin/salva-tema" && request.method === "POST") {
+    const session = await getAdminSession(request, env);
+    if (!session) {
+      return new Response(null, { status: 302, headers: { Location: "/admin" } });
+    }
+    return handleSalvaTemaPost(request, env, session.user);
   }
 
   // Delibera Consiglio Direttivo POST
@@ -119,6 +201,7 @@ async function hashPassword(password) {
     false,
     ["deriveBits", "deriveKey"]
   );
+
   const derivedKey = await crypto.subtle.deriveKey(
     {
       name: "PBKDF2",
@@ -127,30 +210,28 @@ async function hashPassword(password) {
       hash: "SHA-256"
     },
     keyMaterial,
-    { name: "HMAC", hash: "SHA-256", length: 256 },
+    { name: "AES-GCM", length: 256 },
     true,
-    ["sign"]
+    ["encrypt", "decrypt"]
   );
-  const exported = await crypto.subtle.exportKey("raw", derivedKey);
-  return Array.from(new Uint8Array(exported))
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
+
+  const rawKey = await crypto.subtle.exportKey("raw", derivedKey);
+  const hashArray = Array.from(new Uint8Array(rawKey));
+  return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 function generateSessionToken() {
   const bytes = new Uint8Array(32);
   crypto.getRandomValues(bytes);
-  return Array.from(bytes)
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
+  return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 async function getAdminSession(request, env) {
   const cookieHeader = request.headers.get("Cookie") || "";
   const match = cookieHeader.match(new RegExp(`${COOKIE_NAME}=([^;]+)`));
   if (!match) return null;
-  const token = match[1];
 
+  const token = match[1];
   try {
     const session = await env.DB.prepare(`
       SELECT s.token, s.scadenza, u.id, u.email, u.nome, u.cognome, u.ruolo
@@ -177,25 +258,6 @@ async function getAdminSession(request, env) {
   }
 }
 
-async function handleLogout(request, env) {
-  const cookieHeader = request.headers.get("Cookie") || "";
-  const match = cookieHeader.match(new RegExp(`${COOKIE_NAME}=([^;]+)`));
-  if (match) {
-    try {
-      await env.DB.prepare("DELETE FROM sessioni_admin WHERE token = ?").bind(match[1]).run();
-    } catch (e) {
-      console.warn("Errore eliminazione sessione:", e);
-    }
-  }
-  return new Response(null, {
-    status: 302,
-    headers: {
-      Location: "/admin",
-      "Set-Cookie": `${COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0; Secure`
-    }
-  });
-}
-
 async function handleSetupPost(request, env) {
   try {
     const formData = await request.formData();
@@ -204,25 +266,30 @@ async function handleSetupPost(request, env) {
     const email = (formData.get("email") || "").toString().trim().toLowerCase();
     const password = (formData.get("password") || "").toString();
 
-    if (!nome || !cognome || !email || password.length < 8) {
-      return renderSetupPage("Tutti i campi sono obbligatori (password min 8 caratteri).");
+    if (!nome || !cognome || !email || !password) {
+      return renderSetupPage("Tutti i campi sono obbligatori.");
     }
 
-    const adminCheck = await env.DB.prepare(
+    if (password.length < 8) {
+      return renderSetupPage("La password deve avere almeno 8 caratteri.");
+    }
+
+    const checkAdmin = await env.DB.prepare(
       "SELECT id FROM utenti_gestionale WHERE ruolo = 'super_admin' LIMIT 1"
     ).first();
-    if (adminCheck) {
-      return new Response(null, { status: 302, headers: { Location: "/admin" } });
+
+    if (checkAdmin) {
+      return new Response(null, { status: 302, headers: { Location: "/admin/login" } });
     }
 
-    const userId = "usr-admin-" + Date.now();
-    const passwordHash = await hashPassword(password);
+    const passHash = await hashPassword(password);
 
-    await env.DB.prepare(`
-      INSERT INTO utenti_gestionale (id, email, password_hash, nome, cognome, ruolo, attivo)
-      VALUES (?, ?, ?, ?, ?, 'super_admin', 1)
-    `).bind(userId, email, passwordHash, nome, cognome).run();
+    const result = await env.DB.prepare(`
+      INSERT INTO utenti_gestionale (nome, cognome, email, password_hash, ruolo, attivo)
+      VALUES (?, ?, ?, ?, 'super_admin', 1)
+    `).bind(nome, cognome, email, passHash).run();
 
+    const userId = result.meta.last_row_id;
     const sessionToken = generateSessionToken();
     await env.DB.prepare(`
       INSERT INTO sessioni_admin (token, utente_id, scadenza)
@@ -238,7 +305,7 @@ async function handleSetupPost(request, env) {
     });
   } catch (e) {
     console.error("Errore setup admin:", e);
-    return renderSetupPage(`Errore durante la creazione: ${e.message}`);
+    return renderSetupPage(`Errore: ${e.message}`);
   }
 }
 
@@ -249,20 +316,23 @@ async function handleLoginPost(request, env) {
     const password = (formData.get("password") || "").toString();
 
     if (!email || !password) {
-      return renderLoginPage("Inserisci sia email che password.");
+      return renderLoginPage("Inserisci email e password.");
     }
 
-    const user = await env.DB.prepare(
-      "SELECT id, email, password_hash, nome, cognome, attivo FROM utenti_gestionale WHERE email = ?"
-    ).bind(email).first();
+    const passHash = await hashPassword(password);
 
-    if (!user || user.attivo !== 1) {
-      return renderLoginPage("Credenziali non valide o utente disattivato.");
+    const user = await env.DB.prepare(`
+      SELECT id, nome, cognome, email, ruolo, attivo
+      FROM utenti_gestionale
+      WHERE email = ? AND password_hash = ?
+    `).bind(email, passHash).first();
+
+    if (!user) {
+      return renderLoginPage("Credenziali non valide o utente inesistente.");
     }
 
-    const hashedInput = await hashPassword(password);
-    if (hashedInput !== user.password_hash) {
-      return renderLoginPage("Credenziali non valide.");
+    if (user.attivo !== 1) {
+      return renderLoginPage("Questo account è disattivato. Contatta l'amministratore.");
     }
 
     const sessionToken = generateSessionToken();
@@ -270,10 +340,6 @@ async function handleLoginPost(request, env) {
       INSERT INTO sessioni_admin (token, utente_id, scadenza)
       VALUES (?, ?, datetime('now', '+7 days'))
     `).bind(sessionToken, user.id).run();
-
-    await env.DB.prepare(
-      "UPDATE utenti_gestionale SET ultimo_accesso = datetime('now') WHERE id = ?"
-    ).bind(user.id).run();
 
     return new Response(null, {
       status: 302,
@@ -306,10 +372,10 @@ async function handleDeliberaPost(request, env, user) {
     if (!numeroTessera) {
       const year = new Date().getFullYear();
       const countRow = await env.DB.prepare(
-        "SELECT COUNT(*) as tot FROM soci WHERE anno_adesione = ? AND stato_richiesta = 'approvato'"
-      ).bind(year).first();
-      const nextNum = (countRow ? countRow.tot : 0) + 1;
-      numeroTessera = `${year}-${String(nextNum).padStart(3, "0")}`;
+        "SELECT COUNT(*) as c FROM soci WHERE stato_richiesta = 'approvato'"
+      ).first();
+      const progressive = ((countRow ? countRow.c : 0) + 1).toString().padStart(3, "0");
+      numeroTessera = `${year}-${progressive}`;
     }
 
     await env.DB.prepare(`
@@ -319,7 +385,7 @@ async function handleDeliberaPost(request, env, user) {
         data_delibera = ?,
         numero_verbale = ?,
         numero_tessera_aps = ?,
-        updated_at = datetime('now')
+        updated_at = CURRENT_TIMESTAMP
       WHERE id = ?
     `).bind(dataDelibera, numeroVerbale, numeroTessera, socioId).run();
 
@@ -328,25 +394,43 @@ async function handleDeliberaPost(request, env, user) {
       headers: { Location: "/admin?view=domande&msg=delibera_ok" }
     });
   } catch (e) {
-    console.error("Errore delibera CD:", e);
-    return new Response(null, {
-      status: 302,
-      headers: { Location: "/admin?view=domande&msg=err_server" }
-    });
+    console.error("Errore ratifica delibera:", e);
+    return new Response("Errore delibera: " + e.message, { status: 500 });
   }
 }
 
+async function handleLogout(request, env) {
+  const cookieHeader = request.headers.get("Cookie") || "";
+  const match = cookieHeader.match(new RegExp(`${COOKIE_NAME}=([^;]+)`));
+  if (match) {
+    const token = match[1];
+    try {
+      await env.DB.prepare("DELETE FROM sessioni_admin WHERE token = ?").bind(token).run();
+    } catch (e) {
+      console.warn("Errore eliminazione token sessione:", e);
+    }
+  }
+
+  return new Response(null, {
+    status: 302,
+    headers: {
+      Location: "/admin/login",
+      "Set-Cookie": `${COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0; Secure`
+    }
+  });
+}
+
 /* =========================================================================
-   DIZIONARIO STRUTTURATO DELLE MACRO-AREE E SOTTOMENU (BIBBIA)
+   STRUTTURA E ARCHITETTURA UFFICIALE DELLE MACRO-AREE (BIBBIA)
    ========================================================================= */
 
 const MENU_SECTIONS = [
   {
     id: "macro-soci",
     titolo: "Soci & Libro Soci",
-    colore: "#D98295", // Rosa Corallo Brand
+    colore: "#D98295", // Rosa Cervello
     icona: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>`,
-    descrizione: "Gestione domande di ammissione, Libro Soci ufficiale, anagrafiche minori, quote sociali e tesseramento nazionale UILT.",
+    descrizione: "Gestione delibere di ammissione del Consiglio Direttivo, Libro Soci persistente, anagrafiche minori, tutori e affiliazione UILT.",
     voci: [
       { id: "domande", etichetta: "1.1 Domande Ammissione", desc: "Verifica e approvazione con data delibera, verbale CD e numero tessera APS." },
       { id: "registro-soci", etichetta: "1.2 Registro Libro Soci", desc: "Registro cronologico ufficiale dei soci con filtri di ricerca ed esportazione." },
@@ -357,7 +441,7 @@ const MENU_SECTIONS = [
   {
     id: "macro-corsi",
     titolo: "Attività & Corsi",
-    colore: "#06B6D4", // Ciano Teatrale
+    colore: "#60A5FA", // Blu Teatrale
     icona: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>`,
     descrizione: "Laboratori teatrali per bambini, ragazzi e adulti, registri allievi, quote di frequenza e foglio presenze.",
     voci: [
@@ -383,7 +467,7 @@ const MENU_SECTIONS = [
   {
     id: "macro-builder",
     titolo: "Builder & Contenuti",
-    colore: "#10B981", // Smeraldo Strumenti
+    colore: "#A78BFA", // Viola Strumenti
     icona: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>`,
     descrizione: "Strumenti per personalizzare logo, colori, moduli pubblici, modelli di tessere e comunicazioni email.",
     voci: [
@@ -396,7 +480,7 @@ const MENU_SECTIONS = [
   {
     id: "macro-sistema",
     titolo: "Sistema & Utenti",
-    colore: "#6366F1", // Indaco Sicurezza
+    colore: "#34D399", // Smeraldo Sicurezza
     icona: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>`,
     descrizione: "Controllo accessi per ruoli (Super Admin, Cassiere, Docente), dati fiscali APS, registro log e backup D1.",
     voci: [
@@ -413,9 +497,16 @@ const MENU_SECTIONS = [
    ========================================================================= */
 
 async function renderAdminDashboard(env, utente, url) {
-  // Se non c'è parametro view, il default ufficiale è la Dashboard Generale
   const currentView = url.searchParams.get("view") || "dashboard";
   const msgParam = url.searchParams.get("msg");
+  const settings = await getImpostazioni(env);
+
+  // Applica i colori dinamici delle macro-aree salvati in D1
+  if (MENU_SECTIONS[0]) MENU_SECTIONS[0].colore = settings.colore_macro_1 || "#D98295";
+  if (MENU_SECTIONS[1]) MENU_SECTIONS[1].colore = settings.colore_macro_2 || "#60A5FA";
+  if (MENU_SECTIONS[2]) MENU_SECTIONS[2].colore = settings.colore_macro_3 || "#F59E0B";
+  if (MENU_SECTIONS[3]) MENU_SECTIONS[3].colore = settings.colore_macro_4 || "#A78BFA";
+  if (MENU_SECTIONS[4]) MENU_SECTIONS[4].colore = settings.colore_macro_5 || "#34D399";
 
   let domande = [];
   try {
@@ -493,7 +584,7 @@ async function renderAdminDashboard(env, utente, url) {
   // Riconoscimento pagina corrente, titolo, macro-area e colore
   let currentTitle = "Dashboard Generale";
   let currentMacro = "Panoramica Associazione";
-  let currentMacroColor = "#D98295";
+  let currentMacroColor = settings.colore_primario || "#D98295";
   let currentMacroIcon = `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>`;
   let activeMacroId = null;
 
@@ -555,6 +646,10 @@ async function renderAdminDashboard(env, utente, url) {
     msgNotifica = `<div class="alert-box alert-success">Delibera Consiglio Direttivo registrata con successo! Il socio è stato approvato e tesserato.</div>`;
   } else if (msgParam === "err_campi") {
     msgNotifica = `<div class="alert-box alert-error">Compila tutti i campi obbligatori della delibera (Data, N° Verbale).</div>`;
+  } else if (msgParam === "tema_salvato") {
+    msgNotifica = `<div class="alert-box alert-success">Impostazioni grafiche e identità visiva salvate con successo in Cloudflare D1! Tutti i colori e i loghi sono stati aggiornati.</div>`;
+  } else if (msgParam === "err_salvataggio") {
+    msgNotifica = `<div class="alert-box alert-error">Errore durante il salvataggio su D1: ${url.searchParams.get("err") || "Errore sconosciuto"}</div>`;
   }
 
   // Costruzione del Contenuto Principale (Workspace)
@@ -581,7 +676,7 @@ async function renderAdminDashboard(env, utente, url) {
         </div>
         <div class="stat-card">
           <div class="stat-label">SPETTACOLI &amp; CASSA</div>
-          <div class="stat-value" style="color: #D98295;">0 €</div>
+          <div class="stat-value" style="color: var(--brand-coral);">0 €</div>
           <div class="stat-sub">Incassi del mese corrente</div>
         </div>
       </div>
@@ -766,6 +861,250 @@ async function renderAdminDashboard(env, utente, url) {
       </div>
     `;
   }
+  // CASO: BUILDER TEMA & IDENTITÀ VISIVA (SEZIONE 4.2)
+  else if (currentView === "theme-builder") {
+    mainContentHtml = `
+      <form method="POST" action="/admin/salva-tema" class="theme-builder-form">
+        <div class="theme-grid">
+          <!-- SEZIONE A: IDENTITÀ APS & LOGO -->
+          <div class="card-table" style="margin-bottom: 24px;">
+            <div class="card-header-table">
+              <div>
+                <h3>Identità Ufficiale dell'Associazione</h3>
+                <p>Nome, dominio e collegamenti ufficiali visibili in intestazioni e comunicazioni</p>
+              </div>
+            </div>
+            <div style="padding: 24px; display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 20px;">
+              <div class="form-group-clean">
+                <label style="display: block; font-size: 13px; font-weight: 600; margin-bottom: 6px; color: #E4E4E7;">Denominazione APS</label>
+                <input type="text" name="nome_aps" value="${settings.nome_aps || ''}" required class="input-clean">
+              </div>
+              <div class="form-group-clean">
+                <label style="display: block; font-size: 13px; font-weight: 600; margin-bottom: 6px; color: #E4E4E7;">Dominio Web Ufficiale</label>
+                <input type="text" name="dominio_ufficiale" value="${settings.dominio_ufficiale || ''}" required class="input-clean">
+              </div>
+              <div class="form-group-clean">
+                <label style="display: block; font-size: 13px; font-weight: 600; margin-bottom: 6px; color: #E4E4E7;">Email Ufficiale di Contatto</label>
+                <input type="email" name="email_contatto" value="${settings.email_contatto || ''}" required class="input-clean">
+              </div>
+              <div class="form-group-clean">
+                <label style="display: block; font-size: 13px; font-weight: 600; margin-bottom: 6px; color: #E4E4E7;">URL Immagine Logo Ufficiale (PNG trasparente)</label>
+                <input type="url" name="logo_url" id="input_logo_url" value="${settings.logo_url || ''}" placeholder="https://..." class="input-clean" oninput="aggiornaAnteprimaLogo(this.value)">
+                <span style="font-size: 11px; color: #A1A1AA; margin-top: 4px; display: block;">Inserisci il link diretto al file immagine PNG trasparente del logo</span>
+              </div>
+            </div>
+            <div style="padding: 0 24px 24px 24px;">
+              <div style="display: flex; align-items: center; gap: 16px; background: #09090B; padding: 16px; border-radius: 8px; border: 1px dashed #3F3F46;">
+                <div id="preview_logo_box" style="width: 64px; height: 64px; display: flex; align-items: center; justify-content: center; background: #18181B; border-radius: 8px; border: 1px solid #27272A; overflow: hidden;">
+                  ${settings.logo_url ? `<img src="${settings.logo_url}" alt="Anteprima Logo" style="max-width: 100%; max-height: 100%; object-fit: contain;">` : `<span style="font-size: 10px; color: #71717A; text-align: center;">Nessun logo</span>`}
+                </div>
+                <div>
+                  <div style="font-weight: 600; font-size: 14px; color: #FAFAFA;">Anteprima Logo Ufficiale</div>
+                  <div style="font-size: 12px; color: #A1A1AA;">Il logo comparirà nella barra di navigazione e nell'intestazione dei moduli pubblici.</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- SEZIONE B: PALETTE GENERALE -->
+          <div class="card-table" style="margin-bottom: 24px;">
+            <div class="card-header-table">
+              <div>
+                <h3>Palette Colori Principale &amp; Sfondi</h3>
+                <p>Colori base del tema teatrale usati per sfondi, card e pulsanti primari</p>
+              </div>
+            </div>
+            <div style="padding: 24px; display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 20px;">
+              <div class="color-picker-box">
+                <label>Colore Primario Accenti (Rosa Corallo)</label>
+                <div class="color-input-wrapper">
+                  <input type="color" name="colore_primario" id="cp_primario" value="${settings.colore_primario || '#D98295'}" class="picker-native" onchange="document.getElementById('txt_primario').value = this.value; aggiornaLiveTheme();">
+                  <input type="text" id="txt_primario" value="${settings.colore_primario || '#D98295'}" class="input-hex" oninput="document.getElementById('cp_primario').value = this.value; aggiornaLiveTheme();">
+                </div>
+              </div>
+              <div class="color-picker-box">
+                <label>Colore Sfondo Generale</label>
+                <div class="color-input-wrapper">
+                  <input type="color" name="colore_sfondo" id="cp_sfondo" value="${settings.colore_sfondo || '#121214'}" class="picker-native" onchange="document.getElementById('txt_sfondo').value = this.value; aggiornaLiveTheme();">
+                  <input type="text" id="txt_sfondo" value="${settings.colore_sfondo || '#121214'}" class="input-hex" oninput="document.getElementById('cp_sfondo').value = this.value; aggiornaLiveTheme();">
+                </div>
+              </div>
+              <div class="color-picker-box">
+                <label>Colore Sfondo Card &amp; Riquadri</label>
+                <div class="color-input-wrapper">
+                  <input type="color" name="colore_card" id="cp_card" value="${settings.colore_card || '#18181B'}" class="picker-native" onchange="document.getElementById('txt_card').value = this.value; aggiornaLiveTheme();">
+                  <input type="text" id="txt_card" value="${settings.colore_card || '#18181B'}" class="input-hex" oninput="document.getElementById('cp_card').value = this.value; aggiornaLiveTheme();">
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- SEZIONE C: COLORI DISTINTIVI DELLE 5 MACRO-AREE -->
+          <div class="card-table" style="margin-bottom: 24px;">
+            <div class="card-header-table">
+              <div>
+                <h3>Colori Distintivi delle 5 Macro-Aree</h3>
+                <p>Ogni settore del gestionale ha il proprio accento cromatico visibile nella sidebar e nelle schede HUB</p>
+              </div>
+            </div>
+            <div style="padding: 24px; display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 18px;">
+              <div class="color-picker-box">
+                <label>1. Soci &amp; Libro Soci</label>
+                <div class="color-input-wrapper">
+                  <input type="color" name="colore_macro_1" id="cp_m1" value="${settings.colore_macro_1 || '#D98295'}" class="picker-native" onchange="document.getElementById('txt_m1').value = this.value; aggiornaLiveTheme();">
+                  <input type="text" id="txt_m1" value="${settings.colore_macro_1 || '#D98295'}" class="input-hex" oninput="document.getElementById('cp_m1').value = this.value; aggiornaLiveTheme();">
+                </div>
+              </div>
+              <div class="color-picker-box">
+                <label>2. Attività &amp; Corsi</label>
+                <div class="color-input-wrapper">
+                  <input type="color" name="colore_macro_2" id="cp_m2" value="${settings.colore_macro_2 || '#60A5FA'}" class="picker-native" onchange="document.getElementById('txt_m2').value = this.value; aggiornaLiveTheme();">
+                  <input type="text" id="txt_m2" value="${settings.colore_macro_2 || '#60A5FA'}" class="input-hex" oninput="document.getElementById('cp_m2').value = this.value; aggiornaLiveTheme();">
+                </div>
+              </div>
+              <div class="color-picker-box">
+                <label>3. Eventi, Teatro &amp; Casse</label>
+                <div class="color-input-wrapper">
+                  <input type="color" name="colore_macro_3" id="cp_m3" value="${settings.colore_macro_3 || '#F59E0B'}" class="picker-native" onchange="document.getElementById('txt_m3').value = this.value; aggiornaLiveTheme();">
+                  <input type="text" id="txt_m3" value="${settings.colore_macro_3 || '#F59E0B'}" class="input-hex" oninput="document.getElementById('cp_m3').value = this.value; aggiornaLiveTheme();">
+                </div>
+              </div>
+              <div class="color-picker-box">
+                <label>4. Builder &amp; Contenuti</label>
+                <div class="color-input-wrapper">
+                  <input type="color" name="colore_macro_4" id="cp_m4" value="${settings.colore_macro_4 || '#A78BFA'}" class="picker-native" onchange="document.getElementById('txt_m4').value = this.value; aggiornaLiveTheme();">
+                  <input type="text" id="txt_m4" value="${settings.colore_macro_4 || '#A78BFA'}" class="input-hex" oninput="document.getElementById('cp_m4').value = this.value; aggiornaLiveTheme();">
+                </div>
+              </div>
+              <div class="color-picker-box">
+                <label>5. Sistema &amp; Utenti</label>
+                <div class="color-input-wrapper">
+                  <input type="color" name="colore_macro_5" id="cp_m5" value="${settings.colore_macro_5 || '#34D399'}" class="picker-native" onchange="document.getElementById('txt_m5').value = this.value; aggiornaLiveTheme();">
+                  <input type="text" id="txt_m5" value="${settings.colore_macro_5 || '#34D399'}" class="input-hex" oninput="document.getElementById('cp_m5').value = this.value; aggiornaLiveTheme();">
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- SEZIONE D: TIPOGRAFIA E SCALA CARATTERI -->
+          <div class="card-table" style="margin-bottom: 24px;">
+            <div class="card-header-table">
+              <div>
+                <h3>Dimensione Caratteri &amp; Densità Visiva</h3>
+                <p>Regola la grandezza dei testi dell'intera interfaccia gestionale per il massimo comfort</p>
+              </div>
+            </div>
+            <div style="padding: 24px; display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px;">
+              <label class="radio-card ${settings.scala_caratteri === 'compatta' ? 'selected' : ''}">
+                <input type="radio" name="scala_caratteri" value="compatta" ${settings.scala_caratteri === 'compatta' ? 'checked' : ''} onchange="aggiornaRadioCards(this)">
+                <div class="radio-card-body">
+                  <div class="radio-card-title">Compatta (13px)</div>
+                  <div class="radio-card-desc">Massima quantità di dati a schermo su monitor e desktop.</div>
+                </div>
+              </label>
+              <label class="radio-card ${(!settings.scala_caratteri || settings.scala_caratteri === 'normale') ? 'selected' : ''}">
+                <input type="radio" name="scala_caratteri" value="normale" ${(!settings.scala_caratteri || settings.scala_caratteri === 'normale') ? 'checked' : ''} onchange="aggiornaRadioCards(this)">
+                <div class="radio-card-body">
+                  <div class="radio-card-title">Normale (14.5px)</div>
+                  <div class="radio-card-desc">Standard consigliato per equilibrio e perfetta leggibilità.</div>
+                </div>
+              </label>
+              <label class="radio-card ${settings.scala_caratteri === 'grande' ? 'selected' : ''}">
+                <input type="radio" name="scala_caratteri" value="grande" ${settings.scala_caratteri === 'grande' ? 'checked' : ''} onchange="aggiornaRadioCards(this)">
+                <div class="radio-card-body">
+                  <div class="radio-card-title">Grande / Alta Leggibilità (16px)</div>
+                  <div class="radio-card-desc">Testi grandi, campi ampi e massimo contrasto visivo.</div>
+                </div>
+              </label>
+            </div>
+          </div>
+
+          <!-- SEZIONE E: ANTEPRIMA DAL VIVO (LIVE PREVIEW) -->
+          <div class="card-table" style="margin-bottom: 24px;">
+            <div class="card-header-table">
+              <div>
+                <h3>Anteprima Dal Vivo • Componenti del Gestionale</h3>
+                <p>Verifica l'armonia dei colori prima di salvare le modifiche su D1</p>
+              </div>
+            </div>
+            <div style="padding: 24px;">
+              <div id="live_preview_container" style="background: ${settings.colore_sfondo || '#121214'}; padding: 24px; border-radius: 12px; border: 1px solid #27272A; display: flex; flex-wrap: wrap; gap: 20px; align-items: center;">
+                <div id="live_preview_card" style="background: ${settings.colore_card || '#18181B'}; border: 1px solid #27272A; border-radius: 10px; padding: 18px; width: 280px;">
+                  <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 12px;">
+                    <div id="live_preview_icon_box" style="width: 36px; height: 36px; border-radius: 8px; background: ${(settings.colore_macro_1 || '#D98295')}22; color: ${settings.colore_macro_1 || '#D98295'}; display: flex; align-items: center; justify-content: center; font-weight: 700;">★</div>
+                    <div style="font-weight: 700; font-size: 14px; color: #FAFAFA;">Esempio Scheda Hub</div>
+                  </div>
+                  <div style="font-size: 12px; color: #A1A1AA; line-height: 1.4; margin-bottom: 14px;">Così appariranno le card e i testi nelle pagine del tuo gestionale.</div>
+                  <div id="live_preview_badge" style="display: inline-block; font-size: 11px; font-weight: 700; padding: 3px 10px; border-radius: 9999px; background: ${(settings.colore_primario || '#D98295')}22; color: ${settings.colore_primario || '#D98295'}; border: 1px solid ${(settings.colore_primario || '#D98295')}44;">Notifica Live</div>
+                </div>
+
+                <div style="display: flex; flex-direction: column; gap: 12px;">
+                  <button type="button" id="live_preview_btn" style="background: ${settings.colore_primario || '#D98295'}; color: #121214; font-weight: 700; padding: 10px 20px; border-radius: 8px; border: none; cursor: pointer;">
+                    Pulsante Primario
+                  </button>
+                  <div style="font-size: 13px; color: #A1A1AA;">
+                    Testo secondario con <strong style="color: #FAFAFA;">grassetto evidenziato</strong>.
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- BARRA AZIONI SALVATAGGIO IN FONDO -->
+          <div style="display: flex; align-items: center; justify-content: flex-end; gap: 16px; padding: 20px; background: #18181B; border: 1px solid #27272A; border-radius: 12px;">
+            <a href="/admin?view=macro-builder" class="btn-secondary" style="text-decoration: none;">Annulla modifiche</a>
+            <button type="submit" class="btn-primary" style="padding: 12px 28px; font-size: 15px; font-weight: 700; cursor: pointer;">
+              Salva Configurazione Tema su Database D1
+            </button>
+          </div>
+        </div>
+      </form>
+
+      <script>
+        function aggiornaAnteprimaLogo(url) {
+          const box = document.getElementById('preview_logo_box');
+          if (url && url.startsWith('http')) {
+            box.innerHTML = '<img src="' + url + '" alt="Logo" style="max-width: 100%; max-height: 100%; object-fit: contain;" onerror="this.outerHTML=\\'<span style=\\\\'font-size:10px;color:#EF4444;\\\\'>Errore link</span>\\'">';
+          } else {
+            box.innerHTML = '<span style="font-size: 10px; color: #71717A; text-align: center;">Nessun logo</span>';
+          }
+        }
+
+        function aggiornaRadioCards(radio) {
+          document.querySelectorAll('.radio-card').forEach(function(el) { el.classList.remove('selected'); });
+          if (radio.checked) {
+            radio.closest('.radio-card').classList.add('selected');
+          }
+        }
+
+        function aggiornaLiveTheme() {
+          const primario = document.getElementById('txt_primario').value;
+          const sfondo = document.getElementById('txt_sfondo').value;
+          const card = document.getElementById('txt_card').value;
+          const m1 = document.getElementById('txt_m1').value;
+
+          const container = document.getElementById('live_preview_container');
+          const pCard = document.getElementById('live_preview_card');
+          const pBtn = document.getElementById('live_preview_btn');
+          const pBadge = document.getElementById('live_preview_badge');
+          const pIcon = document.getElementById('live_preview_icon_box');
+
+          if (container) container.style.background = sfondo;
+          if (pCard) pCard.style.background = card;
+          if (pBtn) pBtn.style.background = primario;
+          if (pBadge) {
+            pBadge.style.color = primario;
+            pBadge.style.borderColor = primario + '44';
+            pBadge.style.background = primario + '22';
+          }
+          if (pIcon) {
+            pIcon.style.color = m1;
+            pIcon.style.background = m1 + '22';
+          }
+        }
+      </script>
+    `;
+  }
   // CASO 4: ALTRE VOCI SOTTOMENU NON ANCORA COLLEGATE A D1
   else {
     mainContentHtml = `
@@ -787,8 +1126,8 @@ async function renderAdminDashboard(env, utente, url) {
         <div class="placeholder-roadmap">
           <h4>Prossimi Step Immediati da Roadmap:</h4>
           <ul>
-            <li><strong>Passo 2:</strong> Tabella D1 Configurazione &amp; Dati Fiscali dell'APS</li>
-            <li><strong>Passo 3:</strong> Sezione 4.2 Builder Tema &amp; Identità Visiva (Palette colori e logo caricabile)</li>
+            <li><strong>Passo 2:</strong> Tabella D1 Configurazione &amp; Dati Fiscali dell'APS (Completato)</li>
+            <li><strong>Passo 3:</strong> Sezione 4.2 Builder Tema &amp; Identità Visiva (Attivo)</li>
             <li><strong>Passo 4:</strong> Sezione 4.1 Form Builder Dinamico per creare e modificare i moduli soci/corsi</li>
           </ul>
         </div>
@@ -796,8 +1135,8 @@ async function renderAdminDashboard(env, utente, url) {
           <a href="/admin?view=${activeMacroId || 'dashboard'}" class="btn-secondary" style="text-decoration: none;">
             Torna all'Hub ${currentMacro}
           </a>
-          <a href="/admin?view=domande" class="btn-primary" style="display: inline-block; text-decoration: none;">
-            Vai a 1.1 Domande Ammissione
+          <a href="/admin?view=theme-builder" class="btn-primary" style="display: inline-block; text-decoration: none;">
+            Vai a 4.2 Builder Tema
           </a>
         </div>
       </div>
@@ -815,21 +1154,111 @@ async function renderAdminDashboard(env, utente, url) {
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
   <style>
     :root {
-      --brand-coral: #D98295;
+      --brand-coral: ${settings.colore_primario || '#D98295'};
       --brand-silver: #E8E7E9;
-      --brand-black: #121214;
-      --card-bg: #18181B;
+      --brand-black: ${settings.colore_sfondo || '#121214'};
+      --card-bg: ${settings.colore_card || '#18181B'};
       --card-border: #27272A;
       --text-muted: #A1A1AA;
+      --base-font-size: ${settings.scala_caratteri === 'grande' ? '16px' : settings.scala_caratteri === 'compatta' ? '13px' : '14.5px'};
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
       font-family: 'Plus Jakarta Sans', sans-serif;
       background: #09090B;
       color: #FAFAFA;
+      font-size: var(--base-font-size);
       min-height: 100vh;
       display: flex;
       flex-direction: column;
+    }
+
+    /* THEME BUILDER STYLES */
+    .input-clean {
+      width: 100%;
+      background: #09090B;
+      border: 1px solid #27272A;
+      color: #FAFAFA;
+      padding: 10px 14px;
+      border-radius: 8px;
+      font-size: 14px;
+      font-family: inherit;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    .input-clean:focus {
+      border-color: var(--brand-coral);
+    }
+    .color-picker-box {
+      background: #09090B;
+      border: 1px solid #27272A;
+      border-radius: 8px;
+      padding: 14px;
+    }
+    .color-picker-box label {
+      display: block;
+      font-size: 12px;
+      font-weight: 600;
+      color: #E4E4E7;
+      margin-bottom: 8px;
+    }
+    .color-input-wrapper {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .picker-native {
+      -webkit-appearance: none;
+      border: none;
+      width: 40px;
+      height: 38px;
+      border-radius: 6px;
+      cursor: pointer;
+      background: transparent;
+    }
+    .picker-native::-webkit-color-swatch-wrapper { padding: 0; }
+    .picker-native::-webkit-color-swatch { border: 1px solid #3F3F46; border-radius: 6px; }
+    .input-hex {
+      flex: 1;
+      background: #18181B;
+      border: 1px solid #27272A;
+      color: #FAFAFA;
+      padding: 8px 12px;
+      border-radius: 6px;
+      font-family: monospace;
+      font-size: 13px;
+      text-transform: uppercase;
+    }
+    .radio-card {
+      display: block;
+      background: #09090B;
+      border: 1px solid #27272A;
+      border-radius: 8px;
+      padding: 16px;
+      cursor: pointer;
+      position: relative;
+      transition: all 0.2s;
+    }
+    .radio-card input {
+      position: absolute;
+      top: 16px;
+      right: 16px;
+    }
+    .radio-card.selected {
+      border-color: var(--brand-coral);
+      background: #18181B;
+      box-shadow: 0 0 0 1px var(--brand-coral);
+    }
+    .radio-card-title {
+      font-weight: 700;
+      font-size: 14px;
+      color: #FAFAFA;
+      margin-bottom: 4px;
+    }
+    .radio-card-desc {
+      font-size: 12px;
+      color: #A1A1AA;
+      line-height: 1.4;
     }
 
     /* TOP NAVBAR */
@@ -916,127 +1345,133 @@ async function renderAdminDashboard(env, utente, url) {
       color: #EF4444;
     }
 
-    /* APP LAYOUT */
-    .app-body {
+    /* LAYOUT A DUE COLONNE */
+    .admin-wrapper {
       display: flex;
       flex: 1;
-      overflow: hidden;
+      position: relative;
     }
 
-    /* SIDEBAR */
+    /* SIDEBAR NAVIGAZIONE */
     .sidebar {
-      width: 270px;
+      width: 290px;
       background: #121214;
       border-right: 1px solid var(--card-border);
       display: flex;
       flex-direction: column;
       flex-shrink: 0;
-      overflow-y: auto;
-      padding: 16px 12px;
       transition: width 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+      overflow-x: hidden;
+      overflow-y: auto;
+      max-height: calc(100vh - 64px);
+      position: sticky;
+      top: 64px;
     }
     .sidebar.collapsed {
       width: 68px;
-      padding: 16px 8px;
     }
-    .sidebar.collapsed .sidebar-header-label,
-    .sidebar.collapsed .nav-group-name,
-    .sidebar.collapsed .chevron-btn,
-    .sidebar.collapsed .nav-group-sub,
-    .sidebar.collapsed .nav-dashboard-link span,
-    .sidebar.collapsed .sub-text,
-    .sidebar.collapsed .nav-badge {
-      display: none !important;
-    }
-    .sidebar.collapsed .nav-group-title,
-    .sidebar.collapsed .nav-dashboard-link {
-      justify-content: center;
-      padding: 10px 0;
+    .sidebar-inner {
+      padding: 16px 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
     }
 
-    .sidebar-header-label {
-      font-size: 10px;
-      font-weight: 700;
-      color: #52525B;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-      margin: 14px 8px 6px;
-    }
-
-    /* DASHBOARD LINK */
+    /* VOCE DASHBOARD PRINCIPALE */
     .nav-dashboard-link {
       display: flex;
       align-items: center;
-      gap: 10px;
-      padding: 10px 12px;
+      gap: 12px;
+      padding: 12px 14px;
       border-radius: 8px;
-      color: #D4D4D8;
+      color: #E4E4E7;
       text-decoration: none;
-      font-size: 13.5px;
       font-weight: 600;
-      transition: all 0.15s;
-      margin-bottom: 8px;
-      background: transparent;
+      font-size: 13.5px;
+      background: #18181B;
+      border: 1px solid #27272A;
+      margin-bottom: 12px;
+      transition: all 0.2s;
     }
     .nav-dashboard-link:hover {
-      background: #1E1E24;
+      background: #27272A;
       color: #FFF;
+      border-color: var(--brand-coral)66;
     }
     .nav-dashboard-link.active {
-      background: var(--brand-coral);
-      color: #121214;
-      font-weight: 700;
+      background: var(--brand-coral)18;
+      border-color: var(--brand-coral);
+      color: #FFF;
+    }
+    .nav-dashboard-link.active .nav-icon {
+      color: var(--brand-coral);
+    }
+    .nav-dashboard-text {
+      white-space: nowrap;
+      transition: opacity 0.2s;
+    }
+    .sidebar.collapsed .nav-dashboard-text {
+      opacity: 0;
+      display: none;
     }
 
-    /* NAV GROUPS (ACCORDION) */
+    /* GRUPPI MACRO-AREE */
     .nav-group {
-      margin-bottom: 4px;
+      border-radius: 8px;
+      background: #18181B55;
+      border: 1px solid #27272A44;
+      overflow: hidden;
+      margin-bottom: 6px;
+      transition: all 0.2s;
+    }
+    .nav-group:hover {
+      border-color: #27272A;
     }
     .nav-group-header {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      border-radius: 8px;
-      transition: background 0.15s;
-    }
-    .nav-group-header:hover {
-      background: #1E1E24;
+      padding: 10px 12px;
+      cursor: pointer;
     }
     .nav-group-title {
-      flex: 1;
       display: flex;
       align-items: center;
-      gap: 10px;
-      padding: 9px 12px;
-      color: #E4E4E7;
+      gap: 12px;
+      color: #D4D4D8;
       text-decoration: none;
-      font-size: 13.5px;
       font-weight: 600;
-      border-radius: 8px 0 0 8px;
+      font-size: 13px;
+      flex: 1;
+      white-space: nowrap;
+    }
+    .nav-group-title:hover {
+      color: #FFF;
     }
     .nav-group-title.macro-active {
-      background: #27272A;
-      color: #FFF;
+      color: var(--brand-coral);
+      font-weight: 700;
+    }
+    .nav-group-name {
+      transition: opacity 0.2s;
+    }
+    .sidebar.collapsed .nav-group-name {
+      opacity: 0;
+      display: none;
     }
     .chevron-btn {
       background: transparent;
       border: none;
       color: #71717A;
-      padding: 10px 12px;
       cursor: pointer;
       display: flex;
       align-items: center;
-      border-radius: 0 8px 8px 0;
-      transition: color 0.15s;
+      padding: 4px;
+      border-radius: 4px;
     }
     .chevron-btn:hover {
       color: #FAFAFA;
-    }
-    .nav-icon {
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      width: 20px;
+      background: #27272A;
     }
     .chevron {
       transition: transform 0.2s;
@@ -1044,39 +1479,45 @@ async function renderAdminDashboard(env, utente, url) {
     .nav-group.expanded .chevron {
       transform: rotate(180deg);
     }
+    .sidebar.collapsed .chevron-btn {
+      display: none;
+    }
+
+    /* SOTTOMENU VOCI */
     .nav-group-sub {
       display: none;
-      padding-left: 14px;
-      margin-top: 2px;
-      margin-bottom: 6px;
-      border-left: 1px solid #27272A;
-      margin-left: 20px;
+      flex-direction: column;
+      padding: 4px 8px 8px 8px;
+      background: #141417;
+      border-top: 1px solid #27272A44;
     }
     .nav-group.expanded .nav-group-sub {
       display: flex;
-      flex-direction: column;
-      gap: 2px;
+    }
+    .sidebar.collapsed .nav-group-sub {
+      display: none !important;
     }
     .nav-sub-item {
       display: flex;
       align-items: center;
-      gap: 9px;
-      padding: 7px 10px;
+      gap: 10px;
+      padding: 8px 10px;
       border-radius: 6px;
       color: #A1A1AA;
       text-decoration: none;
       font-size: 12.5px;
-      font-weight: 500;
       transition: all 0.15s;
+      white-space: nowrap;
     }
     .nav-sub-item:hover {
-      color: #FFF;
-      background: #1E1E24;
+      background: #27272A;
+      color: #FAFAFA;
     }
     .nav-sub-item.active {
-      color: #FAFAFA;
       background: #27272A;
+      color: #FFF;
       font-weight: 600;
+      border-left: 2px solid var(--brand-coral);
     }
     .sub-dot {
       width: 6px;
@@ -1086,37 +1527,37 @@ async function renderAdminDashboard(env, utente, url) {
     }
     .nav-badge {
       margin-left: auto;
-      font-size: 10.5px;
+      background: #F59E0B;
+      color: #121214;
+      font-size: 11px;
       font-weight: 700;
-      background: #EF4444;
-      color: #FFF;
-      padding: 2px 6px;
+      padding: 1px 6px;
       border-radius: 9999px;
     }
 
-    /* MAIN WORKSPACE */
-    .main-workspace {
+    /* WORKSPACE CONTENUTO PRINCIPALE */
+    .workspace {
       flex: 1;
+      padding: 28px 32px;
       overflow-y: auto;
-      padding: 28px 36px;
-      background: #09090B;
+      max-width: 1400px;
     }
 
-    /* PAGE BANNER */
-    .page-banner {
+    /* HEADER WORKSPACE DINAMICO */
+    .workspace-header {
       display: flex;
       align-items: center;
       justify-content: space-between;
       margin-bottom: 24px;
-      padding-bottom: 16px;
+      padding-bottom: 18px;
       border-bottom: 1px solid var(--card-border);
     }
-    .page-banner-left {
+    .header-info-group {
       display: flex;
       align-items: center;
       gap: 14px;
     }
-    .macro-icon-box {
+    .header-icon-box {
       width: 44px;
       height: 44px;
       border-radius: 10px;
@@ -1125,19 +1566,38 @@ async function renderAdminDashboard(env, utente, url) {
       justify-content: center;
       flex-shrink: 0;
     }
-    .page-banner-title h1 {
+    .page-title {
       font-size: 22px;
       font-weight: 700;
-      letter-spacing: -0.02em;
+      letter-spacing: -0.01em;
       color: #FFF;
     }
-    .breadcrumb {
-      font-size: 12px;
+    .page-breadcrumbs {
+      font-size: 12.5px;
       color: var(--text-muted);
       margin-top: 2px;
     }
 
-    /* STATS GRID */
+    /* ALERT MESSAGES */
+    .alert-box {
+      padding: 12px 18px;
+      border-radius: 8px;
+      margin-bottom: 20px;
+      font-size: 13.5px;
+      font-weight: 500;
+    }
+    .alert-success {
+      background: #10B98118;
+      border: 1px solid #10B98144;
+      color: #34D399;
+    }
+    .alert-error {
+      background: #EF444418;
+      border: 1px solid #EF444444;
+      color: #F87171;
+    }
+
+    /* STATISTICHE DASHBOARD */
     .stats-grid {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
@@ -1147,7 +1607,7 @@ async function renderAdminDashboard(env, utente, url) {
     .stat-card {
       background: var(--card-bg);
       border: 1px solid var(--card-border);
-      border-radius: 12px;
+      border-radius: 10px;
       padding: 18px 20px;
     }
     .stat-label {
@@ -1155,22 +1615,20 @@ async function renderAdminDashboard(env, utente, url) {
       font-weight: 700;
       color: var(--text-muted);
       letter-spacing: 0.05em;
-      text-transform: uppercase;
+      margin-bottom: 6px;
     }
     .stat-value {
       font-size: 28px;
-      font-weight: 800;
-      color: #FFF;
-      margin-top: 6px;
+      font-weight: 700;
       letter-spacing: -0.02em;
     }
     .stat-sub {
-      font-size: 12px;
+      font-size: 11.5px;
       color: #71717A;
       margin-top: 4px;
     }
 
-    /* HUB SECTION & CARDS GRID */
+    /* SEZIONE HUB A TESSERE (CARDS GRID) */
     .section-header-clean {
       margin-bottom: 18px;
     }
@@ -1185,22 +1643,22 @@ async function renderAdminDashboard(env, utente, url) {
       margin-top: 2px;
     }
     .macro-hub-intro {
-      background: var(--card-bg);
-      border: 1px solid var(--card-border);
-      padding: 16px 20px;
-      border-radius: 10px;
       margin-bottom: 24px;
+      background: #18181B;
+      padding: 18px 20px;
+      border-radius: 10px;
+      border: 1px solid #27272A;
     }
     .macro-hub-desc {
       font-size: 14px;
-      color: #D4D4D8;
+      color: #E4E4E7;
       line-height: 1.5;
     }
     .hub-cards-grid {
       display: grid;
       grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
       gap: 18px;
-      margin-bottom: 32px;
+      margin-bottom: 30px;
     }
     .hub-card {
       background: var(--card-bg);
@@ -1210,35 +1668,19 @@ async function renderAdminDashboard(env, utente, url) {
       text-decoration: none;
       display: flex;
       flex-direction: column;
-      position: relative;
       transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
-      overflow: hidden;
-    }
-    .hub-card::before {
-      content: "";
-      position: absolute;
-      top: 0;
-      left: 0;
-      right: 0;
-      height: 3px;
-      background: var(--card-accent, var(--brand-coral));
-      opacity: 0.4;
-      transition: opacity 0.2s;
+      position: relative;
     }
     .hub-card:hover {
-      transform: translateY(-3px);
-      border-color: #3F3F46;
-      background: #1F1F24;
-      box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.5);
-    }
-    .hub-card:hover::before {
-      opacity: 1;
+      transform: translateY(-2px);
+      border-color: var(--card-accent, var(--brand-coral));
+      box-shadow: 0 8px 20px -6px rgba(0,0,0,0.4);
     }
     .hub-card-top {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      margin-bottom: 16px;
+      margin-bottom: 14px;
     }
     .hub-card-icon {
       width: 40px;
@@ -1250,60 +1692,57 @@ async function renderAdminDashboard(env, utente, url) {
     }
     .hub-card-badge {
       font-size: 11px;
-      font-weight: 700;
-      padding: 3px 8px;
-      border-radius: 9999px;
+      font-weight: 600;
       border: 1px solid;
+      padding: 2px 8px;
+      border-radius: 9999px;
     }
     .hub-card-title {
-      font-size: 16px;
+      font-size: 15px;
       font-weight: 700;
-      color: #FAFAFA;
-      letter-spacing: -0.01em;
+      color: #FFF;
       margin-bottom: 8px;
+      line-height: 1.3;
     }
     .hub-card-desc {
-      font-size: 13px;
+      font-size: 12.5px;
       color: var(--text-muted);
       line-height: 1.45;
-      margin-bottom: 20px;
+      margin-bottom: 16px;
       flex: 1;
     }
     .hub-card-footer {
       display: flex;
       align-items: center;
-      justify-content: space-between;
-      font-size: 12.5px;
+      gap: 6px;
+      font-size: 12px;
       font-weight: 600;
-      border-top: 1px solid #27272A;
-      padding-top: 14px;
-      transition: gap 0.2s;
-    }
-    .hub-card:hover .hub-card-footer svg {
-      transform: translateX(3px);
+      margin-top: auto;
     }
 
-    /* TABLE SECTION */
+    /* TABELLE & CARD LISTE */
     .card-table {
       background: var(--card-bg);
       border: 1px solid var(--card-border);
       border-radius: 12px;
       overflow: hidden;
-      margin-bottom: 30px;
     }
     .card-header-table {
-      padding: 20px 24px;
+      padding: 18px 22px;
       border-bottom: 1px solid var(--card-border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
     }
     .card-header-table h3 {
-      font-size: 16px;
+      font-size: 15px;
       font-weight: 700;
-      color: #FAFAFA;
+      color: #FFF;
     }
     .card-header-table p {
       font-size: 12.5px;
       color: var(--text-muted);
-      margin-top: 3px;
+      margin-top: 2px;
     }
     .table-responsive {
       overflow-x: auto;
@@ -1311,82 +1750,79 @@ async function renderAdminDashboard(env, utente, url) {
     table {
       width: 100%;
       border-collapse: collapse;
-      text-align: left;
       font-size: 13px;
+      text-align: left;
     }
     th {
-      background: #141416;
-      color: #A1A1AA;
+      background: #141417;
+      color: var(--text-muted);
       font-weight: 600;
-      font-size: 11.5px;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
       padding: 12px 18px;
       border-bottom: 1px solid var(--card-border);
+      white-space: nowrap;
     }
     td {
-      padding: 16px 18px;
-      border-bottom: 1px solid #27272A;
-      vertical-align: top;
+      padding: 14px 18px;
+      border-bottom: 1px solid #222226;
+      vertical-align: middle;
       color: #E4E4E7;
     }
     tr:hover td {
       background: #1C1C20;
     }
     .text-sub {
-      font-size: 11.5px;
       color: #A1A1AA;
+      font-size: 11.5px;
+      display: block;
+      margin-top: 2px;
     }
     .badge-pill {
-      display: inline-block;
       font-size: 11px;
-      font-weight: 700;
-      padding: 2px 8px;
+      font-weight: 600;
+      padding: 3px 8px;
       border-radius: 9999px;
+      display: inline-block;
       margin: 2px 0;
     }
-    .bg-green { background: #10B98122; color: #10B981; border: 1px solid #10B98144; }
-    .bg-amber { background: #F59E0B22; color: #F59E0B; border: 1px solid #F59E0B44; }
-    .bg-gray { background: #27272A; color: #A1A1AA; border: 1px solid #3F3F46; }
+    .bg-green { background: #10B98122; color: #34D399; border: 1px solid #10B98144; }
+    .bg-amber { background: #F59E0B22; color: #FBBF24; border: 1px solid #F59E0B44; }
+    .bg-gray { background: #3F3F4644; color: #A1A1AA; border: 1px solid #52525B44; }
     .tag-delegato {
+      font-size: 11.5px;
+      color: #CBD5E1;
       display: inline-block;
-      background: #27272A;
-      color: #E4E4E7;
-      font-size: 11px;
-      padding: 2px 6px;
-      border-radius: 4px;
       margin-bottom: 2px;
     }
 
-    /* FORM DELIBERA */
+    /* MODULO DELIBERA CONSIGLIO DIRETTIVO */
     .form-delibera {
-      background: #141416;
-      padding: 10px 12px;
+      background: #121214;
+      border: 1px solid #2E2E33;
       border-radius: 8px;
-      border: 1px solid #27272A;
+      padding: 10px 12px;
     }
     .form-row {
       display: flex;
       gap: 8px;
       align-items: flex-end;
     }
-    .form-delibera label {
+    .form-row label {
       font-size: 10.5px;
       color: #A1A1AA;
-      display: flex;
-      flex-direction: column;
-      gap: 3px;
+      font-weight: 600;
       flex: 1;
     }
-    .form-delibera input {
-      background: #09090B;
+    .form-row input {
+      width: 100%;
+      background: #1C1C20;
       border: 1px solid #3F3F46;
       color: #FFF;
-      padding: 6px 8px;
+      padding: 5px 8px;
       border-radius: 5px;
       font-size: 12px;
+      margin-top: 3px;
     }
-    .form-delibera input:focus {
+    .form-row input:focus {
       outline: none;
       border-color: var(--brand-coral);
     }
@@ -1394,138 +1830,135 @@ async function renderAdminDashboard(env, utente, url) {
       background: var(--brand-coral);
       color: #121214;
       font-weight: 700;
-      font-size: 12px;
       border: none;
-      padding: 8px 14px;
-      border-radius: 6px;
+      padding: 6px 12px;
+      border-radius: 5px;
+      font-size: 12px;
       cursor: pointer;
-      transition: opacity 0.2s;
       white-space: nowrap;
+      transition: opacity 0.2s;
     }
     .btn-delibera:hover {
       opacity: 0.9;
     }
     .delibera-info {
       font-size: 12px;
+      line-height: 1.5;
       color: #D4D4D8;
-      line-height: 1.6;
     }
     .tessera-highlight {
-      color: var(--brand-coral);
-      font-size: 13px;
+      color: #34D399;
+      font-weight: 700;
     }
 
-    /* PLACEHOLDER SECTION */
+    /* PLACEHOLDER SCHERMATE IN FASE DI SVILUPPO */
     .placeholder-card {
       background: var(--card-bg);
-      border: 1px solid var(--card-border);
-      border-radius: 16px;
+      border: 1px dashed var(--card-border);
+      border-radius: 12px;
       padding: 40px 32px;
       text-align: center;
       max-width: 680px;
-      margin: 30px auto;
+      margin: 40px auto;
     }
     .placeholder-icon {
-      width: 72px;
-      height: 72px;
-      border-radius: 18px;
+      width: 60px;
+      height: 60px;
+      border-radius: 14px;
       display: flex;
       align-items: center;
       justify-content: center;
-      margin: 0 auto 20px;
+      margin: 0 auto 18px auto;
     }
     .placeholder-card h2 {
-      font-size: 22px;
+      font-size: 20px;
       font-weight: 700;
       color: #FFF;
-      margin-bottom: 12px;
+      margin-bottom: 8px;
     }
     .placeholder-meta {
       display: flex;
-      gap: 8px;
       justify-content: center;
+      gap: 10px;
       margin-bottom: 16px;
     }
     .tag-macro {
-      font-size: 12px;
-      font-weight: 700;
-      padding: 3px 10px;
+      font-size: 11.5px;
+      font-weight: 600;
+      padding: 2px 10px;
       border-radius: 9999px;
     }
     .tag-status {
-      font-size: 12px;
+      font-size: 11.5px;
+      font-weight: 500;
       background: #27272A;
       color: #D4D4D8;
-      padding: 3px 10px;
+      padding: 2px 10px;
       border-radius: 9999px;
     }
     .placeholder-desc {
-      font-size: 14px;
+      font-size: 13.5px;
       color: var(--text-muted);
       line-height: 1.6;
       margin-bottom: 24px;
     }
     .placeholder-roadmap {
-      background: #121214;
+      background: #141417;
       border: 1px solid #27272A;
-      border-radius: 10px;
-      padding: 16px 20px;
+      border-radius: 8px;
+      padding: 16px;
       text-align: left;
-      font-size: 13px;
+      font-size: 12.5px;
       color: #D4D4D8;
     }
     .placeholder-roadmap h4 {
-      font-size: 13px;
+      font-size: 12.5px;
       font-weight: 700;
-      color: #FFF;
-      margin-bottom: 10px;
+      color: #FAFAFA;
+      margin-bottom: 8px;
       text-transform: uppercase;
-      letter-spacing: 0.05em;
+      letter-spacing: 0.04em;
     }
     .placeholder-roadmap ul {
-      list-style-type: none;
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
+      padding-left: 18px;
+      line-height: 1.7;
     }
     .btn-primary {
       background: var(--brand-coral);
       color: #121214;
       font-weight: 700;
+      padding: 8px 18px;
+      border-radius: 6px;
+      text-decoration: none;
+      border: none;
+      cursor: pointer;
       font-size: 13px;
-      padding: 10px 18px;
-      border-radius: 8px;
-      transition: opacity 0.2s;
     }
     .btn-secondary {
       background: #27272A;
-      color: #FAFAFA;
+      color: #E4E4E7;
       font-weight: 600;
+      padding: 8px 18px;
+      border-radius: 6px;
+      text-decoration: none;
       font-size: 13px;
-      padding: 10px 18px;
-      border-radius: 8px;
-      transition: background 0.2s;
     }
-    .btn-secondary:hover {
-      background: #3F3F46;
-    }
-
-    /* ALERTS */
-    .alert-box {
-      padding: 12px 16px;
-      border-radius: 8px;
-      font-size: 13px;
-      margin-bottom: 20px;
-      font-weight: 600;
-    }
-    .alert-success { background: #10B98120; border: 1px solid #10B981; color: #10B981; }
-    .alert-error { background: #EF444420; border: 1px solid #EF4444; color: #EF4444; }
 
     @media (max-width: 900px) {
-      .sidebar { position: fixed; height: calc(100vh - 64px); z-index: 99; transform: translateX(-100%); }
-      .sidebar.open { transform: translateX(0); }
-      .main-workspace { padding: 20px 16px; }
-      .stats-grid { grid-template-columns: 1fr; }
+      .sidebar {
+        position: fixed;
+        left: 0;
+        top: 64px;
+        bottom: 0;
+        z-index: 99;
+        transform: translateX(-100%);
+      }
+      .sidebar.mobile-open {
+        transform: translateX(0);
+      }
+      .workspace {
+        padding: 20px 16px;
+      }
     }
   </style>
 </head>
@@ -1538,57 +1971,76 @@ async function renderAdminDashboard(env, utente, url) {
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
       </button>
       <a href="/admin?view=dashboard" class="topbar-brand">
-        <span>Cervelli in Affitto APS</span>
+        ${settings.logo_url ? `<img src="${settings.logo_url}" alt="Logo" style="height: 32px; width: auto; object-fit: contain; border-radius: 4px;" onerror="this.style.display='none'">` : `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="var(--brand-coral)" stroke-width="2.2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>`}
+        <span>${settings.nome_aps || 'Cervelli in Affitto APS'}</span>
         <span class="badge-role">SUPER ADMIN</span>
       </a>
     </div>
     <div class="topbar-right">
-      <span class="user-info">Connesso: <strong>${utente.nome} ${utente.cognome}</strong> (${utente.email})</span>
+      <div class="user-info">
+        Collegato: <strong>${utente.nome} ${utente.cognome}</strong>
+      </div>
       <a href="/admin/logout" class="btn-logout">Disconnetti</a>
     </div>
   </header>
 
-  <!-- CORPO PRINCIPALE -->
-  <div class="app-body">
-    <!-- SIDEBAR -->
-    <aside class="sidebar" id="sidebar">
-      <div class="sidebar-header-label">Area Gestionale</div>
-      <a href="/admin?view=dashboard" class="nav-dashboard-link ${currentView === "dashboard" ? "active" : ""}">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
-        <span>Dashboard Generale</span>
-      </a>
+  <!-- STRUTTURA A DUE COLONNE -->
+  <div class="admin-wrapper">
+    <!-- COLONNA SINISTRA: SIDEBAR ACCORDION -->
+    <aside class="sidebar" id="adminSidebar">
+      <div class="sidebar-inner">
+        <!-- 0. LINK DIRETTO DASHBOARD GENERALE -->
+        <a href="/admin?view=dashboard" class="nav-dashboard-link ${currentView === 'dashboard' ? 'active' : ''}">
+          <span class="nav-icon" style="color: ${currentView === 'dashboard' ? 'var(--brand-coral)' : '#A1A1AA'};">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+          </span>
+          <span class="nav-dashboard-text">Dashboard Generale</span>
+        </a>
 
-      <div class="sidebar-header-label">Macro-Aree Bibbia</div>
-      ${sidebarNavHtml}
+        <!-- 5 MACRO-AREE UFFICIALI DELLA BIBBIA -->
+        ${sidebarNavHtml}
+      </div>
     </aside>
 
-    <!-- AREA DI LAVORO CENTRALE -->
-    <main class="main-workspace" id="mainWorkspace">
-      ${msgNotifica}
-
-      <div class="page-banner">
-        <div class="page-banner-left">
-          <div class="macro-icon-box" style="background: ${currentMacroColor}18; color: ${currentMacroColor};">
+    <!-- COLONNA DESTRA: WORKSPACE -->
+    <main class="workspace">
+      <!-- HEADER CONTESTUALE -->
+      <div class="workspace-header">
+        <div class="header-info-group">
+          <div class="header-icon-box" style="background: ${currentMacroColor}18; color: ${currentMacroColor};">
             ${currentMacroIcon}
           </div>
-          <div class="page-banner-title">
-            <h1>${currentTitle}</h1>
-            <div class="breadcrumb">Pannello Gestionale &gt; ${currentMacro} &gt; <strong>${currentTitle}</strong></div>
+          <div>
+            <h1 class="page-title">${currentTitle}</h1>
+            <div class="page-breadcrumbs">
+              <span>Area Riservata</span> &gt; <span>${currentMacro}</span>
+            </div>
           </div>
         </div>
       </div>
 
+      <!-- MESSAGGI DI NOTIFICA -->
+      ${msgNotifica}
+
+      <!-- CONTENUTO DELLA VISTA ATTIVA -->
       ${mainContentHtml}
     </main>
   </div>
 
   <script>
-    const toggleBtn = document.getElementById("toggleSidebar");
-    const sidebar = document.getElementById("sidebar");
+    // Gestione espansione e compressione Sidebar
+    const toggleBtn = document.getElementById('toggleSidebar');
+    const sidebar = document.getElementById('adminSidebar');
 
-    toggleBtn.addEventListener("click", () => {
-      sidebar.classList.toggle("collapsed");
-    });
+    if (toggleBtn && sidebar) {
+      toggleBtn.addEventListener('click', () => {
+        if (window.innerWidth <= 900) {
+          sidebar.classList.toggle('mobile-open');
+        } else {
+          sidebar.classList.toggle('collapsed');
+        }
+      });
+    }
   </script>
 </body>
 </html>`;
@@ -1599,10 +2051,10 @@ async function renderAdminDashboard(env, utente, url) {
 }
 
 /* =========================================================================
-   PAGINE DI AUTENTICAZIONE AMMINISTRATIVA (SETUP & LOGIN)
+   PAGINE DI AUTENTICAZIONE (SETUP E LOGIN)
    ========================================================================= */
 
-function renderSetupPage(error = "") {
+function renderSetupPage(errorMsg = "") {
   const html = `<!DOCTYPE html>
 <html lang="it">
 <head>
@@ -1616,7 +2068,7 @@ function renderSetupPage(error = "") {
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
       font-family: 'Plus Jakarta Sans', sans-serif;
-      background: #121214;
+      background: #09090B;
       color: #FAFAFA;
       min-height: 100vh;
       display: flex;
@@ -1624,124 +2076,116 @@ function renderSetupPage(error = "") {
       justify-content: center;
       padding: 20px;
     }
-    .auth-card {
+    .setup-card {
       background: #18181B;
       border: 1px solid #27272A;
-      border-radius: 16px;
-      padding: 36px 32px;
-      width: 100%;
+      border-radius: 12px;
       max-width: 460px;
-      box-shadow: 0 20px 40px -15px rgba(0,0,0,0.7);
+      width: 100%;
+      padding: 32px;
     }
-    .brand-header {
+    .logo-box {
       text-align: center;
       margin-bottom: 24px;
     }
-    .brand-badge {
-      display: inline-block;
-      font-size: 11px;
-      font-weight: 700;
-      background: #D9829522;
-      color: #D98295;
-      padding: 4px 12px;
-      border-radius: 9999px;
-      border: 1px solid #D9829544;
+    .logo-box svg {
+      width: 48px;
+      height: 48px;
+      stroke: #D98295;
       margin-bottom: 12px;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
     }
     h1 {
-      font-size: 22px;
+      font-size: 20px;
       font-weight: 700;
-      letter-spacing: -0.02em;
-      margin-bottom: 8px;
+      margin-bottom: 6px;
+      text-align: center;
     }
     p.sub {
+      font-size: 13px;
       color: #A1A1AA;
-      font-size: 13.5px;
+      text-align: center;
+      margin-bottom: 24px;
       line-height: 1.5;
     }
-    .error-box {
-      background: #EF444422;
-      border: 1px solid #EF4444;
+    .alert-err {
+      background: #EF444415;
+      border: 1px solid #EF444444;
       color: #F87171;
       padding: 10px 14px;
-      border-radius: 8px;
+      border-radius: 6px;
       font-size: 13px;
       margin-bottom: 20px;
     }
     .form-group {
       margin-bottom: 16px;
-      text-align: left;
     }
     label {
       display: block;
       font-size: 12.5px;
       font-weight: 600;
-      color: #E4E4E7;
+      color: #D4D4D8;
       margin-bottom: 6px;
     }
     input {
       width: 100%;
       background: #09090B;
-      border: 1px solid #3F3F46;
-      color: #FFF;
+      border: 1px solid #27272A;
+      color: #FAFAFA;
       padding: 10px 14px;
-      border-radius: 8px;
+      border-radius: 6px;
       font-size: 14px;
-      transition: border-color 0.2s;
+      outline: none;
     }
     input:focus {
-      outline: none;
       border-color: #D98295;
-      box-shadow: 0 0 0 2px #D9829533;
     }
     .btn-submit {
       width: 100%;
       background: #D98295;
       color: #121214;
       font-weight: 700;
-      font-size: 14px;
       padding: 12px;
-      border-radius: 8px;
       border: none;
+      border-radius: 6px;
+      font-size: 14px;
       cursor: pointer;
       margin-top: 10px;
-      transition: opacity 0.2s;
     }
-    .btn-submit:hover { opacity: 0.9; }
+    .btn-submit:hover {
+      opacity: 0.9;
+    }
   </style>
 </head>
 <body>
-  <div class="auth-card">
-    <div class="brand-header">
-      <span class="brand-badge">Primo Avvio Gestionale</span>
-      <h1>Attivazione Super Admin</h1>
-      <p class="sub">Crea l'account principale con pieno controllo su tutte le macro-aree della Bibbia.</p>
+  <div class="setup-card">
+    <div class="logo-box">
+      <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+      <h1>Primo Avvio Gestionale</h1>
+      <p class="sub">Configura il primo account <strong>Super Admin</strong> con accesso totale a tutte le macro-aree.</p>
     </div>
 
-    ${error ? `<div class="error-box">${error}</div>` : ""}
+    ${errorMsg ? `<div class="alert-err">${errorMsg}</div>` : ""}
 
     <form method="POST" action="/admin/setup">
-      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
-        <div class="form-group">
+      <div style="display: flex; gap: 12px;">
+        <div class="form-group" style="flex: 1;">
           <label>Nome</label>
           <input type="text" name="nome" placeholder="Giacomo" required autofocus>
         </div>
-        <div class="form-group">
+        <div class="form-group" style="flex: 1;">
           <label>Cognome</label>
           <input type="text" name="cognome" placeholder="Garofani" required>
         </div>
       </div>
       <div class="form-group">
         <label>Email Ufficiale</label>
-        <input type="email" name="email" placeholder="tua@email.it" required>
+        <input type="email" name="email" placeholder="admin@cervellinaffitto-aps.it" required>
       </div>
       <div class="form-group">
-        <label>Password Personale (min 8 caratteri)</label>
-        <input type="password" name="password" placeholder="••••••••••••" minlength="8" required>
+        <label>Password di Accesso (minimo 8 caratteri)</label>
+        <input type="password" name="password" required>
       </div>
-      <button type="submit" class="btn-submit">Attiva Account Super Admin &amp; Accedi</button>
+      <button type="submit" class="btn-submit">Crea Account Super Admin &amp; Accedi</button>
     </form>
   </div>
 </body>
@@ -1752,7 +2196,7 @@ function renderSetupPage(error = "") {
   });
 }
 
-function renderLoginPage(error = "") {
+function renderLoginPage(errorMsg = "") {
   const html = `<!DOCTYPE html>
 <html lang="it">
 <head>
@@ -1766,7 +2210,7 @@ function renderLoginPage(error = "") {
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
       font-family: 'Plus Jakarta Sans', sans-serif;
-      background: #121214;
+      background: #09090B;
       color: #FAFAFA;
       min-height: 100vh;
       display: flex;
@@ -1774,100 +2218,106 @@ function renderLoginPage(error = "") {
       justify-content: center;
       padding: 20px;
     }
-    .auth-card {
+    .login-card {
       background: #18181B;
       border: 1px solid #27272A;
-      border-radius: 16px;
-      padding: 40px 32px;
-      width: 100%;
+      border-radius: 12px;
       max-width: 420px;
-      box-shadow: 0 20px 40px -15px rgba(0,0,0,0.7);
+      width: 100%;
+      padding: 32px;
     }
-    .brand-header {
+    .logo-box {
       text-align: center;
-      margin-bottom: 28px;
+      margin-bottom: 24px;
     }
-    .brand-title {
-      font-size: 20px;
+    .logo-box svg {
+      width: 44px;
+      height: 44px;
+      stroke: #D98295;
+      margin-bottom: 12px;
+    }
+    h1 {
+      font-size: 19px;
       font-weight: 700;
-      color: #FFF;
-      letter-spacing: -0.01em;
-      margin-top: 10px;
+      margin-bottom: 4px;
+      text-align: center;
     }
-    .brand-sub {
-      color: #A1A1AA;
+    p.sub {
       font-size: 13px;
-      margin-top: 4px;
+      color: #A1A1AA;
+      text-align: center;
+      margin-bottom: 24px;
     }
-    .error-box {
-      background: #EF444422;
-      border: 1px solid #EF4444;
+    .alert-err {
+      background: #EF444415;
+      border: 1px solid #EF444444;
       color: #F87171;
       padding: 10px 14px;
-      border-radius: 8px;
+      border-radius: 6px;
       font-size: 13px;
       margin-bottom: 20px;
+      line-height: 1.4;
     }
     .form-group {
-      margin-bottom: 18px;
-      text-align: left;
+      margin-bottom: 16px;
     }
     label {
       display: block;
       font-size: 12.5px;
       font-weight: 600;
-      color: #E4E4E7;
+      color: #D4D4D8;
       margin-bottom: 6px;
     }
     input {
       width: 100%;
       background: #09090B;
-      border: 1px solid #3F3F46;
-      color: #FFF;
-      padding: 11px 14px;
-      border-radius: 8px;
+      border: 1px solid #27272A;
+      color: #FAFAFA;
+      padding: 10px 14px;
+      border-radius: 6px;
       font-size: 14px;
-      transition: border-color 0.2s;
+      outline: none;
     }
     input:focus {
-      outline: none;
       border-color: #D98295;
-      box-shadow: 0 0 0 2px #D9829533;
     }
     .btn-submit {
       width: 100%;
       background: #D98295;
       color: #121214;
       font-weight: 700;
-      font-size: 14px;
       padding: 12px;
-      border-radius: 8px;
       border: none;
+      border-radius: 6px;
+      font-size: 14px;
       cursor: pointer;
-      margin-top: 8px;
-      transition: opacity 0.2s;
+      margin-top: 10px;
     }
-    .btn-submit:hover { opacity: 0.9; }
-    .back-link {
+    .btn-submit:hover {
+      opacity: 0.9;
+    }
+    .link-home {
       display: block;
       text-align: center;
-      margin-top: 24px;
+      margin-top: 20px;
       color: #71717A;
       font-size: 12.5px;
       text-decoration: none;
     }
-    .back-link:hover { color: #A1A1AA; }
+    .link-home:hover {
+      color: #FAFAFA;
+    }
   </style>
 </head>
 <body>
-  <div class="auth-card">
-    <div class="brand-header">
-      <svg width="42" height="42" viewBox="0 0 24 24" fill="none" stroke="#D98295" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
-      <h1 class="brand-title">Cervelli in Affitto APS</h1>
-      <p class="brand-sub">Area Riservata • Pannello Amministrativo</p>
+  <div class="login-card">
+    <div class="logo-box">
+      <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+      <h1>Cervelli in Affitto APS</h1>
+      <p class="sub">Area Riservata • Pannello Amministrativo</p>
     </div>
 
-    ${error ? `<div class="error-box">${error}</div>` : ""}
+    ${errorMsg ? `<div class="alert-err">${errorMsg}</div>` : ""}
 
     <form method="POST" action="/admin/login">
       <div class="form-group">
@@ -1876,12 +2326,12 @@ function renderLoginPage(error = "") {
       </div>
       <div class="form-group">
         <label>Password</label>
-        <input type="password" name="password" placeholder="••••••••••••" required>
+        <input type="password" name="password" required>
       </div>
       <button type="submit" class="btn-submit">Accedi al Gestionale</button>
     </form>
 
-    <a href="/" class="back-link">← Torna al Portale Pubblico</a>
+    <a href="/" class="link-home">&larr; Torna al Portale Pubblico</a>
   </div>
 </body>
 </html>`;
@@ -1892,10 +2342,10 @@ function renderLoginPage(error = "") {
 }
 
 /* =========================================================================
-   PORTALE PUBBLICO: WIZARD A 5 STEP PER MINORI & DOMANDA SOCIO
+   PORTALE PUBBLICO (WIZARD A 5 STEP)
    ========================================================================= */
 
-function renderPublicWizard(step, isSuccess, params) {
+function renderPublicWizard(step, isSuccess, params, settings = {}) {
   if (isSuccess) {
     return renderSuccessPage(params.get("socio") || "Socio");
   }
@@ -1919,9 +2369,9 @@ function renderPublicWizard(step, isSuccess, params) {
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
   <style>
     :root {
-      --coral: #D98295;
+      --coral: ${settings.colore_primario || '#D98295'};
       --silver: #E8E7E9;
-      --dark: #121214;
+      --dark: ${settings.colore_sfondo || '#121214'};
       --card-bg: #FFFFFF;
       --text: #1F2937;
       --border: #E5E7EB;
@@ -1955,446 +2405,497 @@ function renderPublicWizard(step, isSuccess, params) {
     .wizard-container {
       max-width: 680px;
       width: 100%;
-      margin: 30px auto;
+      margin: 24px auto 40px auto;
       padding: 0 16px;
       flex: 1;
     }
-    .wizard-progress {
+    .stepper {
       display: flex;
       justify-content: space-between;
-      margin-bottom: 24px;
       position: relative;
+      margin-bottom: 30px;
     }
-    .wizard-progress::before {
+    .stepper::before {
       content: "";
       position: absolute;
       top: 14px;
       left: 10px;
       right: 10px;
       height: 2px;
-      background: #E5E7EB;
+      background: var(--border);
       z-index: 1;
     }
     .step-item {
       position: relative;
       z-index: 2;
-      text-align: center;
-      width: 40px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 6px;
     }
     .step-circle {
       width: 30px;
       height: 30px;
       border-radius: 50%;
       background: #FFF;
-      border: 2px solid #D1D5DB;
-      color: #6B7280;
+      border: 2px solid var(--border);
       display: flex;
       align-items: center;
       justify-content: center;
-      font-size: 12px;
-      font-weight: 700;
-      margin: 0 auto;
-      transition: all 0.2s;
+      font-weight: 600;
+      font-size: 13px;
+      color: #6B7280;
     }
     .step-item.active .step-circle {
       border-color: var(--coral);
       background: var(--coral);
-      color: #121214;
+      color: #FFF;
     }
-    .step-item.done .step-circle {
+    .step-item.completed .step-circle {
       border-color: #10B981;
       background: #10B981;
       color: #FFF;
     }
     .step-label {
-      font-size: 10.5px;
+      font-size: 11px;
       color: #6B7280;
-      margin-top: 6px;
-      display: none;
+      font-weight: 500;
+      text-align: center;
     }
-    @media (min-width: 640px) {
-      .step-item { width: 80px; }
-      .step-label { display: block; }
+    .step-item.active .step-label {
+      color: var(--dark);
+      font-weight: 700;
     }
-    .form-card {
+    .card {
       background: var(--card-bg);
       border: 1px solid var(--border);
-      border-radius: 14px;
-      padding: 30px 24px;
-      box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05);
+      border-radius: 12px;
+      padding: 28px;
+      box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
     }
-    .step-header {
-      margin-bottom: 24px;
-      border-bottom: 1px solid var(--border);
-      padding-bottom: 14px;
-    }
-    .step-header h2 {
-      font-size: 19px;
+    .card-title {
+      font-size: 18px;
       font-weight: 700;
       color: var(--dark);
+      margin-bottom: 6px;
     }
-    .step-header p {
+    .card-desc {
       font-size: 13px;
       color: #6B7280;
-      margin-top: 4px;
-    }
-    .form-grid {
-      display: grid;
-      grid-template-columns: 1fr;
-      gap: 16px;
-    }
-    @media (min-width: 600px) {
-      .form-grid.two-cols { grid-template-columns: 1fr 1fr; }
+      margin-bottom: 24px;
+      line-height: 1.5;
     }
     .form-group {
+      margin-bottom: 18px;
+    }
+    .form-row {
       display: flex;
-      flex-direction: column;
-      gap: 6px;
+      gap: 14px;
+    }
+    .form-row .form-group {
+      flex: 1;
     }
     label {
+      display: block;
       font-size: 12.5px;
       font-weight: 600;
       color: #374151;
+      margin-bottom: 6px;
     }
-    input, select, textarea {
+    input[type="text"], input[type="email"], input[type="tel"], input[type="date"], select {
+      width: 100%;
       padding: 10px 12px;
-      border: 1px solid #D1D5DB;
-      border-radius: 8px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
       font-size: 14px;
       font-family: inherit;
-      color: #111827;
-      background: #FFF;
-    }
-    input:focus, select:focus, textarea:focus {
+      color: var(--text);
       outline: none;
-      border-color: var(--coral);
-      box-shadow: 0 0 0 2px #D9829533;
+      transition: border-color 0.2s;
     }
-    .checkbox-item {
+    input:focus, select:focus {
+      border-color: var(--coral);
+      box-shadow: 0 0 0 1px var(--coral);
+    }
+    .checkbox-group {
       display: flex;
       align-items: flex-start;
       gap: 10px;
-      padding: 12px;
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      background: #F9FAFB;
-      margin-bottom: 10px;
+      margin-bottom: 14px;
     }
-    .checkbox-item input[type="checkbox"] {
+    .checkbox-group input {
       margin-top: 3px;
-      accent-color: var(--coral);
-      width: 16px;
-      height: 16px;
     }
-    .checkbox-item label {
+    .checkbox-group label {
       font-size: 12.5px;
-      font-weight: 500;
+      font-weight: 400;
+      color: #4B5563;
       line-height: 1.4;
-      cursor: pointer;
+      margin: 0;
     }
-    .wizard-actions {
+    .btn-group {
       display: flex;
       justify-content: space-between;
       margin-top: 28px;
       padding-top: 18px;
       border-top: 1px solid var(--border);
     }
-    .btn-prev {
-      background: #E5E7EB;
-      color: #374151;
-      padding: 10px 18px;
-      border-radius: 8px;
-      font-size: 13.5px;
+    .btn {
+      padding: 10px 20px;
+      border-radius: 6px;
+      font-size: 14px;
       font-weight: 600;
-      border: none;
       cursor: pointer;
+      text-decoration: none;
+      border: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
     }
     .btn-next {
       background: var(--coral);
       color: #121214;
-      padding: 10px 24px;
-      border-radius: 8px;
-      font-size: 13.5px;
-      font-weight: 700;
-      border: none;
-      cursor: pointer;
       margin-left: auto;
     }
-    .btn-submit-final {
+    .btn-prev {
+      background: #F3F4F6;
+      color: #4B5563;
+    }
+    .btn-submit {
       background: #10B981;
       color: #FFF;
-      padding: 12px 28px;
-      border-radius: 8px;
-      font-size: 14px;
       font-weight: 700;
-      border: none;
-      cursor: pointer;
-      margin-left: auto;
+      padding: 12px 28px;
+    }
+    .delega-box {
+      border: 1px dashed #D1D5DB;
+      padding: 16px;
+      border-radius: 8px;
+      margin-bottom: 16px;
+      background: #F9FAFB;
+    }
+    .delega-box h4 {
+      font-size: 13px;
+      font-weight: 600;
+      color: #4B5563;
+      margin-bottom: 12px;
+    }
+    .doc-preview {
+      background: #F3F4F6;
+      border: 1px solid #E5E7EB;
+      padding: 14px;
+      border-radius: 6px;
+      font-size: 12px;
+      color: #4B5563;
+      margin-bottom: 16px;
+      max-height: 120px;
+      overflow-y: auto;
+    }
+    .review-row {
+      display: flex;
+      justify-content: space-between;
+      padding: 8px 0;
+      border-bottom: 1px solid #F3F4F6;
+      font-size: 13px;
+    }
+    .review-label {
+      color: #6B7280;
+    }
+    .review-val {
+      font-weight: 600;
+      color: #111827;
     }
     footer.pub-footer {
       background: var(--dark);
       color: #9CA3AF;
-      text-align: center;
-      padding: 20px;
       font-size: 12px;
+      padding: 20px;
+      text-align: center;
       margin-top: auto;
-      border-top: 1px solid #27272A;
     }
   </style>
 </head>
 <body>
 
   <header class="pub-header">
-    <div class="brand-title">Cervelli in Affitto APS</div>
-    <div class="brand-sub">Affiliata UILT • Laboratori Teatrali Bambini &amp; Ragazzi</div>
+    <div style="max-width: 600px; margin: 0 auto; display: flex; flex-direction: column; align-items: center; gap: 6px;">
+      ${settings.logo_url ? `<img src="${settings.logo_url}" alt="Logo" style="max-height: 52px; width: auto; object-fit: contain; margin-bottom: 4px;" onerror="this.style.display='none'">` : ''}
+      <div class="brand-title">${settings.nome_aps || 'Cervelli in Affitto APS'}</div>
+      <div class="brand-sub">Affiliata UILT • Laboratori Teatrali Bambini &amp; Ragazzi</div>
+    </div>
   </header>
 
   <div class="wizard-container">
-    <div class="wizard-progress">
-      ${stepTitles.map((title, idx) => {
-        const num = idx + 1;
-        const cls = num < step ? "done" : num === step ? "active" : "";
+    <div class="stepper">
+      ${stepTitles.map((t, idx) => {
+        const stepNum = idx + 1;
+        const stateClass = stepNum === step ? "active" : stepNum < step ? "completed" : "";
         return `
-          <div class="step-item ${cls}">
-            <div class="step-circle">${num < step ? "✓" : num}</div>
-            <div class="step-label">${title}</div>
+          <div class="step-item ${stateClass}">
+            <div class="step-circle">${stepNum < step ? "✓" : stepNum}</div>
+            <div class="step-label">${t}</div>
           </div>
         `;
       }).join("")}
     </div>
 
-    <form method="POST" action="/iscrizione-minori" id="wizardForm" class="form-card">
-      <input type="hidden" name="step" id="currentStepInput" value="${step}">
-
+    <form id="iscrizioneForm" method="POST" action="/iscrizione-minori">
       <!-- STEP 1: DATI MINORE -->
-      <div id="step-1" class="wizard-step-pane" style="${step === 1 ? "" : "display:none;"}">
-        <div class="step-header">
-          <h2>Passo 1: Dati Anagrafici dell'Allievo Minore</h2>
-          <p>Compila i dati del minore che frequenterà il laboratorio teatrale e diventerà socio ordinario APS.</p>
-        </div>
-        <div class="form-grid two-cols">
+      <div class="card" id="step-1" style="display: ${step === 1 ? 'block' : 'none'};">
+        <h2 class="card-title">1. Dati Anagrafici del Minore</h2>
+        <p class="card-desc">Inserisci i dati dell'allievo/a che parteciperà al laboratorio teatrale.</p>
+        
+        <div class="form-row">
           <div class="form-group">
-            <label>Nome del Minore *</label>
+            <label>Nome Minore *</label>
             <input type="text" name="minore_nome" required>
           </div>
           <div class="form-group">
-            <label>Cognome del Minore *</label>
+            <label>Cognome Minore *</label>
             <input type="text" name="minore_cognome" required>
           </div>
         </div>
-        <div class="form-grid two-cols" style="margin-top: 14px;">
-          <div class="form-group">
-            <label>Codice Fiscale Minore *</label>
-            <input type="text" name="minore_cf" maxlength="16" placeholder="Es. RSSMRA10A01F205Z" required>
-          </div>
+
+        <div class="form-row">
           <div class="form-group">
             <label>Data di Nascita *</label>
-            <input type="date" name="minore_data_nascita" required>
+            <input type="date" name="minore_nascita" required>
           </div>
-        </div>
-        <div class="form-grid two-cols" style="margin-top: 14px;">
           <div class="form-group">
             <label>Luogo di Nascita *</label>
-            <input type="text" name="minore_luogo_nascita" placeholder="Comune o Stato estero" required>
+            <input type="text" name="minore_luogo" placeholder="Es. Bologna" required>
           </div>
-          <div class="form-group">
-            <label>Indirizzo di Residenza *</label>
-            <input type="text" name="minore_indirizzo" placeholder="Via, Civico, Comune, CAP" required>
-          </div>
+        </div>
+
+        <div class="form-group">
+          <label>Codice Fiscale Minore *</label>
+          <input type="text" name="minore_cf" placeholder="RSSMRA..." style="text-transform: uppercase;" required>
+        </div>
+
+        <div class="form-group">
+          <label>Indirizzo di Residenza *</label>
+          <input type="text" name="residenza_indirizzo" placeholder="Via, Numero, Città, CAP" required>
+        </div>
+
+        <div class="form-group">
+          <label>Laboratorio Teatrale Richiesto *</label>
+          <select name="corso_id" required>
+            <option value="corso-teatro-ragazzi-2026">Laboratorio Teatrale Bambini &amp; Ragazzi (2026)</option>
+          </select>
+        </div>
+
+        <div class="btn-group">
+          <button type="button" class="btn btn-next" onclick="goToStep(2)">Avanti: Genitore / Tutore &rarr;</button>
         </div>
       </div>
 
       <!-- STEP 2: TUTORE LEGALE -->
-      <div id="step-2" class="wizard-step-pane" style="${step === 2 ? "" : "display:none;"}">
-        <div class="step-header">
-          <h2>Passo 2: Genitore o Tutore Legale Esercente la Responsabilità</h2>
-          <p>Dati dell'adulto referente che sottoscrive la richiesta di ammissione e l'iscrizione.</p>
-        </div>
-        <div class="form-grid two-cols">
+      <div class="card" id="step-2" style="display: ${step === 2 ? 'block' : 'none'};">
+        <h2 class="card-title">2. Dati del Genitore o Tutore Legale</h2>
+        <p class="card-desc">Dati dell'esercente la responsabilità genitoriale che sottoscrive l'iscrizione.</p>
+
+        <div class="form-row">
           <div class="form-group">
-            <label>Nome Genitore / Tutore *</label>
+            <label>Nome Tutore *</label>
             <input type="text" name="tutore_nome">
           </div>
           <div class="form-group">
-            <label>Cognome Genitore / Tutore *</label>
+            <label>Cognome Tutore *</label>
             <input type="text" name="tutore_cognome">
           </div>
         </div>
-        <div class="form-grid two-cols" style="margin-top: 14px;">
+
+        <div class="form-row">
           <div class="form-group">
-            <label>Codice Fiscale Genitore *</label>
-            <input type="text" name="tutore_cf" maxlength="16">
+            <label>Codice Fiscale Tutore *</label>
+            <input type="text" name="tutore_cf" style="text-transform: uppercase;">
           </div>
           <div class="form-group">
             <label>Grado di Parentela *</label>
-            <select name="tutore_ruolo">
+            <select name="grado_parentela">
               <option value="Madre">Madre</option>
               <option value="Padre">Padre</option>
-              <option value="Tutore Legale">Tutore Legale</option>
-              <option value="Affidatario">Affidatario</option>
+              <option value="Tutore Legale">Tutore Legale / Affidatario</option>
             </select>
           </div>
         </div>
-        <div class="form-grid two-cols" style="margin-top: 14px;">
+
+        <div class="form-row">
           <div class="form-group">
             <label>Telefono Cellulare *</label>
-            <input type="tel" name="tutore_telefono" placeholder="Es. 3401234567">
+            <input type="tel" name="tutore_telefono" placeholder="+39 ...">
           </div>
           <div class="form-group">
-            <label>Email Ufficiale (per comunicazioni e ricevute) *</label>
-            <input type="email" name="tutore_email" placeholder="esempio@email.it">
+            <label>Indirizzo Email *</label>
+            <input type="email" name="tutore_email" placeholder="nome@esempio.it">
           </div>
+        </div>
+
+        <div class="btn-group">
+          <button type="button" class="btn btn-prev" onclick="goToStep(1)">&larr; Indietro</button>
+          <button type="button" class="btn btn-next" onclick="goToStep(3)">Avanti: Deleghe Ritiro &rarr;</button>
         </div>
       </div>
 
       <!-- STEP 3: DELEGHE AL RITIRO -->
-      <div id="step-3" class="wizard-step-pane" style="${step === 3 ? "" : "display:none;"}">
-        <div class="step-header">
-          <h2>Passo 3: Persone Delegate al Ritiro dell'Allievo (Facoltativo)</h2>
-          <p>Indica fino a due persone maggiorenni autorizzate a ritirare il minore al termine della lezione.</p>
-        </div>
-        <div style="background: #F3F4F6; padding: 14px; border-radius: 8px; margin-bottom: 14px;">
-          <h4 style="font-size: 13px; font-weight: 700; margin-bottom: 10px;">Delegato N° 1</h4>
-          <div class="form-grid two-cols">
-            <div class="form-group"><label>Nome e Cognome</label><input type="text" name="delega1_nome" placeholder="Es. Mario Rossi"></div>
-            <div class="form-group"><label>Telefono</label><input type="tel" name="delega1_telefono" placeholder="Es. 3471122334"></div>
+      <div class="card" id="step-3" style="display: ${step === 3 ? 'block' : 'none'};">
+        <h2 class="card-title">3. Deleghe al Ritiro del Minore (Facoltative)</h2>
+        <p class="card-desc">Indica fino a due persone maggiorenni autorizzate a ritirare il minore al termine delle lezioni.</p>
+
+        <div class="delega-box">
+          <h4>Delega N° 1</h4>
+          <div class="form-row">
+            <div class="form-group">
+              <label>Nome Delegato</label>
+              <input type="text" name="delega1_nome" placeholder="Nome">
+            </div>
+            <div class="form-group">
+              <label>Cognome Delegato</label>
+              <input type="text" name="delega1_cognome" placeholder="Cognome">
+            </div>
           </div>
-          <div class="form-group" style="margin-top: 10px;"><label>Relazione di parentela / fiducia</label><input type="text" name="delega1_relazione" placeholder="Es. Nonno, Zia, Babysitter"></div>
+          <div class="form-row">
+            <div class="form-group">
+              <label>Relazione / Grado di Parentela</label>
+              <input type="text" name="delega1_relazione" placeholder="Es. Nonno, Zio, Amico di famiglia">
+            </div>
+            <div class="form-group">
+              <label>Telefono</label>
+              <input type="tel" name="delega1_telefono" placeholder="+39 ...">
+            </div>
+          </div>
         </div>
 
-        <div style="background: #F3F4F6; padding: 14px; border-radius: 8px;">
-          <h4 style="font-size: 13px; font-weight: 700; margin-bottom: 10px;">Delegato N° 2</h4>
-          <div class="form-grid two-cols">
-            <div class="form-group"><label>Nome e Cognome</label><input type="text" name="delega2_nome" placeholder="Es. Anna Bianchi"></div>
-            <div class="form-group"><label>Telefono</label><input type="tel" name="delega2_telefono" placeholder="Es. 3489988776"></div>
+        <div class="delega-box">
+          <h4>Delega N° 2 (Opzionale)</h4>
+          <div class="form-row">
+            <div class="form-group">
+              <label>Nome Delegato</label>
+              <input type="text" name="delega2_nome">
+            </div>
+            <div class="form-group">
+              <label>Cognome Delegato</label>
+              <input type="text" name="delega2_cognome">
+            </div>
           </div>
-          <div class="form-group" style="margin-top: 10px;"><label>Relazione di parentela / fiducia</label><input type="text" name="delega2_relazione" placeholder="Es. Zio, Amico di famiglia"></div>
+          <div class="form-row">
+            <div class="form-group">
+              <label>Relazione</label>
+              <input type="text" name="delega2_relazione">
+            </div>
+            <div class="form-group">
+              <label>Telefono</label>
+              <input type="tel" name="delega2_telefono">
+            </div>
+          </div>
+        </div>
+
+        <div class="btn-group">
+          <button type="button" class="btn btn-prev" onclick="goToStep(2)">&larr; Indietro</button>
+          <button type="button" class="btn btn-next" onclick="goToStep(4)">Avanti: Consensi &rarr;</button>
         </div>
       </div>
 
       <!-- STEP 4: STATUTO & PRIVACY -->
-      <div id="step-4" class="wizard-step-pane" style="${step === 4 ? "" : "display:none;"}">
-        <div class="step-header">
-          <h2>Passo 4: Accettazione Statuto APS &amp; Consensi Privacy</h2>
-          <p>Condizioni di ammissione a socio e tesseramento obbligatorio UILT.</p>
-        </div>
-        
-        <div class="checkbox-item">
-          <input type="checkbox" id="chk_statuto" name="accettazione_statuto" value="1" required>
-          <label for="chk_statuto">
-            <strong>Dichiaro di aver preso visione e di accettare integralmente lo Statuto e i Regolamenti interni di Cervelli in Affitto APS</strong>, nonché di condividere gli scopi associativi e culturali per conto del minore. (Obbligatorio)
-          </label>
+      <div class="card" id="step-4" style="display: ${step === 4 ? 'block' : 'none'};">
+        <h2 class="card-title">4. Statuto Sociale &amp; Consensi Obbligatori</h2>
+        <p class="card-desc">L'iscrizione ai corsi comporta la richiesta di ammissione a Socio Ordinario dell'APS, affiliata UILT.</p>
+
+        <div class="doc-preview">
+          <strong>Estratto Statuto Sociale e Affiliazione UILT:</strong><br>
+          Il richiedente dichiara di condividere le finalità dell'Associazione di Promozione Sociale Cervelli in Affitto e si impegna a osservarne lo Statuto, i regolamenti interni e le deliberazioni degli organi sociali. L'ammissione è subordinata alla ratifica del Consiglio Direttivo e include la copertura assicurativa UILT.
         </div>
 
-        <div class="checkbox-item">
-          <input type="checkbox" id="chk_privacy" name="consenso_privacy" value="1" required>
-          <label for="chk_privacy">
-            <strong>Acconsento al trattamento dei dati personali del minore e del sottoscritto</strong> ai sensi del Regolamento UE 2016/679 (GDPR), per finalità istituzionali, amministrative e per la copertura assicurativa UILT. (Obbligatorio)
-          </label>
+        <div class="checkbox-group">
+          <input type="checkbox" id="check_statuto" name="accettazione_statuto" value="1" required>
+          <label for="check_statuto"><strong>Dichiaro di aver preso visione dello Statuto</strong> dell'APS e di accettarne integralmente le disposizioni (Obbligatorio per ammissione socio). *</label>
         </div>
 
-        <div class="checkbox-item">
-          <input type="checkbox" id="chk_foto" name="consenso_foto_video" value="1">
-          <label for="chk_foto">
-            <strong>Autorizzo riprese foto e video durante i laboratori e saggi teatrali</strong> ad esclusivo scopo documentale, promozionale delle attività dell'APS sui propri canali e archivi istituzionali. (Facoltativo)
-          </label>
+        <div class="checkbox-group">
+          <input type="checkbox" id="check_privacy" name="consenso_privacy" value="1" required>
+          <label for="check_privacy"><strong>Consenso Privacy GDPR:</strong> Autorizzo il trattamento dei dati personali del minore e del genitore per le finalità associative e assicurative UILT. *</label>
         </div>
 
-        <div class="checkbox-item">
-          <input type="checkbox" id="chk_news" name="consenso_newsletter" value="1">
-          <label for="chk_news">
-            Autorizzo la ricezione di comunicazioni teatrali, calendario spettacoli e inviti dell'APS via email o WhatsApp. (Facoltativo)
-          </label>
+        <div class="checkbox-group">
+          <input type="checkbox" id="check_foto" name="consenso_foto_video" value="1">
+          <label for="check_foto"><strong>Liberatoria Foto e Video:</strong> Autorizzo la realizzazione di foto e registrazioni video delle attività didattiche e dei saggi teatrali a uso documentativo e promozionale dell'APS (Facoltativo).</label>
+        </div>
+
+        <div class="checkbox-group">
+          <input type="checkbox" id="check_news" name="consenso_newsletter" value="1">
+          <label for="check_news">Desidero ricevere comunicazioni su spettacoli, rassegne ed eventi teatrali dell'APS.</label>
+        </div>
+
+        <div class="btn-group">
+          <button type="button" class="btn btn-prev" onclick="goToStep(3)">&larr; Indietro</button>
+          <button type="button" class="btn btn-next" onclick="populateReview(); goToStep(5)">Avanti: Riepilogo &rarr;</button>
         </div>
       </div>
 
       <!-- STEP 5: RIEPILOGO & INVIO -->
-      <div id="step-5" class="wizard-step-pane" style="${step === 5 ? "" : "display:none;"}">
-        <div class="step-header">
-          <h2>Passo 5: Riepilogo &amp; Invio Richiesta</h2>
-          <p>Verifica i dati inseriti prima di trasmettere ufficialmente la domanda al Consiglio Direttivo.</p>
-        </div>
-        
-        <div style="background: #F3F4F6; border-left: 4px solid var(--coral); padding: 16px; border-radius: 6px; font-size: 13px; line-height: 1.6; margin-bottom: 20px;">
-          <strong>Procedura di Delibera Associativa:</strong><br>
-          L'invio di questo modulo costituisce formale richiesta di ammissione a socio ordinario per il minore e pre-iscrizione al laboratorio teatrale.
-          La domanda sarà esaminata e ratificata dal Consiglio Direttivo dell'APS alla prima riunione utile, con contestuale assegnazione del numero di tessera e attivazione della copertura assicurativa UILT.
+      <div class="card" id="step-5" style="display: ${step === 5 ? 'block' : 'none'};">
+        <h2 class="card-title">5. Riepilogo Domanda &amp; Sottoscrizione</h2>
+        <p class="card-desc">Verifica i dati inseriti prima di inoltrare ufficialmente la richiesta al Consiglio Direttivo.</p>
+
+        <div id="reviewContainer"></div>
+
+        <div style="background: #ECFDF5; border: 1px solid #A7F3D0; padding: 14px; border-radius: 8px; margin-top: 20px; font-size: 12.5px; color: #065F46;">
+          <strong>Cosa succede dopo l'invio?</strong><br>
+          La domanda verrà protocollata nel registro ammissioni e sottoposta alla prima seduta utile del Consiglio Direttivo per l'assegnazione del numero di tessera APS e la registrazione nel circuito UILT.
         </div>
 
-        <p style="font-size: 13.5px; color: #4B5563; text-align: center; margin: 20px 0;">
-          Cliccando su <strong>"Invia Domanda di Ammissione &amp; Iscrizione"</strong> confermi la veridicità di tutti i dati dichiarati.
-        </p>
-      </div>
-
-      <!-- BOTTONI AVANTI / INDIETRO WIZARD -->
-      <div class="wizard-actions">
-        <button type="button" class="btn-prev" id="prevBtn" style="display: none;">← Indietro</button>
-        <button type="button" class="btn-next" id="nextBtn">Continua →</button>
-        <button type="submit" class="btn-submit-final" id="submitBtn" style="display: none;">Invia Domanda di Ammissione &amp; Iscrizione</button>
+        <div class="btn-group">
+          <button type="button" class="btn btn-prev" onclick="goToStep(4)">&larr; Modifica Dati</button>
+          <button type="submit" class="btn btn-submit">Conferma &amp; Invia Domanda Ufficiale</button>
+        </div>
       </div>
     </form>
   </div>
 
   <footer class="pub-footer">
-    Cervelli in Affitto APS • Sede Legale: Via del Teatro, Forlì • C.F. 92095390400 • Affiliata UILT
+    Cervelli in Affitto APS • Sede Legale: Bologna • Dominio: cervellinaffitto-aps.it • Affiliato UILT
   </footer>
 
   <script>
-    let currentStep = ${step};
-    const totalSteps = 5;
-
-    const prevBtn = document.getElementById("prevBtn");
-    const nextBtn = document.getElementById("nextBtn");
-    const submitBtn = document.getElementById("submitBtn");
-    const stepInput = document.getElementById("currentStepInput");
-
-    function updateStepView() {
-      for (let i = 1; i <= totalSteps; i++) {
-        const pane = document.getElementById("step-" + i);
-        if (pane) pane.style.display = i === currentStep ? "block" : "none";
+    function goToStep(s) {
+      for (let i = 1; i <= 5; i++) {
+        const el = document.getElementById('step-' + i);
+        if (el) el.style.display = (i === s) ? 'block' : 'none';
       }
-
-      document.querySelectorAll(".step-item").forEach((el, idx) => {
-        const n = idx + 1;
-        el.className = "step-item " + (n < currentStep ? "done" : n === currentStep ? "active" : "");
+      const circles = document.querySelectorAll('.step-item');
+      circles.forEach((item, idx) => {
+        const num = idx + 1;
+        item.classList.remove('active', 'completed');
+        if (num === s) item.classList.add('active');
+        if (num < s) item.classList.add('completed');
       });
-
-      prevBtn.style.display = currentStep > 1 ? "block" : "none";
-      if (currentStep === totalSteps) {
-        nextBtn.style.display = "none";
-        submitBtn.style.display = "block";
-      } else {
-        nextBtn.style.display = "block";
-        submitBtn.style.display = "none";
-      }
-      stepInput.value = currentStep;
-      window.scrollTo({ top: 0, behavior: "smooth" });
+      window.scrollTo({ top: 0, behavior: 'smooth' });
     }
 
-    nextBtn.addEventListener("click", () => {
-      // Validazione rapida campi obbligatori del pane corrente
-      const curPane = document.getElementById("step-" + currentStep);
-      const reqInputs = curPane.querySelectorAll("input[required], select[required]");
-      for (const input of reqInputs) {
-        if (!input.checkValidity()) {
-          input.reportValidity();
-          return;
-        }
-      }
-      if (currentStep < totalSteps) {
-        currentStep++;
-        updateStepView();
-      }
-    });
+    function populateReview() {
+      const form = document.getElementById('iscrizioneForm');
+      const container = document.getElementById('reviewContainer');
+      const f = new FormData(form);
 
-    prevBtn.addEventListener("click", () => {
-      if (currentStep > 1) {
-        currentStep--;
-        updateStepView();
-      }
-    });
+      const items = [
+        { label: "Allievo Minore", val: (f.get("minore_nome") || "") + " " + (f.get("minore_cognome") || "") },
+        { label: "Codice Fiscale Minore", val: f.get("minore_cf") || "" },
+        { label: "Nato il", val: (f.get("minore_nascita") || "") + " a " + (f.get("minore_luogo") || "") },
+        { label: "Genitore / Tutore", val: (f.get("tutore_nome") || "") + " " + (f.get("tutore_cognome") || "") + " (" + (f.get("grado_parentela") || "") + ")" },
+        { label: "Recapiti Tutore", val: (f.get("tutore_telefono") || "") + " • " + (f.get("tutore_email") || "") },
+        { label: "Laboratorio Scelto", val: "Laboratorio Teatrale Bambini & Ragazzi (2026)" },
+        { label: "Statuto & Norme APS", val: f.get("accettazione_statuto") ? "Accettato" : "Non accettato" },
+        { label: "Trattamento Dati GDPR", val: f.get("consenso_privacy") ? "Accettato" : "Non accettato" },
+        { label: "Consenso Foto/Video", val: f.get("consenso_foto_video") ? "Autorizzato" : "Non autorizzato" }
+      ];
 
-    updateStepView();
+      container.innerHTML = items.map(it => `
+        <div class="review-row">
+          <span class="review-label">\${it.label}</span>
+          <span class="review-val">\${it.val}</span>
+        </div>
+      `).join("");
+    }
   </script>
 </body>
 </html>`;
@@ -2410,7 +2911,7 @@ function renderSuccessPage(nomeSocio) {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Domanda Ricevuta • Cervelli in Affitto APS</title>
+  <title>Iscrizione Ricevuta • Cervelli in Affitto APS</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -2418,78 +2919,84 @@ function renderSuccessPage(nomeSocio) {
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
       font-family: 'Plus Jakarta Sans', sans-serif;
-      background: #F9FAFB;
-      color: #1F2937;
+      background: #09090B;
+      color: #FAFAFA;
       min-height: 100vh;
       display: flex;
       align-items: center;
       justify-content: center;
       padding: 20px;
     }
-    .card-success {
-      background: #FFF;
-      border: 1px solid #E5E7EB;
-      border-radius: 16px;
+    .success-card {
+      background: #18181B;
+      border: 1px solid #27272A;
+      border-radius: 12px;
+      max-width: 520px;
+      width: 100%;
       padding: 40px 32px;
-      max-width: 540px;
       text-align: center;
-      box-shadow: 0 10px 25px -5px rgba(0,0,0,0.05);
     }
-    .icon-success {
+    .check-icon {
       width: 64px;
       height: 64px;
-      background: #10B98120;
-      color: #10B981;
+      background: #10B98122;
+      border: 1px solid #10B98144;
+      color: #34D399;
       border-radius: 50%;
       display: flex;
       align-items: center;
       justify-content: center;
-      margin: 0 auto 20px;
+      margin: 0 auto 20px auto;
+      font-size: 28px;
     }
     h1 {
       font-size: 22px;
       font-weight: 700;
-      color: #111827;
       margin-bottom: 12px;
+      color: #FFF;
     }
     p {
       font-size: 14px;
-      color: #4B5563;
+      color: #A1A1AA;
       line-height: 1.6;
       margin-bottom: 24px;
     }
-    .info-box {
-      background: #F3F4F6;
+    .next-box {
+      background: #121214;
+      border: 1px solid #27272A;
       border-radius: 8px;
       padding: 16px;
-      font-size: 13px;
       text-align: left;
-      line-height: 1.6;
-      margin-bottom: 24px;
+      font-size: 13px;
+      color: #D4D4D8;
+      margin-bottom: 28px;
     }
     .btn-home {
       display: inline-block;
       background: #D98295;
       color: #121214;
       font-weight: 700;
-      font-size: 13.5px;
-      padding: 11px 22px;
-      border-radius: 8px;
+      padding: 12px 28px;
+      border-radius: 6px;
       text-decoration: none;
+      font-size: 14px;
     }
   </style>
 </head>
 <body>
-  <div class="card-success">
-    <div class="icon-success">
-      <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
-    </div>
+  <div class="success-card">
+    <div class="check-icon">✓</div>
     <h1>Richiesta Inviata con Successo!</h1>
-    <p>Grazie per aver compilato la richiesta di iscrizione per <strong>${nomeSocio}</strong>.</p>
-    <div class="info-box">
-      <strong>Cosa succede ora?</strong><br>
-      1. Il Consiglio Direttivo di <em>Cervelli in Affitto APS</em> delibererà l'ammissione a socio.<br>
-      2. Riceverai un'email di conferma con il numero di tessera APS e le istruzioni per il perfezionamento del tesseramento UILT.
+    <p>
+      La domanda di ammissione e iscrizione per <strong>${nomeSocio}</strong> è stata registrata correttamente nel sistema di Cervelli in Affitto APS.
+    </p>
+    <div class="next-box">
+      <strong>Prossimi Passaggi:</strong>
+      <ol style="padding-left: 18px; margin-top: 8px; line-height: 1.6;">
+        <li>Il Consiglio Direttivo esaminerà e delibererà la richiesta nella prima riunione utile.</li>
+        <li>Verrà generato il numero di tessera sociale APS.</li>
+        <li>Riceverai via email la conferma e la tessera assicurativa UILT.</li>
+      </ol>
     </div>
     <a href="/" class="btn-home">Torna alla Pagina Iniziale</a>
   </div>
@@ -2502,132 +3009,117 @@ function renderSuccessPage(nomeSocio) {
 }
 
 /* =========================================================================
-   PORTALE PUBBLICO: SALVATAGGIO DATI SU CLOUDFLARE D1
+   BACKEND: SALVATAGGIO ISCRIZIONE MINORI SU D1
    ========================================================================= */
 
 async function handleIscrizionePost(request, env, url) {
   try {
     const formData = await request.formData();
 
+    // Dati Minore
     const minoreNome = (formData.get("minore_nome") || "").toString().trim();
     const minoreCognome = (formData.get("minore_cognome") || "").toString().trim();
+    const minoreNascita = (formData.get("minore_nascita") || "").toString().trim();
+    const minoreLuogo = (formData.get("minore_luogo") || "").toString().trim();
     const minoreCf = (formData.get("minore_cf") || "").toString().trim().toUpperCase();
-    const minoreNascita = (formData.get("minore_data_nascita") || "").toString().trim();
-    const minoreLuogo = (formData.get("minore_luogo_nascita") || "").toString().trim();
-    const minoreIndirizzo = (formData.get("minore_indirizzo") || "").toString().trim();
+    const residenzaIndirizzo = (formData.get("residenza_indirizzo") || "").toString().trim();
+    const corsoId = (formData.get("corso_id") || DEFAULT_CORSO_ID).toString().trim();
 
+    // Dati Tutore
     const tutoreNome = (formData.get("tutore_nome") || "").toString().trim();
     const tutoreCognome = (formData.get("tutore_cognome") || "").toString().trim();
     const tutoreCf = (formData.get("tutore_cf") || "").toString().trim().toUpperCase();
-    const tutoreRuolo = (formData.get("tutore_ruolo") || "Genitore").toString().trim();
+    const gradoParentela = (formData.get("grado_parentela") || "Genitore").toString().trim();
     const tutoreTelefono = (formData.get("tutore_telefono") || "").toString().trim();
     const tutoreEmail = (formData.get("tutore_email") || "").toString().trim().toLowerCase();
 
+    // Deleghe al Ritiro
     const delega1Nome = (formData.get("delega1_nome") || "").toString().trim();
-    const delega1Tel = (formData.get("delega1_telefono") || "").toString().trim();
-    const delega1Rel = (formData.get("delega1_relazione") || "").toString().trim();
+    const delega1Cognome = (formData.get("delega1_cognome") || "").toString().trim();
+    const delega1Relazione = (formData.get("delega1_relazione") || "").toString().trim();
+    const delega1Telefono = (formData.get("delega1_telefono") || "").toString().trim();
 
     const delega2Nome = (formData.get("delega2_nome") || "").toString().trim();
-    const delega2Tel = (formData.get("delega2_telefono") || "").toString().trim();
-    const delega2Rel = (formData.get("delega2_relazione") || "").toString().trim();
+    const delega2Cognome = (formData.get("delega2_cognome") || "").toString().trim();
+    const delega2Relazione = (formData.get("delega2_relazione") || "").toString().trim();
+    const delega2Telefono = (formData.get("delega2_telefono") || "").toString().trim();
 
-    const accettaStatuto = formData.get("accettazione_statuto") === "1" ? 1 : 0;
-    const consensoPrivacy = formData.get("consenso_privacy") === "1" ? 1 : 0;
-    const consensoFoto = formData.get("consenso_foto_video") === "1" ? 1 : 0;
-    const consensoNews = formData.get("consenso_newsletter") === "1" ? 1 : 0;
+    // Consensi
+    const statuto = formData.get("accettazione_statuto") === "1" ? 1 : 0;
+    const privacy = formData.get("consenso_privacy") === "1" ? 1 : 0;
+    const foto = formData.get("consenso_foto_video") === "1" ? 1 : 0;
+    const newsletter = formData.get("consenso_newsletter") === "1" ? 1 : 0;
 
-    if (!minoreNome || !minoreCognome || !minoreCf) {
-      return new Response("Dati del minore incompleti.", { status: 400 });
+    if (!minoreNome || !minoreCognome || !minoreCf || !tutoreNome || !tutoreCognome || !tutoreEmail) {
+      return new Response("Campi obbligatori mancanti.", { status: 400 });
     }
 
-    // Assicura l'esistenza del corso di riferimento
-    await env.DB.prepare(`
-      INSERT OR IGNORE INTO attivita_eventi (id, tipo, titolo, descrizione, anno_sociale, attivo)
-      VALUES (?, 'corso', 'Laboratorio Teatrale Bambini e Ragazzi', 'Corso propedeutico di teatro per minori', 2026, 1)
-    `).bind(DEFAULT_CORSO_ID).run();
-
-    // 1. Inserimento Tutore (o recupero se già presente)
+    // 1. Inserimento o recupero Tutore Legale
     let tutoreId = null;
-    if (tutoreCf) {
-      const existingTutore = await env.DB.prepare("SELECT id FROM tutori WHERE codice_fiscale = ?").bind(tutoreCf).first();
-      if (existingTutore) {
-        tutoreId = existingTutore.id;
-        await env.DB.prepare(`
-          UPDATE tutori SET nome = ?, cognome = ?, telefono = ?, email = ?, grado_parentela = ? WHERE id = ?
-        `).bind(tutoreNome, tutoreCognome, tutoreTelefono, tutoreEmail, tutoreRuolo, tutoreId).run();
-      } else {
-        tutoreId = "tut-" + Date.now();
-        await env.DB.prepare(`
-          INSERT INTO tutori (id, nome, cognome, codice_fiscale, telefono, email, grado_parentela)
-          VALUES (?, ?, ?, ?, ?, ?, ?)
-        `).bind(tutoreId, tutoreNome, tutoreCognome, tutoreCf, tutoreTelefono, tutoreEmail, tutoreRuolo).run();
-      }
-    }
+    const existingTutore = await env.DB.prepare(
+      "SELECT id FROM tutori WHERE email = ? OR (codice_fiscale = ? AND codice_fiscale != '')"
+    ).bind(tutoreEmail, tutoreCf).first();
 
-    // 2. Inserimento Minore come Socio Ordinario (in attesa di delibera)
-    let socioId = null;
-    const existingSocio = await env.DB.prepare("SELECT id FROM soci WHERE codice_fiscale = ?").bind(minoreCf).first();
-    if (existingSocio) {
-      socioId = existingSocio.id;
-      await env.DB.prepare(`
-        UPDATE soci 
-        SET nome = ?, cognome = ?, data_nascita = ?, luogo_nascita = ?, residenza_indirizzo = ?, tutore_id = ?, updated_at = datetime('now')
-        WHERE id = ?
-      `).bind(minoreNome, minoreCognome, minoreNascita, minoreLuogo, minoreIndirizzo, tutoreId, socioId).run();
+    if (existingTutore) {
+      tutoreId = existingTutore.id;
     } else {
-      socioId = "soc-" + Date.now();
-      await env.DB.prepare(`
-        INSERT INTO soci (
-          id, tipo_socio, is_minore, tutore_id, nome, cognome, codice_fiscale,
-          data_nascita, luogo_nascita, residenza_indirizzo, email, telefono,
-          stato_richiesta, anno_adesione, data_domanda
-        ) VALUES (
-          ?, 'ordinario', 1, ?, ?, ?, ?,
-          ?, ?, ?, ?, ?,
-          'in_attesa', 2026, datetime('now')
-        )
-      `).bind(
-        socioId, tutoreId, minoreNome, minoreCognome, minoreCf,
-        minoreNascita, minoreLuogo, minoreIndirizzo, tutoreEmail, tutoreTelefono
-      ).run();
+      const tutoreRes = await env.DB.prepare(`
+        INSERT INTO tutori (nome, cognome, codice_fiscale, telefono, email, grado_parentela)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).bind(tutoreNome, tutoreCognome, tutoreCf, tutoreTelefono, tutoreEmail, gradoParentela).run();
+      tutoreId = tutoreRes.meta.last_row_id;
     }
 
-    // 3. Iscrizione al Corso Teatrale
+    // 2. Inserimento Socio Minore (in_attesa di delibera del Direttivo)
+    const socioRes = await env.DB.prepare(`
+      INSERT INTO soci (
+        nome, cognome, codice_fiscale, data_nascita, luogo_nascita,
+        residenza_indirizzo, tutore_id, is_minore, tipologia, stato_richiesta, data_domanda
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, 'ordinario', 'in_attesa', datetime('now'))
+    `).bind(
+      minoreNome, minoreCognome, minoreCf, minoreNascita, minoreLuogo,
+      residenzaIndirizzo, tutoreId
+    ).run();
+
+    const socioId = socioRes.meta.last_row_id;
+
+    // 3. Registrazione Consensi Privacy
     await env.DB.prepare(`
-      INSERT OR REPLACE INTO iscrizioni_corsi (id, socio_id, attivita_id, stato_iscrizione, data_iscrizione)
-      VALUES (?, ?, ?, 'confermata', datetime('now'))
-    `).bind("isc-" + socioId, socioId, DEFAULT_CORSO_ID).run();
+      INSERT INTO consensi_privacy (
+        socio_id, accettazione_statuto, consenso_trattamento_dati,
+        consenso_foto_video, consenso_newsletter
+      ) VALUES (?, ?, ?, ?, ?)
+    `).bind(socioId, statuto, privacy, foto, newsletter).run();
 
-    // 4. Inserimento Deleghe
-    if (delega1Nome) {
+    // 4. Registrazione Deleghe al Ritiro (se compilate)
+    if (delega1Nome && delega1Cognome) {
       await env.DB.prepare(`
-        INSERT INTO deleghe_ritiro (id, socio_minore_id, nome, cognome, telefono, relazione)
-        VALUES (?, ?, ?, '', ?, ?)
-      `).bind("del1-" + socioId, socioId, delega1Nome, delega1Tel, delega1Rel).run();
-    }
-    if (delega2Nome) {
-      await env.DB.prepare(`
-        INSERT INTO deleghe_ritiro (id, socio_minore_id, nome, cognome, telefono, relazione)
-        VALUES (?, ?, ?, '', ?, ?)
-      `).bind("del2-" + socioId, socioId, delega2Nome, delega2Tel, delega2Rel).run();
+        INSERT INTO deleghe_ritiro (socio_minore_id, nome, cognome, telefono, relazione)
+        VALUES (?, ?, ?, ?, ?)
+      `).bind(socioId, delega1Nome, delega1Cognome, delega1Telefono, delega1Relazione).run();
     }
 
-    // 5. Consensi Privacy & Statuto
+    if (delega2Nome && delega2Cognome) {
+      await env.DB.prepare(`
+        INSERT INTO deleghe_ritiro (socio_minore_id, nome, cognome, telefono, relazione)
+        VALUES (?, ?, ?, ?, ?)
+      `).bind(socioId, delega2Nome, delega2Cognome, delega2Telefono, delega2Relazione).run();
+    }
+
+    // 5. Iscrizione al Corso Teatrale (con garanzia presenza attività in D1)
     await env.DB.prepare(`
-      INSERT OR REPLACE INTO consensi_privacy (
-        id, socio_id, accettazione_statuto, consenso_trattamento_dati,
-        consenso_foto_video, consenso_newsletter, data_consenso
-      ) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
-    `).bind("cons-" + socioId, socioId, accettaStatuto, consensoPrivacy, consensoFoto, consensoNews).run();
+      INSERT OR IGNORE INTO attivita_eventi (id, titolo, tipo, descrizione)
+      VALUES (?, 'Laboratorio Teatrale Bambini & Ragazzi', 'corso', 'Laboratorio teatrale annuale per allievi minori')
+    `).bind(corsoId).run();
 
-    return new Response(null, {
-      status: 302,
-      headers: {
-        Location: `/?success=1&socio=${encodeURIComponent(minoreNome + " " + minoreCognome)}`
-      }
-    });
-  } catch (err) {
-    console.error("Errore salvataggio domanda:", err);
-    return new Response("Errore durante il salvataggio dei dati: " + err.message, { status: 500 });
+    await env.DB.prepare(`
+      INSERT INTO iscrizioni_corsi (socio_id, attivita_id, stato_iscrizione)
+      VALUES (?, ?, 'confermata')
+    `).bind(socioId, corsoId).run();
+
+    return Response.redirect(`${url.origin}/?success=1&socio=${encodeURIComponent(minoreNome)}`, 303);
+  } catch (e) {
+    console.error("Errore salvataggio iscrizione:", e);
+    return new Response(`Errore salvataggio iscrizione: ${e.message}`, { status: 500 });
   }
 }
