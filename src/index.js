@@ -14,7 +14,8 @@
 
 const SESSION_COOKIE_NAME = "cervelli_admin_sess";
 const SESSION_DURATION_HOURS = 12;
-const PBKDF2_SALT = "cervelli_aps_secure_salt_2026_uilt";
+const PBKDF2_SALT = "cervelli-aps-security-salt-2026";
+const LEGACY_SALT_UILT = "cervelli_aps_secure_salt_2026_uilt";
 
 // Configurazione predefinita del tema (usata se la tabella D1 non è ancora popolata)
 const DEFAULT_THEME = {
@@ -56,95 +57,29 @@ export default {
       }
     }
 
-    // Rotte dell'Area Amministrativa e Gestionale (/admin e sottomenu)
+    // Rotte dell'Area Amministrativa (/admin*)
     if (url.pathname.startsWith("/admin")) {
       return handleAdminRoutes(request, env, url);
     }
 
-    // Rotte del Portale Pubblico (Modulo Iscrizione Corsi Minori & Domanda Socio)
-    return handlePublicRoutes(request, env, url, ctx);
+    // Assicura l'esistenza del corso predefinito in D1
+    await seedDefaultCourseIfNeeded(env);
+
+    // Ricezione modulo iscrizione e domanda socio (POST)
+    if (request.method === "POST" && (url.pathname === "/" || url.pathname === "/iscrizione-minori")) {
+      return handleIscrizionePost(request, env, ctx);
+    }
+
+    // Portale pubblico: Wizard a passaggi
+    if (url.pathname === "/" || url.pathname === "/iscrizione-minori") {
+      const step = parseInt(url.searchParams.get("step") || "1", 10);
+      const isSuccess = url.searchParams.get("success") === "1";
+      return renderPublicWizard(step, isSuccess, url.searchParams);
+    }
+
+    return new Response("Pagina non trovata", { status: 404 });
   }
 };
-
-/* =========================================================================
-   CARICAMENTO DINAMICO DELLE IMPOSTAZIONI DAL DATABASE D1
-   ========================================================================= */
-
-async function getThemeSettings(env) {
-  try {
-    const { results } = await env.DB.prepare(
-      "SELECT chiave, valore FROM impostazioni_gestionale"
-    ).all();
-
-    if (!results || results.length === 0) {
-      return { ...DEFAULT_THEME };
-    }
-
-    const config = { ...DEFAULT_THEME };
-    for (const row of results) {
-      if (row.valore !== null && row.valore !== undefined) {
-        config[row.chiave] = row.valore;
-      }
-    }
-    return config;
-  } catch (err) {
-    console.warn("Tabella impostazioni_gestionale non ancora disponibile, uso valori di fallback:", err.message);
-    return { ...DEFAULT_THEME };
-  }
-}
-
-/* =========================================================================
-   SALVATAGGIO CONFIGURAZIONI TEMA SU D1 (POST DA ADMIN BUILDER TEMA)
-   ========================================================================= */
-
-async function handleSalvaTemaPost(request, env, user) {
-  try {
-    const form = await request.formData();
-
-    const chiaviPermesse = [
-      "nome_associazione",
-      "dominio_ufficiale",
-      "colore_primario",
-      "colore_secondario",
-      "colore_scuro",
-      "colore_sfondo",
-      "colore_accento",
-      "colore_testo",
-      "scala_font",
-      "url_logo",
-      "email_contatto"
-    ];
-
-    const statements = [];
-    for (const chiave of chiaviPermesse) {
-      const val = form.get(chiave);
-      if (val !== null && val !== undefined) {
-        statements.push(
-          env.DB.prepare(
-            `INSERT INTO impostazioni_gestionale (chiave, valore, data_aggiornamento)
-             VALUES (?, ?, datetime('now'))
-             ON CONFLICT(chiave) DO UPDATE SET valore=excluded.valore, data_aggiornamento=datetime('now')`
-          ).bind(chiave, val.toString().trim())
-        );
-      }
-    }
-
-    if (statements.length > 0) {
-      await env.DB.batch(statements);
-    }
-
-    return new Response(null, {
-      status: 302,
-      headers: { Location: "/admin?view=theme-builder&msg=tema_salvato" }
-    });
-  } catch (e) {
-    console.error("Errore salvataggio tema:", e);
-    return new Response(null, {
-      status: 302,
-      headers: { Location: `/admin?view=theme-builder&msg=err_salvataggio&err=${encodeURIComponent(e.message)}` }
-    });
-  }
-}
 
 /* =========================================================================
    ROUTER AREA AMMINISTRATIVA
@@ -214,7 +149,7 @@ async function handleAdminRoutes(request, env, url) {
    AUTENTICAZIONE E SICUREZZA CON PBKDF2 (WEB CRYPTO)
    ========================================================================= */
 
-async function hashPassword(password) {
+async function hashPassword(password, salt = PBKDF2_SALT) {
   const enc = new TextEncoder();
   const keyMaterial = await crypto.subtle.importKey(
     "raw",
@@ -227,7 +162,7 @@ async function hashPassword(password) {
   const derivedKey = await crypto.subtle.deriveKey(
     {
       name: "PBKDF2",
-      salt: enc.encode(PBKDF2_SALT),
+      salt: enc.encode(salt),
       iterations: 100000,
       hash: "SHA-256"
     },
@@ -243,24 +178,72 @@ async function hashPassword(password) {
     .join("");
 }
 
+async function verifyPasswordMatch(password, storedHash) {
+  if (!storedHash || !password) return false;
+
+  // 1. Prova con salt standard originale (cervelli-aps-security-salt-2026)
+  const h1 = await hashPassword(password, PBKDF2_SALT);
+  if (h1 === storedHash) return true;
+
+  // 2. Prova con deriveBits (formato usato nei primi test)
+  try {
+    const enc = new TextEncoder();
+    const km = await crypto.subtle.importKey("raw", enc.encode(password), { name: "PBKDF2" }, false, ["deriveBits"]);
+    const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", salt: enc.encode(PBKDF2_SALT), iterations: 100000, hash: "SHA-256" }, km, 256);
+    const h2 = Array.from(new Uint8Array(bits)).map(b => b.toString(16).padStart(2, "0")).join("");
+    if (h2 === storedHash) return true;
+  } catch (e) {}
+
+  // 3. Prova con HMAC (variante intermedia)
+  try {
+    const enc = new TextEncoder();
+    const km = await crypto.subtle.importKey("raw", enc.encode(password), { name: "PBKDF2" }, false, ["deriveBits", "deriveKey"]);
+    const dk = await crypto.subtle.deriveKey({ name: "PBKDF2", salt: enc.encode(PBKDF2_SALT), iterations: 100000, hash: "SHA-256" }, km, { name: "HMAC", hash: "SHA-256", length: 256 }, true, ["sign"]);
+    const exp = await crypto.subtle.exportKey("raw", dk);
+    const h3 = Array.from(new Uint8Array(exp)).map(b => b.toString(16).padStart(2, "0")).join("");
+    if (h3 === storedHash) return true;
+  } catch (e) {}
+
+  // 4. Prova con salt alternativo temporaneo
+  const h4 = await hashPassword(password, LEGACY_SALT_UILT);
+  if (h4 === storedHash) return true;
+
+  // 5. Prova con hash SHA-256 semplice (primissimo avvio)
+  try {
+    const enc = new TextEncoder();
+    const data = enc.encode(password + ":cervelli-aps-gestionale-2026");
+    const buf = await crypto.subtle.digest("SHA-256", data);
+    const h5 = Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, "0")).join("");
+    if (h5 === storedHash) return true;
+  } catch (e) {}
+
+  return false;
+}
+
 function generateSecureToken() {
   const bytes = new Uint8Array(32);
   crypto.getRandomValues(bytes);
   return Array.from(bytes).map(b => b.toString(16).padStart(2, "0")).join("");
 }
 
+function parseCookies(cookieHeader) {
+  const list = {};
+  if (!cookieHeader) return list;
+  cookieHeader.split(";").forEach(cookie => {
+    let [name, ...rest] = cookie.split("=");
+    name = name?.trim();
+    if (!name) return;
+    const value = rest.join("=").trim();
+    if (value) list[name] = decodeURIComponent(value);
+  });
+  return list;
+}
+
 async function getAdminSession(request, env) {
   const cookieHeader = request.headers.get("Cookie");
   if (!cookieHeader) return null;
-
-  const cookies = Object.fromEntries(
-    cookieHeader.split(";").map(c => {
-      const parts = c.trim().split("=");
-      return [parts[0], parts.slice(1).join("=")];
-    })
-  );
-
-  const token = cookies[SESSION_COOKIE_NAME];
+  const cookies = parseCookies(cookieHeader);
+  const token = cookies[SESSION_COOKIE_NAME] || cookies["cervelli_admin_session"];
   if (!token) return null;
 
   try {
@@ -338,7 +321,7 @@ async function handleLoginPost(request, env) {
     const password = form.get("password");
 
     if (!email || !password) {
-      return renderLoginPage("Inserisci sia l'email che la password.");
+      return renderLoginPage("Inserisci sia l'email che la password.", email);
     }
 
     const user = await env.DB.prepare(`
@@ -349,12 +332,22 @@ async function handleLoginPost(request, env) {
     `).bind(email).first();
 
     if (!user) {
-      return renderLoginPage("Credenziali non valide o utente non attivo.");
+      return renderLoginPage("Credenziali non valide o utente non attivo.", email);
     }
 
-    const inputHash = await hashPassword(password);
-    if (inputHash !== user.password_hash) {
-      return renderLoginPage("Credenziali non valide.");
+    const passwordValida = await verifyPasswordMatch(password, user.password_hash);
+    if (!passwordValida) {
+      return renderLoginPage("Credenziali non valide.", email);
+    }
+
+    // Se l'impronta salvata era in un formato precedente, la aggiorna automaticamente al formato standard
+    const standardHash = await hashPassword(password, PBKDF2_SALT);
+    if (user.password_hash !== standardHash) {
+      try {
+        await env.DB.prepare("UPDATE utenti_gestionale SET password_hash = ? WHERE id = ?").bind(standardHash, user.id).run();
+      } catch (e) {
+        console.error("Errore aggiornamento hash utente:", e);
+      }
     }
 
     const token = generateSecureToken();
@@ -374,1373 +367,724 @@ async function handleLoginPost(request, env) {
       }
     });
   } catch (err) {
-    console.error("Errore durante il login:", err);
-    return renderLoginPage("Errore di sistema durante l'accesso.");
+    console.error("Errore login:", err);
+    return renderLoginPage("Errore del server durante il login: " + err.message);
   }
 }
 
-async function handleLogout(request, env) {
-  const cookieHeader = request.headers.get("Cookie") || "";
-  const cookies = Object.fromEntries(
-    cookieHeader.split(";").map(c => {
-      const parts = c.trim().split("=");
-      return [parts[0], parts.slice(1).join("=")];
-    })
-  );
-
-  const token = cookies[SESSION_COOKIE_NAME];
-  if (token) {
-    try {
-      await env.DB.prepare("DELETE FROM sessioni_admin WHERE token = ?").bind(token).run();
-    } catch (e) {
-      console.warn("Errore eliminazione token sessione:", e);
-    }
-  }
-
-  const deleteCookie = `${SESSION_COOKIE_NAME}=; Path=/; HttpOnly; Max-Age=0; SameSite=Lax`;
+function handleLogout(request, env) {
+  const cookieValue = `${SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0; Secure`;
   return new Response(null, {
     status: 302,
     headers: {
-      "Location": "/admin",
-      "Set-Cookie": deleteCookie
+      "Location": "/admin/login",
+      "Set-Cookie": cookieValue
     }
   });
 }
 
 /* =========================================================================
-   DELIBERA DEL CONSIGLIO DIRETTIVO E ASSEGNAZIONE TESSERA APS
+   GESTIONE IMPOSTAZIONI TEMA (MACRO-AREA 4.2)
    ========================================================================= */
 
-async function handleDeliberaPost(request, env, user) {
+async function getTemaGestionale(env) {
   try {
-    const form = await request.formData();
-    const socioId = form.get("socio_id");
-    const dataDelibera = form.get("data_delibera");
-    const numeroVerbale = form.get("numero_verbale")?.trim();
-    const numeroTessera = form.get("numero_tessera")?.trim();
-    const dataSaldoQuota = form.get("data_saldo_quota");
-    const modalitaPagamento = form.get("modalita_pagamento") || "contanti";
+    const { results } = await env.DB.prepare(
+      "SELECT chiave, valore FROM impostazioni_gestionale WHERE gruppo IN ('brand', 'tema', 'contatti')"
+    ).all();
 
-    if (!socioId || !dataDelibera || !numeroVerbale || !numeroTessera) {
-      return new Response("Tutti i campi di delibera sono obbligatori.", { status: 400 });
+    if (!results || results.length === 0) {
+      return DEFAULT_THEME;
     }
 
-    const statements = [
-      env.DB.prepare(`
-        UPDATE soci
-        SET stato_iscrizione = 'attivo',
-            data_ammissione = ?,
-            delibera_verbale_ammissione = ?,
-            numero_tessera_aps = ?,
-            aggiornato_il = datetime('now')
-        WHERE id = ?
-      `).bind(dataDelibera, numeroVerbale, numeroTessera, socioId),
+    const config = { ...DEFAULT_THEME };
+    for (const row of results) {
+      if (row.valore !== null && row.valore !== undefined) {
+        config[row.chiave] = row.valore;
+      }
+    }
+    return config;
+  } catch (err) {
+    console.warn("Tabella impostazioni_gestionale non ancora pronta o vuota. Uso tema default:", err.message);
+    return DEFAULT_THEME;
+  }
+}
 
-      env.DB.prepare(`
-        UPDATE quote_sociali
-        SET stato_pagamento = 'saldato',
-            data_pagamento = ?,
-            modalita_pagamento = ?
-        WHERE socio_id = ?
-      `).bind(dataSaldoQuota || dataDelibera, modalitaPagamento, socioId)
+async function handleSalvaTemaPost(request, env, user) {
+  try {
+    const form = await request.formData();
+    const nome_associazione = form.get("nome_associazione")?.trim() || DEFAULT_THEME.nome_associazione;
+    const dominio_ufficiale = form.get("dominio_ufficiale")?.trim() || DEFAULT_THEME.dominio_ufficiale;
+    const email_contatto = form.get("email_contatto")?.trim() || DEFAULT_THEME.email_contatto;
+    const url_logo = form.get("url_logo")?.trim() || DEFAULT_THEME.url_logo;
+    const colore_primario = form.get("colore_primario")?.trim() || DEFAULT_THEME.colore_primario;
+    const colore_secondario = form.get("colore_secondario")?.trim() || DEFAULT_THEME.colore_secondario;
+    const colore_scuro = form.get("colore_scuro")?.trim() || DEFAULT_THEME.colore_scuro;
+    const scala_font = form.get("scala_font")?.trim() || DEFAULT_THEME.scala_font;
+
+    const upsertSql = `
+      INSERT INTO impostazioni_gestionale (chiave, valore, gruppo, tipo, aggiornato_il)
+      VALUES (?, ?, ?, 'testo', datetime('now'))
+      ON CONFLICT(chiave) DO UPDATE SET valore = excluded.valore, aggiornato_il = datetime('now');
+    `;
+
+    const statements = [
+      env.DB.prepare(upsertSql).bind("nome_associazione", nome_associazione, "brand"),
+      env.DB.prepare(upsertSql).bind("dominio_ufficiale", dominio_ufficiale, "brand"),
+      env.DB.prepare(upsertSql).bind("email_contatto", email_contatto, "contatti"),
+      env.DB.prepare(upsertSql).bind("url_logo", url_logo, "brand"),
+      env.DB.prepare(upsertSql).bind("colore_primario", colore_primario, "tema"),
+      env.DB.prepare(upsertSql).bind("colore_secondario", colore_secondario, "tema"),
+      env.DB.prepare(upsertSql).bind("colore_scuro", colore_scuro, "tema"),
+      env.DB.prepare(upsertSql).bind("scala_font", scala_font, "tema")
     ];
 
     await env.DB.batch(statements);
 
     return new Response(null, {
       status: 302,
-      headers: { Location: "/admin?view=domande&msg=delibera_completata" }
+      headers: { Location: "/admin?view=theme-builder&msg=tema_salvato" }
     });
   } catch (err) {
-    console.error("Errore durante la delibera:", err);
-    return new Response("Errore durante il salvataggio della delibera: " + err.message, { status: 500 });
+    console.error("Errore salvataggio tema:", err);
+    return new Response(null, {
+      status: 302,
+      headers: { Location: "/admin?view=theme-builder&err=" + encodeURIComponent(err.message) }
+    });
   }
 }
 
 /* =========================================================================
-   DEFINIZIONE DELLA STRUTTURA UFFICIALE DEL GESTIONALE (BIBBIA v2.4)
+   DELIBERA CONSIGLIO DIRETTIVO E APPROVAZIONE DOMANDE
    ========================================================================= */
 
-const MACRO_AREE = [
-  {
-    id: "soci",
-    numero: "1",
-    titolo: "Soci & Libro Soci",
-    icona: "users",
-    colore: "#D98295",
-    descrizione: "Gestione domande di ammissione, Libro Soci ufficiale, anagrafiche minori, quote sociali e tesseramento nazionale UILT.",
-    sezioni: [
-      { id: "domande", etichetta: "1.1 Domande Ammissione", desc: "Verifica e delibera delle richieste di nuovi soci o minori dei laboratori." },
-      { id: "libro-soci", etichetta: "1.2 Libro Soci Ufficiale", desc: "Registro anagrafico soci attivi con stato quota APS e data verbale delibera." },
-      { id: "tutori-minori", etichetta: "1.3 Tutori & Minori", desc: "Elenco genitori, deleghe di ritiro per i corsi e contatti per emergenze." },
-      { id: "uilt", etichetta: "1.4 Tesseramento UILT", desc: "Copertura infortuni/RC e caricamento attestati tessera UILT in PDF." }
-    ]
-  },
-  {
-    id: "corsi",
-    numero: "2",
-    titolo: "Attività & Corsi",
-    icona: "graduation-cap",
-    colore: "#38BDF8",
-    descrizione: "Laboratori teatrali per bambini, ragazzi e adulti, registri allievi, quote di frequenza e foglio presenze.",
-    sezioni: [
-      { id: "laboratori", etichetta: "2.1 Elenco Corsi & Laboratori", desc: "Corsi teatrali attivi, fasce orarie, sedi di svolgimento e docenti." },
-      { id: "presenze", etichetta: "2.2 Registro Presenze", desc: "Foglio presenze lezioni con spunta allievi presenti ed esportazione PDF." },
-      { id: "quote-corsi", etichetta: "2.3 Quote & Rate Frequenza", desc: "Stato dei pagamenti mensili o quadrimestrali per la frequenza ai laboratori." }
-    ]
-  },
-  {
-    id: "teatro",
-    numero: "3",
-    titolo: "Eventi, Teatro & Casse",
-    icona: "ticket",
-    colore: "#F59E0B",
-    descrizione: "Cartellone spettacoli, cene con delitto, eventi sul territorio, gestione prenotazioni e casse distinte.",
-    sezioni: [
-      { id: "cartellone", etichetta: "3.1 Cartellone Spettacoli", desc: "Stagione teatrale, date di debutto e repliche con mappa posti a sedere." },
-      { id: "altri-eventi", etichetta: "3.2 Cene con Delitto & Eventi", desc: "Eventi gastronomici e animazioni con moduli di iscrizione dedicati." },
-      { id: "prenotazioni", etichetta: "3.3 Gestione Prenotazioni", desc: "Ricerca persistente, modifica capienza, omaggi e ingressi con codice univoco." },
-      { id: "cassa-teatro", etichetta: "3.4 Cassa Spettacoli Teatrali", desc: "Biglietteria sul posto, gestione piantina platea e saldo all'ingresso." },
-      { id: "cassa-eventi", etichetta: "3.5 Cassa Altri Eventi", desc: "Incassi quote eventi esterni, modalità flessibili e causali personalizzate." }
-    ]
-  },
-  {
-    id: "builder",
-    numero: "4",
-    titolo: "Builder & Contenuti",
-    icona: "palette",
-    colore: "#10B981",
-    descrizione: "Strumenti per personalizzare logo, colori, moduli pubblici, modelli di tessere e comunicazioni email.",
-    sezioni: [
-      { id: "form-builder", etichetta: "4.1 Form Builder Dinamico", desc: "Modifica campi, consensi e requisiti dei form pubblici senza toccare il codice." },
-      { id: "theme-builder", etichetta: "4.2 Builder Tema & Identità Visiva", desc: "Configura colori, sfondi, logo e layout di portale e gestionale." },
-      { id: "card-builder", etichetta: "4.3 Builder Tessera APS", desc: "Layout grafico della tessera associativa digitale stampabile o scaricabile." },
-      { id: "email-templates", etichetta: "4.4 Template Email & Comunicazioni", desc: "Modelli automatici per conferme iscrizione, delibere e solleciti quote." }
-    ]
-  },
-  {
-    id: "sistema",
-    numero: "5",
-    titolo: "Sistema & Utenti",
-    icona: "shield",
-    colore: "#818CF8",
-    descrizione: "Gestione accessi direttivo e operatori, permessi granulari, sicurezza database, log e backup.",
-    sezioni: [
-      { id: "utenti", etichetta: "5.1 Gestione Utenti & Ruoli", desc: "Accessi Super Admin, Direttivo, Cassa e Operatori con permessi differenziati." },
-      { id: "log-audit", etichetta: "5.2 Registro Eventi & Audit", desc: "Storico modifiche per trasparenza interna e conformità al Terzo Settore." },
-      { id: "backup-dati", etichetta: "5.3 Backup & Esportazione Dati", desc: "Esportazione completa in CSV/Excel e copie di salvataggio conformi a D1." }
-    ]
-  }
-];
+async function handleDeliberaPost(request, env, user) {
+  try {
+    const form = await request.formData();
+    const socioId = form.get("socio_id");
+    const numVerbale = form.get("numero_verbale")?.trim();
+    const dataDelibera = form.get("data_delibera") || new Date().toISOString().split("T")[0];
+    const numTessera = form.get("numero_tessera")?.trim();
 
-function getIconSvg(name, size = 20) {
-  const icons = {
-    "dashboard": `<path d="M3 3h7v7H3z"/><path d="M14 3h7v7h-7z"/><path d="M14 14h7v7h-7z"/><path d="M3 14h7v7H3z"/>`,
-    "users": `<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>`,
-    "graduation-cap": `<path d="M22 10v6M2 10l10-5 10 5-10 5z"/><path d="M6 12v5c0 2 2 3 6 3s6-1 6-3v-5"/>`,
-    "ticket": `<rect x="2" y="6" width="20" height="12" rx="2"/><line x1="6" y1="12" x2="18" y2="12"/><line x1="12" y1="6" x2="12" y2="18"/>`,
-    "palette": `<circle cx="13.5" cy="6.5" r=".5"/><circle cx="17.5" cy="10.5" r=".5"/><circle cx="8.5" cy="7.5" r=".5"/><circle cx="6.5" cy="12.5" r=".5"/><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.926 0 1.648-.746 1.648-1.688 0-.437-.18-.835-.437-1.125-.29-.289-.438-.652-.438-1.125a1.64 1.64 0 0 1 1.668-1.668h1.996c3.051 0 5.555-2.503 5.555-5.554C21.965 6.012 17.461 2 12 2z"/>`,
-    "shield": `<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>`
-  };
-  const body = icons[name] || icons["dashboard"];
-  return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${body}</svg>`;
+    if (!socioId || !numVerbale || !numTessera) {
+      return new Response("Dati mancanti per la delibera.", { status: 400 });
+    }
+
+    await env.DB.prepare(`
+      UPDATE soci
+      SET stato_ammissione = 'approvata',
+          numero_verbale_ammissione = ?,
+          data_delibera_ammissione = ?,
+          numero_tessera_aps = ?,
+          aggiornato_il = datetime('now')
+      WHERE id = ?
+    `).bind(numVerbale, dataDelibera, numTessera, socioId).run();
+
+    return new Response(null, {
+      status: 302,
+      headers: { Location: "/admin?view=domande&msg=delibera_ok" }
+    });
+  } catch (err) {
+    console.error("Errore delibera socio:", err);
+    return new Response("Errore durante la delibera: " + err.message, { status: 500 });
+  }
 }
 
 /* =========================================================================
-   RENDERING AREA AMMINISTRATIVA (DASHBOARD, HUB E BUILDER TEMA)
+   RENDER INTERFACCIA AMMINISTRATIVA (DASHBOARD, HUB E BUILDER TEMA)
    ========================================================================= */
 
 async function renderAdminDashboard(env, user, url) {
-  const currentView = url.searchParams.get("view") || "dashboard";
+  const view = url.searchParams.get("view") || "dashboard";
   const msg = url.searchParams.get("msg");
-  const theme = await getThemeSettings(env);
+  const err = url.searchParams.get("err");
 
-  // 1. Dati statistici di riepilogo per la Dashboard Generale
-  let stats = { domandeAttesa: 0, sociAttivi: 0, corsiAttivi: 1, incassiTotali: 0 };
-  let domande = [];
+  const tema = await getTemaGestionale(env);
+
+  // Conteggi statistici generali
+  let countDomande = 0;
+  let countSociAttivi = 0;
+  let countCorsi = 0;
 
   try {
-    const dAttesa = await env.DB.prepare(
-      "SELECT COUNT(*) as count FROM soci WHERE stato_iscrizione = 'in_attesa_delibera'"
-    ).first();
-    stats.domandeAttesa = dAttesa?.count || 0;
+    const r1 = await env.DB.prepare("SELECT COUNT(*) as c FROM soci WHERE stato_ammissione = 'in_attesa'").first();
+    countDomande = r1 ? r1.c : 0;
 
-    const sAttivi = await env.DB.prepare(
-      "SELECT COUNT(*) as count FROM soci WHERE stato_iscrizione = 'attivo'"
-    ).first();
-    stats.sociAttivi = sAttivi?.count || 0;
+    const r2 = await env.DB.prepare("SELECT COUNT(*) as c FROM soci WHERE stato_ammissione = 'approvata'").first();
+    countSociAttivi = r2 ? r2.c : 0;
 
-    domande = await env.DB.prepare(`
-      SELECT 
-        s.id, s.nome, s.cognome, s.codice_fiscale, s.data_nascita, s.luogo_nascita,
-        s.tipo_socio, s.stato_iscrizione, s.creato_il,
-        t.nome as tutore_nome, t.cognome as tutore_cognome, t.telefono as tutore_telefono,
-        t.email as tutore_email, t.grado_parentela,
-        q.importo as quota_importo, q.stato_pagamento as quota_stato
+    const r3 = await env.DB.prepare("SELECT COUNT(*) as c FROM attivita_eventi WHERE attivo = 1").first();
+    countCorsi = r3 ? r3.c : 0;
+  } catch (e) {
+    console.error("Errore statistiche dashboard:", e);
+  }
+
+  // Lista domande di ammissione
+  let listaDomande = [];
+  try {
+    const { results } = await env.DB.prepare(`
+      SELECT s.id, s.nome, s.cognome, s.tipologia, s.quota_dovuta, s.creato_il, s.stato_ammissione,
+             t.nome as tutore_nome, t.cognome as tutore_cognome, t.email as tutore_email, t.telefono as tutore_tel
       FROM soci s
       LEFT JOIN tutori t ON s.tutore_id = t.id
-      LEFT JOIN quote_sociali q ON q.socio_id = s.id AND q.stagione = '2025/2026'
-      WHERE s.stato_iscrizione = 'in_attesa_delibera'
-      ORDER BY s.creato_il ASC
+      ORDER BY s.creato_il DESC
+      LIMIT 25
     `).all();
-  } catch (err) {
-    console.warn("Errore caricamento statistiche dashboard:", err.message);
+    listaDomande = results || [];
+  } catch (e) {
+    console.error("Errore caricamento lista domande:", e);
   }
 
-  // Costruzione della Sidebar Ufficiale
-  let sidebarHtml = `
-    <div class="sidebar-brand">
-      <div class="logo-box">
-        <img src="${theme.url_logo}" alt="Logo" class="brand-img" onerror="this.style.display='none'; document.getElementById('logoSvgFallback').style.display='block';">
-        <div id="logoSvgFallback" style="display:none;">${getIconSvg("shield", 28)}</div>
-      </div>
-      <div>
-        <div class="brand-title">${theme.nome_associazione}</div>
-        <div class="brand-badge">${user.ruolo === 'super_admin' ? 'SUPER ADMIN' : user.ruolo.toUpperCase()}</div>
-      </div>
-    </div>
+  // Costruzione della vista principale in base al parametro view
+  let contenutoPrincipale = "";
+  let titoloSezione = "Dashboard Generale";
+  let breadcrumb = "Panoramica Associazione";
 
-    <div class="sidebar-menu">
-      <div class="menu-section-title">AREA GESTIONALE</div>
-      <a href="/admin?view=dashboard" class="menu-item-root ${currentView === 'dashboard' ? 'active' : ''}">
-        <span class="icon">${getIconSvg("dashboard", 18)}</span>
-        <span class="text">Dashboard Generale</span>
-      </a>
-
-      <div class="menu-section-title" style="margin-top: 18px;">MACRO-AREE BIBBIA</div>
-  `;
-
-  for (const macro of MACRO_AREE) {
-    const isMacroActive = currentView.startsWith(macro.id) || macro.sezioni.some(s => s.id === currentView);
-    sidebarHtml += `
-      <div class="macro-group ${isMacroActive ? 'open' : ''}">
-        <a href="/admin?view=${macro.id}-hub" class="macro-header ${isMacroActive ? 'active' : ''}">
-          <span class="icon" style="color: ${macro.colore};">${getIconSvg(macro.icona, 18)}</span>
-          <span class="text">${macro.titolo}</span>
-          <span class="arrow">${isMacroActive ? '▾' : '▸'}</span>
-        </a>
-        <div class="macro-subitems">
-          ${macro.sezioni.map(sez => `
-            <a href="/admin?view=${sez.id}" class="subitem ${currentView === sez.id ? 'active' : ''}">
-              <span class="subitem-dot"></span>
-              <span class="text">${sez.etichetta}</span>
-            </a>
-          `).join("")}
-        </div>
+  if (view === "dashboard") {
+    titoloSezione = "Dashboard Generale";
+    breadcrumb = "Panoramica Associazione";
+    contenutoPrincipale = renderVistaDashboard(countDomande, countSociAttivi, countCorsi, listaDomande, tema);
+  } else if (view === "hub-soci") {
+    titoloSezione = "1. Soci & Libro Soci";
+    breadcrumb = "Macro-Area 1 • Gestione Associati UILT";
+    contenutoPrincipale = renderHubSoci(countDomande, countSociAttivi);
+  } else if (view === "domande") {
+    titoloSezione = "1.1 Domande di Ammissione";
+    breadcrumb = "Soci & Libro Soci • Delibere Consiglio Direttivo";
+    contenutoPrincipale = renderTabellaDomande(listaDomande);
+  } else if (view === "hub-corsi") {
+    titoloSezione = "2. Attività & Corsi";
+    breadcrumb = "Macro-Area 2 • Laboratori Teatrali";
+    contenutoPrincipale = renderHubCorsi(countCorsi);
+  } else if (view === "hub-eventi") {
+    titoloSezione = "3. Eventi, Biglietteria & Casse";
+    breadcrumb = "Macro-Area 3 • Stagione Teatrale e Altri Eventi";
+    contenutoPrincipale = renderHubEventi();
+  } else if (view === "hub-builder") {
+    titoloSezione = "4. Builder & Contenuti";
+    breadcrumb = "Macro-Area 4 • Personalizzazione Senza Codice";
+    contenutoPrincipale = renderHubBuilder();
+  } else if (view === "theme-builder") {
+    titoloSezione = "4.2 Builder Tema & Identità Visiva";
+    breadcrumb = "Builder & Contenuti • Palette, Logo e Tipografia";
+    contenutoPrincipale = renderThemeBuilderView(tema, msg, err);
+  } else if (view === "hub-sistema") {
+    titoloSezione = "5. Sistema & Utenti";
+    breadcrumb = "Macro-Area 5 • Permessi e Sicurezza";
+    contenutoPrincipale = renderHubSistema();
+  } else {
+    titoloSezione = "Sezione in Allestimento";
+    breadcrumb = "Bibbia Gestionale v2.4";
+    contenutoPrincipale = `
+      <div class="card" style="padding: 40px; text-align: center;">
+        <h3 style="color: #FFF; font-size: 18px; margin-bottom: 8px;">Modulo "${view}" previsto dalla Bibbia</h3>
+        <p style="color: #A1A1AA; font-size: 14px; max-width: 500px; margin: 0 auto 20px;">
+          Questa sezione è mappata nell'architettura ufficiale e verrà attivata nei prossimi rilasci del gestionale.
+        </p>
+        <a href="/admin?view=dashboard" class="btn btn-secondary">Torna alla Dashboard</a>
       </div>
     `;
   }
 
-  sidebarHtml += `</div>`;
-
-  // Costruzione del corpo centrale in base alla vista selezionata
-  let mainContentHtml = "";
-
-  if (currentView === "dashboard") {
-    mainContentHtml = `
-      <div class="page-header">
-        <div class="page-title-box">
-          <span class="page-icon">${getIconSvg("dashboard", 24)}</span>
-          <div>
-            <h1>Dashboard Generale</h1>
-            <p class="breadcrumbs">Pannello Gestionale &gt; Panoramica Associazione &gt; Dashboard Generale</p>
-          </div>
-        </div>
-      </div>
-
-      <div class="stats-grid">
-        <div class="stat-card">
-          <div class="stat-label">DOMANDE IN ATTESA CD</div>
-          <div class="stat-value" style="color: #F59E0B;">${stats.domandeAttesa}</div>
-          <div class="stat-desc">Richieste di ammissione da deliberare</div>
-        </div>
-        <div class="stat-card">
-          <div class="stat-label">SOCI ATTIVI & TESSERATI</div>
-          <div class="stat-value" style="color: #10B981;">${stats.sociAttivi}</div>
-          <div class="stat-desc">Soci con tessera APS attiva</div>
-        </div>
-        <div class="stat-card">
-          <div class="stat-label">ATTIVITÀ & LABORATORI</div>
-          <div class="stat-value" style="color: #38BDF8;">${stats.corsiAttivi}</div>
-          <div class="stat-desc">Corsi di teatro attivi</div>
-        </div>
-        <div class="stat-card">
-          <div class="stat-label">SPETTACOLI & CASSA</div>
-          <div class="stat-value" style="color: #D98295;">${stats.incassiTotali} €</div>
-          <div class="stat-desc">Incassi del mese corrente</div>
-        </div>
-      </div>
-
-      <div class="hub-header" style="margin-top: 36px; margin-bottom: 16px;">
-        <h2>Centro di Controllo • Tutte le Macro-Aree</h2>
-        <p style="color: #A1A1AA; font-size: 13px;">Naviga rapidamente tra i settori del gestionale approvati nella Bibbia</p>
-      </div>
-
-      <div class="hub-cards-grid">
-        ${MACRO_AREE.map(macro => `
-          <div class="hub-card" style="border-top: 3px solid ${macro.colore};">
-            <div class="hub-card-header">
-              <span class="hub-icon" style="color: ${macro.colore};">${getIconSvg(macro.icona, 24)}</span>
-              <span class="hub-count">${macro.sezioni.length} sezioni</span>
-            </div>
-            <h3 class="hub-title">${macro.titolo}</h3>
-            <p class="hub-desc">${macro.descrizione}</p>
-            <div class="hub-action">
-              <a href="/admin?view=${macro.id}-hub" style="color: ${macro.colore};">Apri panoramica <span>&rsaquo;</span></a>
-            </div>
-          </div>
-        `).join("")}
-      </div>
-    `;
-  }
-  else if (currentView.endsWith("-hub")) {
-    const macroId = currentView.replace("-hub", "");
-    const macro = MACRO_AREE.find(m => m.id === macroId) || MACRO_AREE[0];
-
-    mainContentHtml = `
-      <div class="page-header">
-        <div class="page-title-box">
-          <span class="page-icon" style="color: ${macro.colore};">${getIconSvg(macro.icona, 24)}</span>
-          <div>
-            <h1>Macro-Area ${macro.numero}: ${macro.titolo}</h1>
-            <p class="breadcrumbs">Pannello Gestionale &gt; ${macro.titolo} &gt; Panoramica Sotto-Sezioni</p>
-          </div>
-        </div>
-      </div>
-
-      <div class="hub-intro-card">
-        <div class="intro-icon" style="background: ${macro.colore}22; color: ${macro.colore};">
-          ${getIconSvg(macro.icona, 32)}
-        </div>
-        <div>
-          <h2>${macro.titolo}</h2>
-          <p style="color: #D4D4D8; font-size: 14px; margin-top: 4px;">${macro.descrizione}</p>
-        </div>
-      </div>
-
-      <h3 style="font-size: 16px; margin: 28px 0 16px; color: #FFF;">Sotto-Sezioni Operative</h3>
-      <div class="sections-list-grid">
-        ${macro.sezioni.map(sez => `
-          <div class="section-card">
-            <div class="section-header">
-              <span class="section-dot" style="background: ${macro.colore};"></span>
-              <h4>${sez.etichetta}</h4>
-            </div>
-            <p class="section-desc">${sez.desc}</p>
-            <a href="/admin?view=${sez.id}" class="btn-open-section">Accedi alla sezione &rsaquo;</a>
-          </div>
-        `).join("")}
-      </div>
-    `;
-  }
-  else if (currentView === "theme-builder") {
-    // 4.2 BUILDER TEMA & IDENTITÀ VISIVA (OPERATIVO)
-    mainContentHtml = `
-      <div class="page-header">
-        <div class="page-title-box">
-          <span class="page-icon" style="color: #10B981;">${getIconSvg("palette", 24)}</span>
-          <div>
-            <h1>4.2 Builder Tema & Identità Visiva</h1>
-            <p class="breadcrumbs">Pannello Gestionale &gt; Builder & Contenuti &gt; 4.2 Builder Tema</p>
-          </div>
-        </div>
-      </div>
-
-      ${msg === 'tema_salvato' ? `
-        <div class="alert-success">
-          <strong>Configurazione salvata con successo!</strong> Le impostazioni visive e il logo sono state aggiornate sia per il gestionale sia per il modulo pubblico.
-        </div>
-      ` : ''}
-
-      ${msg === 'err_salvataggio' ? `
-        <div class="alert-error">
-          <strong>Errore durante il salvataggio:</strong> ${url.searchParams.get("err") || "Verificare i dati e riprovare."}
-        </div>
-      ` : ''}
-
-      <form method="POST" action="/admin/salva-tema" class="theme-builder-form">
-        <div class="form-grid-2">
-          
-          <!-- Sezione Brand & Logo -->
-          <div class="builder-card">
-            <h3 class="card-heading">Dati Istituzionali & Logo Ufficiale</h3>
-            <p class="card-hint">I dati dell'associazione e l'immagine del logo che compaiono nell'header, nei moduli e nel footer.</p>
-
-            <div class="form-group" style="margin-top: 16px;">
-              <label>Nome Ufficiale Associazione</label>
-              <input type="text" name="nome_associazione" value="${theme.nome_associazione}" required>
-            </div>
-
-            <div class="form-group">
-              <label>Dominio Web Ufficiale</label>
-              <input type="text" name="dominio_ufficiale" value="${theme.dominio_ufficiale}" required>
-            </div>
-
-            <div class="form-group">
-              <label>Email Ufficiale di Contatto</label>
-              <input type="email" name="email_contatto" value="${theme.email_contatto}" required>
-            </div>
-
-            <div class="form-group">
-              <label>URL Immagine Logo (PNG Trasparente)</label>
-              <input type="url" name="url_logo" id="inputUrlLogo" value="${theme.url_logo}" required oninput="document.getElementById('previewLogoImg').src = this.value">
-            </div>
-
-            <div class="logo-preview-box">
-              <div class="preview-title">Anteprima Logo su Sfondo Scuro:</div>
-              <div class="preview-canvas">
-                <img id="previewLogoImg" src="${theme.url_logo}" alt="Logo Preview" style="max-height: 80px; max-width: 100%;">
-              </div>
-            </div>
-          </div>
-
-          <!-- Sezione Palette Colori -->
-          <div class="builder-card">
-            <h3 class="card-heading">Palette Colori Teatrale (HEX)</h3>
-            <p class="card-hint">Tutti i componenti del portale pubblico e del gestionale attingono a questi colori.</p>
-
-            <div class="color-picker-row">
-              <div class="color-preview" style="background: ${theme.colore_primario};"></div>
-              <div class="color-info">
-                <label>Colore Primario (Rosa Cervello)</label>
-                <input type="text" name="colore_primario" value="${theme.colore_primario}" class="color-hex-input" required>
-              </div>
-              <input type="color" value="${theme.colore_primario}" class="native-picker" onchange="this.previousElementSibling.querySelector('input').value = this.value; this.parentElement.querySelector('.color-preview').style.background = this.value;">
-            </div>
-
-            <div class="color-picker-row">
-              <div class="color-preview" style="background: ${theme.colore_secondario};"></div>
-              <div class="color-info">
-                <label>Colore Secondario (Argento Maschere)</label>
-                <input type="text" name="colore_secondario" value="${theme.colore_secondario}" class="color-hex-input" required>
-              </div>
-              <input type="color" value="${theme.colore_secondario}" class="native-picker" onchange="this.previousElementSibling.querySelector('input').value = this.value; this.parentElement.querySelector('.color-preview').style.background = this.value;">
-            </div>
-
-            <div class="color-picker-row">
-              <div class="color-preview" style="background: ${theme.colore_scuro};"></div>
-              <div class="color-info">
-                <label>Colore Scuro Header & Footer (Nero Ribalta)</label>
-                <input type="text" name="colore_scuro" value="${theme.colore_scuro}" class="color-hex-input" required>
-              </div>
-              <input type="color" value="${theme.colore_scuro}" class="native-picker" onchange="this.previousElementSibling.querySelector('input').value = this.value; this.parentElement.querySelector('.color-preview').style.background = this.value;">
-            </div>
-
-            <div class="color-picker-row">
-              <div class="color-preview" style="background: ${theme.colore_accento};"></div>
-              <div class="color-info">
-                <label>Colore Accento & Notifiche (Verde Attivo)</label>
-                <input type="text" name="colore_accento" value="${theme.colore_accento}" class="color-hex-input" required>
-              </div>
-              <input type="color" value="${theme.colore_accento}" class="native-picker" onchange="this.previousElementSibling.querySelector('input').value = this.value; this.parentElement.querySelector('.color-preview').style.background = this.value;">
-            </div>
-
-            <div class="form-group" style="margin-top: 20px;">
-              <label>Scala Dimensione Caratteri (Leggibilità)</label>
-              <select name="scala_font" style="width: 100%; background: #09090B; border: 1px solid #3F3F46; color: #FFF; padding: 10px; border-radius: 8px;">
-                <option value="compatta" ${theme.scala_font === 'compatta' ? 'selected' : ''}>Compatta (Ideale per tabelle dense)</option>
-                <option value="normale" ${theme.scala_font === 'normale' ? 'selected' : ''}>Normale (Bilanciata standard UX)</option>
-                <option value="grande" ${theme.scala_font === 'grande' ? 'selected' : ''}>Grande (Caratteri maggiorati per massima leggibilità)</option>
-              </select>
-            </div>
-          </div>
-
-        </div>
-
-        <div class="builder-actions-bar">
-          <a href="/admin?view=builder-hub" class="btn-secondary">Annulla</a>
-          <button type="submit" class="btn-primary">Salva Configurazione Tema su Database D1</button>
-        </div>
-      </form>
-    `;
-  }
-  else if (currentView === "domande") {
-    // 1.1 DOMANDE DI AMMISSIONE (OPERATIVO)
-    mainContentHtml = `
-      <div class="page-header">
-        <div class="page-title-box">
-          <span class="page-icon" style="color: #D98295;">${getIconSvg("users", 24)}</span>
-          <div>
-            <h1>1.1 Domande di Ammissione</h1>
-            <p class="breadcrumbs">Pannello Gestionale &gt; Soci &amp; Libro Soci &gt; Domande di Ammissione</p>
-          </div>
-        </div>
-      </div>
-
-      ${msg === 'delibera_completata' ? `
-        <div class="alert-success">
-          <strong>Delibera registrata con successo!</strong> Il socio è stato ammesso, il numero di tessera APS assegnato e la quota registrata.
-        </div>
-      ` : ''}
-
-      <div class="table-card">
-        <div class="table-header">
-          <div class="table-title">Richieste in attesa di delibera del Direttivo (${domande?.results?.length || 0})</div>
-          <span class="badge-pending">Da Deliberare</span>
-        </div>
-
-        ${(!domande?.results || domande.results.length === 0) ? `
-          <div class="empty-state">
-            <p>Nessuna domanda di ammissione in attesa al momento.</p>
-          </div>
-        ` : `
-          <div class="table-responsive">
-            <table class="data-table">
-              <thead>
-                <tr>
-                  <th>Data Richiesta</th>
-                  <th>Aspirante Socio</th>
-                  <th>Codice Fiscale</th>
-                  <th>Tipologia</th>
-                  <th>Tutore / Contatti</th>
-                  <th>Quota Sociale</th>
-                  <th style="text-align: right;">Azione Consiglio Direttivo</th>
-                </tr>
-              </thead>
-              <tbody>
-                ${domande.results.map(d => `
-                  <tr>
-                    <td>${new Date(d.creato_il).toLocaleDateString('it-IT')}</td>
-                    <td>
-                      <strong>${d.nome} ${d.cognome}</strong>
-                      <div class="sub-cell">Nato il ${d.data_nascita || 'N/D'} a ${d.luogo_nascita || 'N/D'}</div>
-                    </td>
-                    <td><code>${d.codice_fiscale}</code></td>
-                    <td><span class="tag-tipo">${d.tipo_socio?.toUpperCase()}</span></td>
-                    <td>
-                      ${d.tutore_nome ? `
-                        <div><strong>${d.tutore_nome} ${d.tutore_cognome}</strong> (${d.grado_parentela})</div>
-                        <div class="sub-cell">${d.tutore_telefono || ''} • ${d.tutore_email || ''}</div>
-                      ` : '<span style="color: #71717A;">Maggiorenne</span>'}
-                    </td>
-                    <td>
-                      <strong>${d.quota_importo || 20} €</strong>
-                      <div class="sub-cell">${d.quota_stato === 'saldato' ? 'Saldato' : 'In attesa'}</div>
-                    </td>
-                    <td style="text-align: right;">
-                      <button class="btn-action" onclick="apriModaleDelibera('${d.id}', '${d.nome} ${d.cognome}', '${d.tipo_socio}')">
-                        Approva &amp; Tessera
-                      </button>
-                    </td>
-                  </tr>
-                `).join("")}
-              </tbody>
-            </table>
-          </div>
-        `}
-      </div>
-
-      <!-- Modale Delibera del Consiglio Direttivo -->
-      <div id="modaleDelibera" class="modal-backdrop" style="display: none;">
-        <div class="modal-card">
-          <div class="modal-header">
-            <h3>Delibera Consiglio Direttivo</h3>
-            <button class="modal-close" onclick="chiudiModaleDelibera()">&times;</button>
-          </div>
-          <p class="modal-subtitle">Ammissione a socio di: <strong id="modalNomeSocio"></strong></p>
-
-          <form method="POST" action="/admin/delibera">
-            <input type="hidden" name="socio_id" id="modalSocioId">
-            
-            <div class="form-group">
-              <label>Data Riunione Consiglio Direttivo *</label>
-              <input type="date" name="data_delibera" value="${new Date().toISOString().split('T')[0]}" required>
-            </div>
-
-            <div class="form-group">
-              <label>Numero Verbale delibera CD *</label>
-              <input type="text" name="numero_verbale" placeholder="Es. Verbale CD n. 03/2026" required>
-            </div>
-
-            <div class="form-group">
-              <label>Numero Tessera APS da Assegnare *</label>
-              <input type="text" name="numero_tessera" placeholder="Es. APS-2026-042" required>
-            </div>
-
-            <div class="form-row-2">
-              <div class="form-group">
-                <label>Data Saldo Quota Sociale</label>
-                <input type="date" name="data_saldo_quota" value="${new Date().toISOString().split('T')[0]}" required>
-              </div>
-              <div class="form-group">
-                <label>Modalità di Pagamento</label>
-                <select name="modalita_pagamento" style="width: 100%; background: #09090B; border: 1px solid #3F3F46; color: #FFF; padding: 10px; border-radius: 8px;">
-                  <option value="contanti">Contanti in Sede</option>
-                  <option value="bonifico">Bonifico Bancario</option>
-                  <option value="pos">POS / Carta</option>
-                  <option value="satispay">Satispay</option>
-                </select>
-              </div>
-            </div>
-
-            <div class="modal-actions">
-              <button type="button" class="btn-secondary" onclick="chiudiModaleDelibera()">Annulla</button>
-              <button type="submit" class="btn-primary">Conferma Ammissione Ufficiale</button>
-            </div>
-          </form>
-        </div>
-      </div>
-    `;
-  }
-  else {
-    // Segnaposto modulare per le sezioni future
-    mainContentHtml = `
-      <div class="page-header">
-        <div class="page-title-box">
-          <span class="page-icon" style="color: #10B981;">${getIconSvg("dashboard", 24)}</span>
-          <div>
-            <h1>${currentView.toUpperCase().replace("-", " ")}</h1>
-            <p class="breadcrumbs">Pannello Gestionale &gt; Sezione Operativa</p>
-          </div>
-        </div>
-      </div>
-
-      <div class="hub-intro-card" style="text-align: center; justify-content: center; padding: 48px 24px;">
-        <div style="max-width: 540px;">
-          <div style="font-size: 36px; margin-bottom: 12px;">⚙️</div>
-          <h2 style="margin-bottom: 10px;">${currentView.toUpperCase().replace("-", " ")}</h2>
-          <p style="color: #A1A1AA; font-size: 14px; line-height: 1.6;">
-            Questa sezione è già perfettamente inserita e mappata nella struttura del gestionale. 
-            Nel prossimo passaggio collegheremo i dati specifici di questa schermata.
-          </p>
-          <div style="margin-top: 24px;">
-            <a href="/admin?view=theme-builder" class="btn-primary" style="display: inline-block; text-decoration: none;">
-              Vai al Builder Tema & Identità Visiva
-            </a>
-          </div>
-        </div>
-      </div>
-    `;
-  }
-
-  // Costruzione della pagina completa con stili CSS dinamici
   const html = `<!DOCTYPE html>
 <html lang="it">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Gestionale Admin • ${theme.nome_associazione}</title>
+  <title>${titoloSezione} • ${tema.nome_associazione}</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
   <style>
     :root {
-      --coral: ${theme.colore_primario};
-      --silver: ${theme.colore_secondario};
-      --dark: ${theme.colore_scuro};
-      --card-bg: ${theme.colore_sfondo};
-      --accent: ${theme.colore_accento};
-      --text: ${theme.colore_testo};
-      --sidebar-w: 270px;
+      --color-primary: ${tema.colore_primario};
+      --color-secondary: ${tema.colore_secondario};
+      --color-dark: ${tema.colore_scuro};
+      --color-surface: #18181B;
+      --color-border: #27272A;
+      --color-text: #FAFAFA;
+      --color-muted: #A1A1AA;
+      --color-success: #10B981;
+      --color-warning: #F59E0B;
+      --color-danger: #EF4444;
     }
+
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
       font-family: 'Plus Jakarta Sans', sans-serif;
-      background: var(--dark);
-      color: var(--text);
+      background: var(--color-dark);
+      color: var(--color-text);
       min-height: 100vh;
       display: flex;
     }
 
-    /* Sidebar Layout */
-    .admin-sidebar {
-      width: var(--sidebar-w);
-      background: #09090B;
-      border-right: 1px solid #27272A;
+    /* SIDEBAR */
+    .sidebar {
+      width: 270px;
+      background: #0D0D0E;
+      border-right: 1px solid var(--color-border);
       display: flex;
       flex-direction: column;
       flex-shrink: 0;
-      position: sticky;
-      top: 0;
-      height: 100vh;
-      overflow-y: auto;
+      transition: width 0.25s ease;
     }
-    .sidebar-brand {
+
+    .brand-box {
       padding: 20px;
       display: flex;
       align-items: center;
       gap: 12px;
-      border-bottom: 1px solid #27272A;
+      border-bottom: 1px solid var(--color-border);
     }
-    .logo-box {
-      width: 40px;
-      height: 40px;
-      background: #18181B;
-      border: 1px solid #27272A;
-      border-radius: 8px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      overflow: hidden;
-    }
-    .brand-img {
-      max-width: 100%;
-      max-height: 100%;
+    .brand-logo-img {
+      width: 36px;
+      height: 36px;
       object-fit: contain;
+      border-radius: 8px;
     }
-    .brand-title {
-      font-size: 14px;
-      font-weight: 700;
+    .brand-name {
+      font-size: 14.5px;
+      font-weight: 800;
       color: #FFF;
-      line-height: 1.2;
+      letter-spacing: -0.2px;
     }
     .brand-badge {
       display: inline-block;
       font-size: 10px;
       font-weight: 700;
-      color: var(--coral);
-      letter-spacing: 0.05em;
-      margin-top: 3px;
+      background: rgba(217, 130, 149, 0.15);
+      color: var(--color-primary);
+      padding: 2px 6px;
+      border-radius: 4px;
+      text-transform: uppercase;
+      margin-top: 2px;
     }
-    .sidebar-menu {
+
+    .nav-section {
       padding: 16px 12px;
+      overflow-y: auto;
       flex: 1;
     }
-    .menu-section-title {
+    .nav-group-title {
       font-size: 11px;
       font-weight: 700;
+      text-transform: uppercase;
       color: #71717A;
-      letter-spacing: 0.05em;
-      padding: 0 10px 8px;
+      letter-spacing: 0.5px;
+      padding: 12px 12px 6px 12px;
     }
-    .menu-item-root {
+    .nav-link {
       display: flex;
       align-items: center;
       gap: 10px;
       padding: 10px 12px;
-      border-radius: 8px;
-      color: #D4D4D8;
+      color: var(--color-muted);
       text-decoration: none;
       font-size: 13.5px;
       font-weight: 600;
-      transition: all 0.15s;
-    }
-    .menu-item-root:hover {
-      background: #18181B;
-      color: #FFF;
-    }
-    .menu-item-root.active {
-      background: var(--coral);
-      color: #121214;
-    }
-    .macro-group {
-      margin-top: 4px;
-    }
-    .macro-header {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      padding: 9px 12px;
       border-radius: 8px;
-      color: #A1A1AA;
-      text-decoration: none;
-      font-size: 13px;
-      font-weight: 600;
-      transition: all 0.15s;
+      transition: all 0.15s ease;
+      margin-bottom: 3px;
     }
-    .macro-header:hover {
-      background: #18181B;
+    .nav-link:hover {
+      background: rgba(255, 255, 255, 0.05);
       color: #FFF;
     }
-    .macro-header .arrow {
-      margin-left: auto;
-      font-size: 11px;
-      color: #71717A;
+    .nav-link.active {
+      background: var(--color-primary);
+      color: #121214;
+      font-weight: 700;
     }
-    .macro-subitems {
-      display: none;
-      padding-left: 20px;
-      margin-top: 2px;
+    .nav-link.active svg {
+      stroke: #121214;
     }
-    .macro-group.open .macro-subitems {
-      display: block;
-    }
-    .macro-group.open .macro-header {
-      color: #FFF;
-    }
-    .subitem {
+    .nav-sublink {
       display: flex;
       align-items: center;
-      gap: 8px;
-      padding: 7px 10px;
-      border-radius: 6px;
+      padding: 7px 12px 7px 34px;
+      font-size: 12.5px;
       color: #A1A1AA;
       text-decoration: none;
-      font-size: 12.5px;
-      transition: all 0.15s;
+      border-radius: 6px;
+      margin-bottom: 2px;
     }
-    .subitem:hover {
-      color: #FFF;
-      background: #18181B;
-    }
-    .subitem.active {
-      color: var(--accent);
-      font-weight: 600;
-      background: #10B98115;
-    }
-    .subitem-dot {
-      width: 6px;
-      height: 6px;
-      border-radius: 50%;
-      background: currentColor;
-    }
+    .nav-sublink:hover { color: #FFF; background: rgba(255, 255, 255, 0.03); }
+    .nav-sublink.active { color: var(--color-primary); font-weight: 700; }
 
-    /* Main Area Layout */
-    .admin-main {
+    /* TOPBAR & MAIN CONTENT */
+    .main-wrapper {
       flex: 1;
       display: flex;
       flex-direction: column;
-      overflow-x: hidden;
-      min-height: 100vh;
+      min-width: 0;
+      background: #121214;
     }
-    .admin-topbar {
-      height: 60px;
-      border-bottom: 1px solid #27272A;
+
+    .topbar {
+      height: 64px;
+      background: #0D0D0E;
+      border-bottom: 1px solid var(--color-border);
       display: flex;
       align-items: center;
       justify-content: space-between;
-      padding: 0 32px;
-      background: #121214;
+      padding: 0 28px;
     }
-    .topbar-user {
+    .user-pill {
       display: flex;
       align-items: center;
-      gap: 12px;
+      gap: 10px;
       font-size: 13px;
-      color: #A1A1AA;
+      color: var(--color-muted);
     }
-    .topbar-user strong { color: #FFF; }
+    .user-name {
+      color: #FFF;
+      font-weight: 600;
+    }
     .btn-logout {
       background: transparent;
-      border: 1px solid #3F3F46;
-      color: #D4D4D8;
-      padding: 6px 14px;
+      border: 1px solid var(--color-border);
+      color: #EF4444;
+      padding: 6px 12px;
       border-radius: 6px;
-      font-size: 12.5px;
+      font-size: 12px;
+      font-weight: 600;
       text-decoration: none;
-      transition: all 0.15s;
+      transition: background 0.15s;
     }
-    .btn-logout:hover {
-      background: #27272A;
-      color: #FFF;
-    }
-    .admin-content {
-      padding: 32px;
+    .btn-logout:hover { background: rgba(239, 68, 68, 0.1); }
+
+    .content-area {
+      padding: 32px 36px;
       flex: 1;
-      max-width: 1400px;
-      width: 100%;
-      margin: 0 auto;
+      overflow-y: auto;
     }
 
-    /* Common Components */
     .page-header {
       margin-bottom: 28px;
     }
-    .page-title-box {
-      display: flex;
-      align-items: center;
-      gap: 14px;
-    }
-    .page-icon {
-      background: #18181B;
-      border: 1px solid #27272A;
-      width: 44px;
-      height: 44px;
-      border-radius: 10px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-    }
-    .page-title-box h1 {
-      font-size: 22px;
-      font-weight: 700;
-      color: #FFF;
-      letter-spacing: -0.01em;
-    }
-    .breadcrumbs {
-      font-size: 12.5px;
+    .breadcrumb {
+      font-size: 12px;
       color: #71717A;
-      margin-top: 3px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 6px;
+    }
+    .page-title {
+      font-size: 26px;
+      font-weight: 800;
+      color: #FFF;
+      letter-spacing: -0.5px;
     }
 
-    /* Stats Grid */
+    /* GRIGLIE & CARD */
     .stats-grid {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
       gap: 16px;
+      margin-bottom: 32px;
     }
     .stat-card {
-      background: var(--card-bg);
-      border: 1px solid #27272A;
+      background: var(--color-surface);
+      border: 1px solid var(--color-border);
       border-radius: 12px;
       padding: 20px;
     }
     .stat-label {
-      font-size: 11.5px;
+      font-size: 12px;
       font-weight: 700;
-      color: #71717A;
-      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      color: var(--color-muted);
+      letter-spacing: 0.4px;
+      margin-bottom: 8px;
     }
-    .stat-value {
+    .stat-val {
       font-size: 32px;
-      font-weight: 700;
-      margin: 8px 0 4px;
+      font-weight: 800;
+      color: #FFF;
+      line-height: 1;
+      margin-bottom: 6px;
     }
     .stat-desc {
       font-size: 12px;
-      color: #A1A1AA;
+      color: #71717A;
     }
 
-    /* Hub Cards */
-    .hub-cards-grid {
+    .card {
+      background: var(--color-surface);
+      border: 1px solid var(--color-border);
+      border-radius: 14px;
+      padding: 24px;
+      margin-bottom: 28px;
+    }
+    .card-title {
+      font-size: 17px;
+      font-weight: 700;
+      color: #FFF;
+      margin-bottom: 6px;
+    }
+    .card-sub {
+      font-size: 13px;
+      color: var(--color-muted);
+      margin-bottom: 20px;
+    }
+
+    .hub-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-      gap: 20px;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 16px;
     }
     .hub-card {
-      background: var(--card-bg);
-      border: 1px solid #27272A;
+      background: #1E1E22;
+      border: 1px solid var(--color-border);
       border-radius: 12px;
-      padding: 22px;
-      display: flex;
-      flex-direction: column;
-      transition: transform 0.15s, border-color 0.15s;
+      padding: 20px;
+      text-decoration: none;
+      display: block;
+      transition: all 0.2s ease;
     }
     .hub-card:hover {
+      border-color: var(--color-primary);
       transform: translateY(-2px);
-      border-color: #3F3F46;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.3);
     }
     .hub-card-header {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      margin-bottom: 14px;
+      margin-bottom: 12px;
     }
-    .hub-icon {
-      background: #09090B;
-      padding: 8px;
-      border-radius: 8px;
-      border: 1px solid #27272A;
-      display: flex;
+    .hub-card-title {
+      font-size: 15px;
+      font-weight: 700;
+      color: #FFF;
+      margin-bottom: 4px;
     }
-    .hub-count {
-      font-size: 11.5px;
-      background: #27272A;
-      color: #D4D4D8;
+    .hub-card-desc {
+      font-size: 12.5px;
+      color: #A1A1AA;
+      line-height: 1.45;
+    }
+    .badge-count {
+      background: rgba(255, 255, 255, 0.08);
+      font-size: 11px;
+      font-weight: 700;
+      color: #FFF;
       padding: 3px 8px;
       border-radius: 12px;
-      font-weight: 600;
-    }
-    .hub-title {
-      font-size: 16px;
-      font-weight: 700;
-      color: #FFF;
-      margin-bottom: 8px;
-    }
-    .hub-desc {
-      font-size: 12.5px;
-      color: #A1A1AA;
-      line-height: 1.5;
-      flex: 1;
-      margin-bottom: 18px;
-    }
-    .hub-action a {
-      font-size: 13px;
-      font-weight: 600;
-      text-decoration: none;
-      display: inline-flex;
-      align-items: center;
-      gap: 4px;
     }
 
-    /* Hub Inner View */
-    .hub-intro-card {
-      background: var(--card-bg);
-      border: 1px solid #27272A;
-      border-radius: 14px;
-      padding: 24px;
-      display: flex;
-      align-items: center;
-      gap: 20px;
-    }
-    .intro-icon {
-      width: 60px;
-      height: 60px;
-      border-radius: 12px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      flex-shrink: 0;
-    }
-    .sections-list-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
-      gap: 16px;
-    }
-    .section-card {
-      background: var(--card-bg);
-      border: 1px solid #27272A;
-      border-radius: 12px;
-      padding: 20px;
-      display: flex;
-      flex-direction: column;
-    }
-    .section-header {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      margin-bottom: 10px;
-    }
-    .section-dot {
-      width: 8px;
-      height: 8px;
-      border-radius: 50%;
-    }
-    .section-header h4 {
-      font-size: 15px;
-      font-weight: 700;
-      color: #FFF;
-    }
-    .section-desc {
-      font-size: 12.5px;
-      color: #A1A1AA;
-      line-height: 1.5;
-      flex: 1;
-      margin-bottom: 16px;
-    }
-    .btn-open-section {
-      background: #27272A;
-      color: #FFF;
-      text-decoration: none;
-      font-size: 12.5px;
-      font-weight: 600;
-      padding: 8px 12px;
-      border-radius: 6px;
-      text-align: center;
-      transition: background 0.15s;
-    }
-    .btn-open-section:hover {
-      background: #3F3F46;
-    }
-
-    /* Table Component */
-    .table-card {
-      background: var(--card-bg);
-      border: 1px solid #27272A;
-      border-radius: 12px;
-      overflow: hidden;
-    }
-    .table-header {
-      padding: 18px 24px;
-      border-bottom: 1px solid #27272A;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-    }
-    .table-title {
-      font-size: 15px;
-      font-weight: 700;
-      color: #FFF;
-    }
-    .badge-pending {
-      background: #F59E0B22;
-      color: #FBBF24;
-      border: 1px solid #F59E0B;
-      padding: 3px 10px;
-      border-radius: 12px;
-      font-size: 11.5px;
-      font-weight: 600;
-    }
-    .table-responsive {
+    /* TABELLE */
+    .table-container {
       overflow-x: auto;
+      border: 1px solid var(--color-border);
+      border-radius: 10px;
     }
-    .data-table {
+    table {
       width: 100%;
       border-collapse: collapse;
       text-align: left;
       font-size: 13px;
     }
-    .data-table th {
-      background: #09090B;
-      padding: 12px 20px;
+    th {
+      background: #141416;
       color: #A1A1AA;
-      font-weight: 600;
-      border-bottom: 1px solid #27272A;
-      font-size: 11.5px;
-      letter-spacing: 0.03em;
+      font-weight: 700;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--color-border);
     }
-    .data-table td {
-      padding: 14px 20px;
-      border-bottom: 1px solid #27272A;
-      color: #D4D4D8;
-    }
-    .data-table tr:last-child td {
-      border-bottom: none;
-    }
-    .sub-cell {
-      font-size: 11.5px;
-      color: #71717A;
-      margin-top: 2px;
-    }
-    .tag-tipo {
-      background: #27272A;
+    td {
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--color-border);
       color: #E4E4E7;
-      padding: 2px 8px;
+    }
+    tr:last-child td { border-bottom: none; }
+    tr:hover td { background: rgba(255, 255, 255, 0.02); }
+
+    .badge {
+      display: inline-block;
+      padding: 4px 8px;
       border-radius: 4px;
       font-size: 11px;
-      font-weight: 600;
-    }
-    .btn-action {
-      background: var(--coral);
-      color: #121214;
-      border: none;
-      padding: 7px 14px;
-      border-radius: 6px;
       font-weight: 700;
-      font-size: 12px;
-      cursor: pointer;
-      transition: opacity 0.15s;
+      text-transform: uppercase;
     }
-    .btn-action:hover { opacity: 0.9; }
+    .badge-pending { background: rgba(245, 158, 11, 0.15); color: #F59E0B; }
+    .badge-approved { background: rgba(16, 185, 129, 0.15); color: #10B981; }
 
-    /* Builder Tema Form */
-    .theme-builder-form {
-      margin-top: 10px;
-    }
-    .form-grid-2 {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
-      gap: 24px;
-    }
-    .builder-card {
-      background: var(--card-bg);
-      border: 1px solid #27272A;
-      border-radius: 12px;
-      padding: 24px;
-    }
-    .card-heading {
-      font-size: 16px;
-      font-weight: 700;
-      color: #FFF;
-      margin-bottom: 4px;
-    }
-    .card-hint {
-      font-size: 12.5px;
-      color: #A1A1AA;
-      margin-bottom: 16px;
-      line-height: 1.4;
-    }
-    .color-picker-row {
-      display: flex;
+    /* BOTTONI */
+    .btn {
+      display: inline-flex;
       align-items: center;
-      gap: 14px;
-      background: #09090B;
-      border: 1px solid #27272A;
-      padding: 10px 14px;
-      border-radius: 8px;
-      margin-bottom: 12px;
-    }
-    .color-preview {
-      width: 32px;
-      height: 32px;
-      border-radius: 6px;
-      border: 1px solid #3F3F46;
-      flex-shrink: 0;
-    }
-    .color-info {
-      flex: 1;
-    }
-    .color-info label {
-      display: block;
-      font-size: 11.5px;
-      color: #A1A1AA;
-      margin-bottom: 2px;
-    }
-    .color-hex-input {
-      background: transparent;
-      border: none;
-      color: #FFF;
-      font-family: monospace;
-      font-size: 13.5px;
-      font-weight: 700;
-      width: 100%;
-    }
-    .color-hex-input:focus { outline: none; }
-    .native-picker {
-      width: 36px;
-      height: 36px;
-      border: none;
-      background: transparent;
-      cursor: pointer;
-    }
-    .logo-preview-box {
-      margin-top: 18px;
-      border-top: 1px solid #27272A;
-      padding-top: 14px;
-    }
-    .preview-title {
-      font-size: 12px;
-      color: #71717A;
-      margin-bottom: 8px;
-    }
-    .preview-canvas {
-      background: #09090B;
-      border: 1px dashed #3F3F46;
-      border-radius: 8px;
-      padding: 16px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      min-height: 90px;
-    }
-    .builder-actions-bar {
-      margin-top: 24px;
-      display: flex;
-      justify-content: flex-end;
-      gap: 12px;
-      background: var(--card-bg);
-      border: 1px solid #27272A;
-      padding: 16px 24px;
-      border-radius: 12px;
-    }
-
-    /* Modale Delibera */
-    .modal-backdrop {
-      position: fixed;
-      top: 0; left: 0; width: 100vw; height: 100vh;
-      background: rgba(0,0,0,0.75);
-      backdrop-filter: blur(4px);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      z-index: 999;
-      padding: 20px;
-    }
-    .modal-card {
-      background: #18181B;
-      border: 1px solid #3F3F46;
-      border-radius: 14px;
-      padding: 28px;
-      width: 100%;
-      max-width: 520px;
-      box-shadow: 0 25px 50px -12px rgba(0,0,0,0.8);
-    }
-    .modal-header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 4px;
-    }
-    .modal-header h3 { font-size: 18px; color: #FFF; font-weight: 700; }
-    .modal-close {
-      background: transparent;
-      border: none;
-      color: #71717A;
-      font-size: 24px;
-      cursor: pointer;
-    }
-    .modal-subtitle {
-      font-size: 13px;
-      color: #A1A1AA;
-      margin-bottom: 20px;
-    }
-    .modal-subtitle strong { color: var(--coral); }
-    .form-group {
-      margin-bottom: 16px;
-      text-align: left;
-    }
-    .form-group label {
-      display: block;
-      font-size: 12px;
-      font-weight: 600;
-      color: #D4D4D8;
-      margin-bottom: 6px;
-    }
-    .form-group input, .form-group select {
-      width: 100%;
-      background: #09090B;
-      border: 1px solid #3F3F46;
-      color: #FFF;
-      padding: 10px 12px;
-      border-radius: 8px;
-      font-size: 13.5px;
-    }
-    .form-group input:focus, .form-group select:focus {
-      outline: none;
-      border-color: var(--coral);
-    }
-    .form-row-2 {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 12px;
-    }
-    .modal-actions {
-      display: flex;
-      justify-content: flex-end;
-      gap: 10px;
-      margin-top: 24px;
-    }
-    .btn-secondary {
-      background: #27272A;
-      color: #E4E4E7;
-      border: none;
+      gap: 8px;
       padding: 10px 18px;
       border-radius: 8px;
-      font-size: 13px;
-      font-weight: 600;
-      cursor: pointer;
-      text-decoration: none;
-    }
-    .btn-primary {
-      background: var(--coral);
-      color: #121214;
-      border: none;
-      padding: 10px 20px;
-      border-radius: 8px;
-      font-size: 13px;
+      font-size: 13.5px;
       font-weight: 700;
       cursor: pointer;
+      border: none;
+      text-decoration: none;
+      transition: all 0.15s ease;
     }
+    .btn-primary { background: var(--color-primary); color: #121214; }
+    .btn-primary:hover { opacity: 0.9; transform: translateY(-1px); }
+    .btn-secondary { background: #27272A; color: #FFF; }
+    .btn-secondary:hover { background: #3F3F46; }
 
-    /* Alerts */
-    .alert-success {
-      background: #10B9811A;
-      border: 1px solid #10B981;
-      color: #34D399;
-      padding: 12px 18px;
+    /* NOTIFICHE */
+    .alert-banner {
+      padding: 14px 18px;
       border-radius: 8px;
-      font-size: 13px;
+      font-size: 13.5px;
+      font-weight: 600;
       margin-bottom: 24px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
     }
-    .alert-error {
-      background: #EF44441A;
-      border: 1px solid #EF4444;
-      color: #F87171;
-      padding: 12px 18px;
-      border-radius: 8px;
-      font-size: 13px;
-      margin-bottom: 24px;
+    .alert-success { background: rgba(16, 185, 129, 0.15); border: 1px solid #10B981; color: #10B981; }
+    .alert-error { background: rgba(239, 68, 68, 0.15); border: 1px solid #EF4444; color: #EF4444; }
+
+    /* MODALE DELIBERA */
+    .modal-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.75);
+      backdrop-filter: blur(4px);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 100;
+    }
+    .modal-box {
+      background: #18181B;
+      border: 1px solid var(--color-border);
+      border-radius: 14px;
+      width: 100%;
+      max-width: 480px;
+      padding: 24px;
+      box-shadow: 0 20px 40px rgba(0,0,0,0.5);
     }
   </style>
 </head>
 <body>
-  <div class="admin-sidebar">
-    ${sidebarHtml}
-  </div>
-
-  <div class="admin-main">
-    <div class="admin-topbar">
-      <div style="font-size: 13px; color: #71717A;">
-        Ambiente: <span style="color: #10B981; font-weight: 600;">Produzione • D1 Cloudflare</span>
-      </div>
-      <div class="topbar-user">
-        <span>Connesso: <strong>${user.nome} ${user.cognome}</strong> (${user.email})</span>
-        <a href="/admin/logout" class="btn-logout">Disconnetti</a>
+  <!-- SIDEBAR UFFICIALE BIBBIA -->
+  <aside class="sidebar">
+    <div class="brand-box">
+      <img src="${tema.url_logo}" alt="Logo" class="brand-logo-img">
+      <div>
+        <div class="brand-name">${tema.nome_associazione}</div>
+        <div class="brand-badge">Super Admin</div>
       </div>
     </div>
 
-    <div class="admin-content">
-      ${mainContentHtml}
+    <div class="nav-section">
+      <!-- 0. DASHBOARD ESTERNA -->
+      <a href="/admin?view=dashboard" class="nav-link ${view === 'dashboard' ? 'active' : ''}">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+        <span>Dashboard Generale</span>
+      </a>
+
+      <!-- 1. SOCI & LIBRO SOCI -->
+      <div class="nav-group-title">Macro-Aree</div>
+      <a href="/admin?view=hub-soci" class="nav-link ${view.startsWith('hub-soci') || view === 'domande' ? 'active' : ''}">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+        <span>1. Soci & Libro Soci</span>
+      </a>
+      ${view.startsWith('hub-soci') || view === 'domande' ? `
+        <a href="/admin?view=domande" class="nav-sublink ${view === 'domande' ? 'active' : ''}">↳ 1.1 Domande Ammissione</a>
+        <a href="/admin?view=libro-soci" class="nav-sublink">↳ 1.2 Libro Soci Ufficiale</a>
+        <a href="/admin?view=quote-uilt" class="nav-sublink">↳ 1.3 Quote & Tessere UILT</a>
+      ` : ''}
+
+      <!-- 2. ATTIVITÀ & CORSI -->
+      <a href="/admin?view=hub-corsi" class="nav-link ${view.startsWith('hub-corsi') ? 'active' : ''}">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
+        <span>2. Attività & Corsi</span>
+      </a>
+
+      <!-- 3. EVENTI, TEATRO & CASSE -->
+      <a href="/admin?view=hub-eventi" class="nav-link ${view.startsWith('hub-eventi') ? 'active' : ''}">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="7" width="20" height="15" rx="2" ry="2"/><polyline points="17 2 12 7 7 2"/></svg>
+        <span>3. Eventi & Casse</span>
+      </a>
+
+      <!-- 4. BUILDER & CONTENUTI -->
+      <a href="/admin?view=hub-builder" class="nav-link ${view.startsWith('hub-builder') || view === 'theme-builder' ? 'active' : ''}">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
+        <span>4. Builder & Contenuti</span>
+      </a>
+      ${view.startsWith('hub-builder') || view === 'theme-builder' ? `
+        <a href="/admin?view=theme-builder" class="nav-sublink ${view === 'theme-builder' ? 'active' : ''}">↳ 4.2 Builder Tema & Brand</a>
+      ` : ''}
+
+      <!-- 5. SISTEMA & UTENTI -->
+      <a href="/admin?view=hub-sistema" class="nav-link ${view.startsWith('hub-sistema') ? 'active' : ''}">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        <span>5. Sistema & Utenti</span>
+      </a>
+    </div>
+  </aside>
+
+  <!-- CONTENUTO PRINCIPALE -->
+  <div class="main-wrapper">
+    <header class="topbar">
+      <div class="user-pill">
+        <span>Connesso:</span>
+        <strong class="user-name">${user.nome} ${user.cognome}</strong>
+        <span>(${user.email})</span>
+      </div>
+      <a href="/admin/logout" class="btn-logout">Disconnetti</a>
+    </header>
+
+    <main class="content-area">
+      <div class="page-header">
+        <div class="breadcrumb">${breadcrumb}</div>
+        <h1 class="page-title">${titoloSezione}</h1>
+      </div>
+
+      ${msg === 'delibera_ok' ? '<div class="alert-banner alert-success">Domanda approvata con successo! Assegnato numero di tessera APS e registrato verbale CD.</div>' : ''}
+      ${msg === 'tema_salvato' ? '<div class="alert-banner alert-success">Impostazioni del Brand e del Tema salvate correttamente nel database Cloudflare D1!</div>' : ''}
+      ${err ? `<div class="alert-banner alert-error">Errore: ${decodeURIComponent(err)}</div>` : ''}
+
+      ${contenutoPrincipale}
+    </main>
+  </div>
+
+  <!-- MODALE FORMALE DI DELIBERA CONSIGLIO DIRETTIVO -->
+  <div id="modaleDelibera" class="modal-overlay">
+    <div class="modal-box">
+      <h3 style="color:#FFF; font-size: 18px; margin-bottom: 6px;">Delibera Consiglio Direttivo</h3>
+      <p style="color:#A1A1AA; font-size: 13px; margin-bottom: 20px;">
+        Ammissione a socio per: <strong id="modalNomeSocio" style="color:var(--color-primary)"></strong>
+      </p>
+
+      <form method="POST" action="/admin/delibera">
+        <input type="hidden" name="socio_id" id="modalSocioId">
+
+        <div style="margin-bottom: 14px;">
+          <label style="display:block; font-size: 12px; font-weight:700; color:#A1A1AA; margin-bottom: 6px;">Data Verbale CD *</label>
+          <input type="date" name="data_delibera" value="${new Date().toISOString().split('T')[0]}" required style="width:100%; padding:10px; background:#121214; border:1px solid #27272A; border-radius:6px; color:#FFF;">
+        </div>
+
+        <div style="margin-bottom: 14px;">
+          <label style="display:block; font-size: 12px; font-weight:700; color:#A1A1AA; margin-bottom: 6px;">Numero Verbale CD *</label>
+          <input type="text" name="numero_verbale" placeholder="Es. Verbale CD n. 04/2026" required style="width:100%; padding:10px; background:#121214; border:1px solid #27272A; border-radius:6px; color:#FFF;">
+        </div>
+
+        <div style="margin-bottom: 20px;">
+          <label style="display:block; font-size: 12px; font-weight:700; color:#A1A1AA; margin-bottom: 6px;">Numero Tessera APS Assegnato *</label>
+          <input type="text" name="numero_tessera" placeholder="Es. APS-2026-0042" required style="width:100%; padding:10px; background:#121214; border:1px solid #27272A; border-radius:6px; color:#FFF;">
+        </div>
+
+        <div style="display:flex; justify-content:flex-end; gap: 10px;">
+          <button type="button" onclick="chiudiModaleDelibera()" class="btn btn-secondary">Annulla</button>
+          <button type="submit" class="btn btn-primary">Approva &amp; Registra</button>
+        </div>
+      </form>
     </div>
   </div>
 
@@ -1763,7 +1107,11 @@ async function renderAdminDashboard(env, user, url) {
   });
 }
 
-function renderLoginPage(errorMsg = null) {
+/* =========================================================================
+   PAGINE DI AUTENTICAZIONE (SETUP E LOGIN)
+   ========================================================================= */
+
+function renderLoginPage(errorMsg = null, emailVal = "") {
   const html = `<!DOCTYPE html>
 <html lang="it">
 <head>
@@ -1789,10 +1137,10 @@ function renderLoginPage(errorMsg = null) {
       background: #18181B;
       border: 1px solid #27272A;
       border-radius: 16px;
-      padding: 40px 32px;
+      padding: 36px;
       width: 100%;
       max-width: 420px;
-      box-shadow: 0 20px 40px -15px rgba(0,0,0,0.7);
+      box-shadow: 0 20px 40px rgba(0,0,0,0.4);
     }
     .brand-header {
       text-align: center;
@@ -1800,65 +1148,62 @@ function renderLoginPage(errorMsg = null) {
     }
     .brand-title {
       font-size: 20px;
-      font-weight: 700;
+      font-weight: 800;
       color: #FFF;
-      letter-spacing: -0.01em;
-      margin-top: 10px;
+      margin-top: 12px;
     }
     .brand-sub {
+      font-size: 13px;
       color: #A1A1AA;
-      font-size: 13px;
       margin-top: 4px;
-    }
-    .error-box {
-      background: #EF444422;
-      border: 1px solid #EF4444;
-      color: #F87171;
-      padding: 10px 14px;
-      border-radius: 8px;
-      font-size: 13px;
-      margin-bottom: 20px;
     }
     .form-group {
       margin-bottom: 18px;
-      text-align: left;
     }
     label {
       display: block;
       font-size: 12.5px;
       font-weight: 600;
-      color: #E4E4E7;
+      color: #D4D4D8;
       margin-bottom: 6px;
     }
     input {
       width: 100%;
-      background: #09090B;
-      border: 1px solid #3F3F46;
-      color: #FFF;
-      padding: 11px 14px;
+      background: #0D0D0E;
+      border: 1px solid #27272A;
       border-radius: 8px;
+      padding: 12px 14px;
       font-size: 14px;
-      transition: border-color 0.2s;
-    }
-    input:focus {
+      color: #FFF;
       outline: none;
-      border-color: #D98295;
-      box-shadow: 0 0 0 2px #D9829533;
+      transition: border-color 0.15s;
     }
+    input:focus { border-color: #D98295; }
     .btn-submit {
       width: 100%;
       background: #D98295;
       color: #121214;
-      font-weight: 700;
-      font-size: 14px;
-      padding: 12px;
-      border-radius: 8px;
       border: none;
+      border-radius: 8px;
+      padding: 13px;
+      font-size: 14.5px;
+      font-weight: 700;
       cursor: pointer;
-      margin-top: 8px;
-      transition: opacity 0.2s;
+      transition: opacity 0.15s;
+      margin-top: 6px;
     }
     .btn-submit:hover { opacity: 0.9; }
+    .error-box {
+      background: rgba(239, 68, 68, 0.15);
+      border: 1px solid #EF4444;
+      color: #EF4444;
+      padding: 12px;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 600;
+      margin-bottom: 20px;
+      text-align: center;
+    }
     .back-link {
       display: block;
       text-align: center;
@@ -1883,7 +1228,7 @@ function renderLoginPage(errorMsg = null) {
     <form method="POST" action="/admin/login">
       <div class="form-group">
         <label>Email</label>
-        <input type="email" name="email" placeholder="tua-email@personale.it" required autofocus>
+        <input type="email" name="email" value="${emailVal ? emailVal.replace(/"/g, '&quot;') : ''}" placeholder="tua-email@personale.it" required autofocus>
       </div>
       <div class="form-group">
         <label>Password</label>
@@ -1924,114 +1269,64 @@ function renderSetupPage(errorMsg = null) {
       justify-content: center;
       padding: 20px;
     }
-    .setup-card {
+    .auth-card {
       background: #18181B;
       border: 1px solid #27272A;
       border-radius: 16px;
-      padding: 40px 32px;
+      padding: 36px;
       width: 100%;
-      max-width: 480px;
-      box-shadow: 0 20px 40px -15px rgba(0,0,0,0.7);
+      max-width: 440px;
+      box-shadow: 0 20px 40px rgba(0,0,0,0.4);
     }
-    .brand-header {
-      text-align: center;
-      margin-bottom: 28px;
-    }
-    .brand-title {
-      font-size: 22px;
-      font-weight: 700;
-      color: #FFF;
-      letter-spacing: -0.01em;
-      margin-top: 10px;
-    }
-    .brand-sub {
-      color: #A1A1AA;
-      font-size: 13px;
-      margin-top: 4px;
-    }
-    .error-box {
-      background: #EF444422;
-      border: 1px solid #EF4444;
-      color: #F87171;
-      padding: 10px 14px;
-      border-radius: 8px;
-      font-size: 13px;
-      margin-bottom: 20px;
-    }
-    .form-group {
-      margin-bottom: 16px;
-      text-align: left;
-    }
-    .form-row {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 12px;
-    }
-    label {
-      display: block;
-      font-size: 12.5px;
-      font-weight: 600;
-      color: #E4E4E7;
-      margin-bottom: 6px;
-    }
+    .brand-title { font-size: 20px; font-weight: 800; text-align: center; margin-bottom: 4px; }
+    .brand-sub { font-size: 13px; color: #A1A1AA; text-align: center; margin-bottom: 24px; }
+    .form-group { margin-bottom: 16px; }
+    label { display: block; font-size: 12px; font-weight: 600; color: #D4D4D8; margin-bottom: 6px; }
     input {
       width: 100%;
-      background: #09090B;
-      border: 1px solid #3F3F46;
-      color: #FFF;
-      padding: 11px 14px;
+      background: #0D0D0E;
+      border: 1px solid #27272A;
       border-radius: 8px;
+      padding: 11px 13px;
       font-size: 14px;
-      transition: border-color 0.2s;
-    }
-    input:focus {
+      color: #FFF;
       outline: none;
-      border-color: #D98295;
-      box-shadow: 0 0 0 2px #D9829533;
     }
+    input:focus { border-color: #D98295; }
     .btn-submit {
       width: 100%;
       background: #D98295;
       color: #121214;
-      font-weight: 700;
-      font-size: 14px;
-      padding: 12px;
-      border-radius: 8px;
       border: none;
+      border-radius: 8px;
+      padding: 13px;
+      font-size: 14.5px;
+      font-weight: 700;
       cursor: pointer;
-      margin-top: 12px;
-      transition: opacity 0.2s;
+      margin-top: 10px;
     }
-    .btn-submit:hover { opacity: 0.9; }
   </style>
 </head>
 <body>
-  <div class="setup-card">
-    <div class="brand-header">
-      <svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="#D98295" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
-      <h1 class="brand-title">Primo Avvio Gestionale</h1>
-      <p class="brand-sub">Creazione Account Super Admin • Cervelli in Affitto APS</p>
-    </div>
-
-    ${errorMsg ? `<div class="error-box">${errorMsg}</div>` : ''}
-
+  <div class="auth-card">
+    <h1 class="brand-title">Primo Avvio Gestionale</h1>
+    <p class="brand-sub">Configura l'account Super Admin principale</p>
+    ${errorMsg ? `<div style="background:rgba(239,68,68,0.15); border:1px solid #EF4444; color:#EF4444; padding:10px; border-radius:6px; font-size:12.5px; margin-bottom:16px;">${errorMsg}</div>` : ''}
     <form method="POST" action="/admin/setup">
-      <div class="form-row">
-        <div class="form-group">
-          <label>Nome *</label>
-          <input type="text" name="nome" placeholder="Giacomo" required>
-        </div>
-        <div class="form-group">
-          <label>Cognome *</label>
-          <input type="text" name="cognome" placeholder="Garofani" required>
-        </div>
+      <div class="form-group">
+        <label>Nome</label>
+        <input type="text" name="nome" placeholder="Giacomo" required>
       </div>
       <div class="form-group">
-        <label>Email Ufficiale Super Admin *</label>
+        <label>Cognome</label>
+        <input type="text" name="cognome" placeholder="Garofani" required>
+      </div>
+      <div class="form-group">
+        <label>Email Ufficiale Super Admin</label>
         <input type="email" name="email" placeholder="garofanigiacomo@hotmail.it" required>
       </div>
       <div class="form-group">
-        <label>Password Super Admin (minimo 8 caratteri) *</label>
+        <label>Password (minimo 8 caratteri)</label>
         <input type="password" name="password" minlength="8" required>
       </div>
       <button type="submit" class="btn-submit">Crea Account Super Admin</button>
@@ -2039,601 +1334,943 @@ function renderSetupPage(errorMsg = null) {
   </div>
 </body>
 </html>`;
-
-  return new Response(html, {
-    headers: { "Content-Type": "text/html; charset=utf-8" }
-  });
+  return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
 }
 
 /* =========================================================================
-   PORTALE PUBBLICO: WIZARD ISCRIZIONE CORSI MINORI & DOMANDA SOCIO
+   VISTE INTERNE DELLA DASHBOARD
    ========================================================================= */
 
-async function handlePublicRoutes(request, env, url, ctx) {
-  if (request.method === "POST" && (url.pathname === "/" || url.pathname === "/iscrizione")) {
-    return handleIscrizionePost(request, env, ctx);
+function renderVistaDashboard(countDomande, countSociAttivi, countCorsi, listaDomande, tema) {
+  return `
+    <div class="stats-grid">
+      <div class="stat-card">
+        <div class="stat-label">Domande in Attesa CD</div>
+        <div class="stat-val" style="color: #F59E0B;">${countDomande}</div>
+        <div class="stat-desc">Richieste di ammissione da deliberare</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Soci Attivi & Tesserati</div>
+        <div class="stat-val" style="color: #10B981;">${countSociAttivi}</div>
+        <div class="stat-desc">Soci con tessera APS attiva</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Attività & Laboratori</div>
+        <div class="stat-val">${countCorsi}</div>
+        <div class="stat-desc">Corsi di teatro attivi</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Spettacoli & Cassa</div>
+        <div class="stat-val">0 €</div>
+        <div class="stat-desc">Incassi del mese corrente</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Centro di Controllo • Tutte le Macro-Aree</div>
+      <div class="card-sub">Naviga rapidamente tra i settori del gestionale approvati nella Bibbia</div>
+
+      <div class="hub-grid">
+        <a href="/admin?view=hub-soci" class="hub-card">
+          <div class="hub-card-header">
+            <span class="hub-card-title">Soci & Libro Soci</span>
+            <span class="badge-count">4 sezioni</span>
+          </div>
+          <div class="hub-card-desc">Gestione domande di ammissione, Libro Soci ufficiale, anagrafiche minori, quote sociali e tesseramento nazionale UILT.</div>
+        </a>
+
+        <a href="/admin?view=hub-corsi" class="hub-card">
+          <div class="hub-card-header">
+            <span class="hub-card-title">Attività & Corsi</span>
+            <span class="badge-count">3 sezioni</span>
+          </div>
+          <div class="hub-card-desc">Laboratori teatrali per bambini, ragazzi e adulti, registri allievi, quote di frequenza e foglio presenze.</div>
+        </a>
+
+        <a href="/admin?view=hub-eventi" class="hub-card">
+          <div class="hub-card-header">
+            <span class="hub-card-title">Eventi, Teatro & Casse</span>
+            <span class="badge-count">5 sezioni</span>
+          </div>
+          <div class="hub-card-desc">Cartellone spettacoli, cene con delitto, eventi sul territorio, gestione prenotazioni e casse distinte.</div>
+        </a>
+
+        <a href="/admin?view=theme-builder" class="hub-card" style="border-color: rgba(217, 130, 149, 0.4);">
+          <div class="hub-card-header">
+            <span class="hub-card-title" style="color: var(--color-primary)">Builder Tema & Brand</span>
+            <span class="badge-count" style="background: rgba(217,130,149,0.2); color: var(--color-primary);">Macro 4.2</span>
+          </div>
+          <div class="hub-card-desc">Personalizza logo ufficiale, palette colori (rosa cervello, argento maschere), scala font e dati legali.</div>
+        </a>
+      </div>
+    </div>
+
+    <div class="card">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+        <div>
+          <div class="card-title">Ultime Domande di Ammissione</div>
+          <div class="card-sub" style="margin-bottom:0">Richieste recenti inviate dal modulo online pubblico</div>
+        </div>
+        <a href="/admin?view=domande" class="btn btn-secondary">Vedi Tutte</a>
+      </div>
+      ${renderTabellaDomande(listaDomande.slice(0, 5))}
+    </div>
+  `;
+}
+
+function renderTabellaDomande(domande) {
+  if (!domande || domande.length === 0) {
+    return `<div style="text-align:center; padding: 30px; color: #71717A; font-size: 13.5px;">Nessuna domanda di ammissione presente nel database.</div>`;
   }
-  const theme = await getThemeSettings(env);
-  return renderPublicForm(theme);
+
+  const rows = domande.map(d => {
+    const isMinore = !!d.tutore_nome;
+    const nomeCompleto = `${d.nome} ${d.cognome}`;
+    const infoTutore = isMinore ? `<div style="font-size:11px; color:#A1A1AA; margin-top:2px;">Tutore: ${d.tutore_nome} ${d.tutore_cognome} (${d.tutore_email || d.tutore_tel || ''})</div>` : '';
+    const badgeStato = d.stato_ammissione === 'approvata'
+      ? '<span class="badge badge-approved">Approvata</span>'
+      : '<span class="badge badge-pending">In Attesa CD</span>';
+
+    const btnAzione = d.stato_ammissione === 'in_attesa'
+      ? `<button onclick="apriModaleDelibera('${d.id}', '${nomeCompleto.replace(/'/g, "\\'")}', '${d.tipologia}')" class="btn btn-primary" style="padding: 6px 12px; font-size: 12px;">Approva &amp; Tessera</button>`
+      : '<span style="color:#10B981; font-size:12px; font-weight:700;">Deliberato</span>';
+
+    return `
+      <tr>
+        <td>
+          <strong style="color:#FFF;">${nomeCompleto}</strong>
+          ${infoTutore}
+        </td>
+        <td><span class="badge" style="background:#27272A; color:#E4E4E7;">${d.tipologia.toUpperCase()}</span></td>
+        <td><strong>${d.quota_dovuta || 0} €</strong></td>
+        <td><span style="font-size:12px; color:#A1A1AA;">${d.creato_il ? d.creato_il.substring(0, 10) : '-'}</span></td>
+        <td>${badgeStato}</td>
+        <td style="text-align: right;">${btnAzione}</td>
+      </tr>
+    `;
+  }).join("");
+
+  return `
+    <div class="table-container">
+      <table>
+        <thead>
+          <tr>
+            <th>Nominativo Socio</th>
+            <th>Tipologia</th>
+            <th>Quota APS</th>
+            <th>Data Richiesta</th>
+            <th>Stato</th>
+            <th style="text-align: right;">Azione</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+function renderHubSoci(countDomande, countSociAttivi) {
+  return `
+    <div class="card">
+      <div class="card-title">Macro-Area 1: Soci & Libro Soci</div>
+      <div class="card-sub">Gestione del corpo sociale, conformità Codice Terzo Settore e affiliazione UILT</div>
+
+      <div class="hub-grid">
+        <a href="/admin?view=domande" class="hub-card">
+          <div class="hub-card-header">
+            <span class="hub-card-title">1.1 Domande Ammissione</span>
+            <span class="badge-count" style="background: rgba(245,158,11,0.2); color:#F59E0B;">${countDomande} in attesa</span>
+          </div>
+          <div class="hub-card-desc">Valutazione formale e delibera del Consiglio Direttivo con verbalizzazione automatica.</div>
+        </a>
+
+        <a href="/admin?view=libro-soci" class="hub-card">
+          <div class="hub-card-header">
+            <span class="hub-card-title">1.2 Libro Soci Ufficiale</span>
+            <span class="badge-count">${countSociAttivi} attivi</span>
+          </div>
+          <div class="hub-card-desc">Registro progressivo vidimabile ed esportabile in PDF/Excel conforme CTS.</div>
+        </a>
+
+        <a href="/admin?view=quote-uilt" class="hub-card">
+          <div class="hub-card-header">
+            <span class="hub-card-title">1.3 Quote & Tessere UILT</span>
+            <span class="badge-count">Annualità 2026</span>
+          </div>
+          <div class="hub-card-desc">Monitoraggio quote associative APS, caricamento e invio tessere assicurative UILT.</div>
+        </a>
+      </div>
+    </div>
+  `;
+}
+
+function renderHubCorsi(countCorsi) {
+  return `
+    <div class="card">
+      <div class="card-title">Macro-Area 2: Attività & Corsi Teatrali</div>
+      <div class="card-sub">Gestione allievi, laboratori per ragazzi e adulti e registri presenze</div>
+      <div class="hub-grid">
+        <div class="hub-card">
+          <div class="hub-card-header"><span class="hub-card-title">2.1 Laboratori Teatrali</span><span class="badge-count">${countCorsi} attivi</span></div>
+          <div class="hub-card-desc">Corsi annuali, quote di frequenza periodiche e docenti referenti.</div>
+        </div>
+        <div class="hub-card">
+          <div class="hub-card-header"><span class="hub-card-title">2.2 Registro Allievi</span></div>
+          <div class="hub-card-desc">Anagrafiche allievi, deleghe di ritiro per minori e contatti d'emergenza.</div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderHubEventi() {
+  return `
+    <div class="card">
+      <div class="card-title">Macro-Area 3: Eventi, Teatro & Casse</div>
+      <div class="card-sub">Gestione cartellone, prenotazioni e casse distinte conformi alla Bibbia</div>
+      <div class="hub-grid">
+        <div class="hub-card">
+          <div class="hub-card-header"><span class="hub-card-title">3.1 Spettacoli Teatrali</span></div>
+          <div class="hub-card-desc">Biglietti, capienza platea, assegnazione posti e cassa teatrale.</div>
+        </div>
+        <div class="hub-card">
+          <div class="hub-card-header"><span class="hub-card-title">3.2 Eventi Altri (Cene con Delitto)</span></div>
+          <div class="hub-card-desc">Moduli prenotazione dinamici e cassa personalizzabile per eventi esterni.</div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderHubBuilder() {
+  return `
+    <div class="card">
+      <div class="card-title">Macro-Area 4: Builder & Contenuti</div>
+      <div class="card-sub">Personalizzazione grafica e modulare della piattaforma senza scrivere codice</div>
+      <div class="hub-grid">
+        <a href="/admin?view=theme-builder" class="hub-card" style="border-color: var(--color-primary)">
+          <div class="hub-card-header"><span class="hub-card-title" style="color:var(--color-primary)">4.2 Builder Tema & Brand</span></div>
+          <div class="hub-card-desc">Configurazione colori, logo ufficiale ad alta definizione e dati istituzionali.</div>
+        </a>
+        <div class="hub-card">
+          <div class="hub-card-header"><span class="hub-card-title">4.1 Form Builder</span></div>
+          <div class="hub-card-desc">Creazione e modifica dei campi dei moduli pubblici online.</div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderHubSistema() {
+  return `
+    <div class="card">
+      <div class="card-title">Macro-Area 5: Sistema & Utenti</div>
+      <div class="card-sub">Gestione account, ruoli operativi, audit log e sicurezza del gestionale</div>
+      <div class="hub-grid">
+        <div class="hub-card">
+          <div class="hub-card-header"><span class="hub-card-title">5.1 Gestione Utenti & Ruoli</span></div>
+          <div class="hub-card-desc">Super Admin, cassieri, segreteria e volontari con permessi differenziati.</div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+/* =========================================================================
+   VISTA 4.2: BUILDER TEMA & IDENTITÀ VISIVA (D1 SETTINGS)
+   ========================================================================= */
+
+function renderThemeBuilderView(tema, msg, err) {
+  return `
+    <form method="POST" action="/admin/salva-tema">
+      <div class="card">
+        <div class="card-title">Identità Istituzionale & Contatti</div>
+        <div class="card-sub">I dati qui impostati vengono salvati nel database Cloudflare D1 e usati su tutte le pagine e comunicazioni.</div>
+
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px;">
+          <div>
+            <label style="display:block; font-size:12px; font-weight:700; color:#A1A1AA; margin-bottom:6px;">Nome Ufficiale APS</label>
+            <input type="text" name="nome_associazione" value="${tema.nome_associazione.replace(/"/g, '&quot;')}" required style="width:100%; padding:10px; background:#121214; border:1px solid #27272A; border-radius:6px; color:#FFF;">
+          </div>
+          <div>
+            <label style="display:block; font-size:12px; font-weight:700; color:#A1A1AA; margin-bottom:6px;">Dominio Ufficiale</label>
+            <input type="text" name="dominio_ufficiale" value="${tema.dominio_ufficiale.replace(/"/g, '&quot;')}" required style="width:100%; padding:10px; background:#121214; border:1px solid #27272A; border-radius:6px; color:#FFF;">
+          </div>
+          <div>
+            <label style="display:block; font-size:12px; font-weight:700; color:#A1A1AA; margin-bottom:6px;">Email Istituzionale di Contatto</label>
+            <input type="email" name="email_contatto" value="${tema.email_contatto.replace(/"/g, '&quot;')}" required style="width:100%; padding:10px; background:#121214; border:1px solid #27272A; border-radius:6px; color:#FFF;">
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Logo Ufficiale Trasparente</div>
+        <div class="card-sub">Immagine del logo (cervello rosa e maschere d'argento) con sfondo trasparente</div>
+
+        <div style="display: flex; gap: 20px; align-items: center; flex-wrap: wrap;">
+          <div style="width: 80px; height: 80px; background: #000; border: 1px solid #27272A; border-radius: 12px; display: flex; align-items: center; justify-content: center; padding: 8px;">
+            <img src="${tema.url_logo}" alt="Anteprima Logo" style="max-width: 100%; max-height: 100%; object-fit: contain;">
+          </div>
+          <div style="flex: 1; min-width: 250px;">
+            <label style="display:block; font-size:12px; font-weight:700; color:#A1A1AA; margin-bottom:6px;">URL Immagine Logo (PNG trasparente)</label>
+            <input type="url" name="url_logo" value="${tema.url_logo.replace(/"/g, '&quot;')}" required style="width:100%; padding:10px; background:#121214; border:1px solid #27272A; border-radius:6px; color:#FFF;">
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Palette Teatrale & Colori Ufficiali</div>
+        <div class="card-sub">Personalizza i codici colore esadecimali del brand Cervelli in Affitto APS</div>
+
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px;">
+          <div>
+            <label style="display:block; font-size:12px; font-weight:700; color:#A1A1AA; margin-bottom:6px;">Colore Primario (Rosa Cervello)</label>
+            <div style="display:flex; gap:8px;">
+              <input type="color" value="${tema.colore_primario}" onchange="document.getElementById('inputPrimario').value = this.value" style="width:44px; height:42px; border:none; border-radius:6px; cursor:pointer; background:none;">
+              <input type="text" id="inputPrimario" name="colore_primario" value="${tema.colore_primario}" style="flex:1; padding:10px; background:#121214; border:1px solid #27272A; border-radius:6px; color:#FFF;">
+            </div>
+          </div>
+          <div>
+            <label style="display:block; font-size:12px; font-weight:700; color:#A1A1AA; margin-bottom:6px;">Colore Secondario (Argento Maschere)</label>
+            <div style="display:flex; gap:8px;">
+              <input type="color" value="${tema.colore_secondario}" onchange="document.getElementById('inputSecondario').value = this.value" style="width:44px; height:42px; border:none; border-radius:6px; cursor:pointer; background:none;">
+              <input type="text" id="inputSecondario" name="colore_secondario" value="${tema.colore_secondario}" style="flex:1; padding:10px; background:#121214; border:1px solid #27272A; border-radius:6px; color:#FFF;">
+            </div>
+          </div>
+          <div>
+            <label style="display:block; font-size:12px; font-weight:700; color:#A1A1AA; margin-bottom:6px;">Colore Sfondo Scuro (Nero Ribalta)</label>
+            <div style="display:flex; gap:8px;">
+              <input type="color" value="${tema.colore_scuro}" onchange="document.getElementById('inputScuro').value = this.value" style="width:44px; height:42px; border:none; border-radius:6px; cursor:pointer; background:none;">
+              <input type="text" id="inputScuro" name="colore_scuro" value="${tema.colore_scuro}" style="flex:1; padding:10px; background:#121214; border:1px solid #27272A; border-radius:6px; color:#FFF;">
+            </div>
+          </div>
+          <div>
+            <label style="display:block; font-size:12px; font-weight:700; color:#A1A1AA; margin-bottom:6px;">Scala Caratteri</label>
+            <select name="scala_font" style="width:100%; height:42px; padding:0 10px; background:#121214; border:1px solid #27272A; border-radius:6px; color:#FFF;">
+              <option value="compatta" ${tema.scala_font === 'compatta' ? 'selected' : ''}>Compatta (Desktop compatto)</option>
+              <option value="normale" ${tema.scala_font === 'normale' ? 'selected' : ''}>Normale (Predefinita)</option>
+              <option value="grande" ${tema.scala_font === 'grande' ? 'selected' : ''}>Grande (Maggiore leggibilità)</option>
+            </select>
+          </div>
+        </div>
+      </div>
+
+      <div style="display: flex; justify-content: flex-end; gap: 12px; margin-top: 10px;">
+        <a href="/admin?view=dashboard" class="btn btn-secondary">Annulla</a>
+        <button type="submit" class="btn btn-primary" style="padding: 12px 24px; font-size: 14.5px;">Salva Modifiche nel Database</button>
+      </div>
+    </form>
+  `;
+}
+
+/* =========================================================================
+   PORTALE PUBBLICO: WIZARD ISCRIZIONE E DOMANDA SOCIO (5 STEP)
+   ========================================================================= */
+
+async function seedDefaultCourseIfNeeded(env) {
+  try {
+    const existing = await env.DB.prepare(
+      "SELECT id FROM attivita_eventi WHERE id = 'corso-teatro-ragazzi-2026' LIMIT 1"
+    ).first();
+
+    if (!existing) {
+      await env.DB.prepare(`
+        INSERT INTO attivita_eventi (id, tipologia, titolo, descrizione, quota_default, attivo, creato_il)
+        VALUES ('corso-teatro-ragazzi-2026', 'corso', 'Laboratorio Teatrale Bambini & Ragazzi', 'Laboratorio propedeutico teatrale annuale con spettacolo di fine anno.', 20.0, 1, datetime('now'))
+      `).run();
+    }
+  } catch (err) {
+    console.error("Errore seed corso:", err);
+  }
 }
 
 async function handleIscrizionePost(request, env, ctx) {
   try {
     const form = await request.formData();
 
-    const minoreNome = form.get("minore_nome")?.trim();
-    const minoreCognome = form.get("minore_cognome")?.trim();
-    const minoreCF = form.get("minore_cf")?.trim().toUpperCase();
-    const minoreNascita = form.get("minore_nascita");
-    const minoreLuogo = form.get("minore_luogo")?.trim();
-    const noteMediche = form.get("note_mediche")?.trim() || null;
+    // Dati Minore
+    const nomeMinore = form.get("minore_nome")?.trim();
+    const cognomeMinore = form.get("minore_cognome")?.trim();
+    const cfMinore = form.get("minore_cf")?.trim().toUpperCase();
+    const dataNascitaMinore = form.get("minore_data_nascita");
+    const luogoNascitaMinore = form.get("minore_luogo_nascita")?.trim();
+    const corsoId = form.get("corso_id") || "corso-teatro-ragazzi-2026";
+    const noteSalute = form.get("note_salute")?.trim();
 
-    const tutoreNome = form.get("tutore_nome")?.trim();
-    const tutoreCognome = form.get("tutore_cognome")?.trim();
-    const tutoreCF = form.get("tutore_cf")?.trim().toUpperCase();
-    const tutoreTelefono = form.get("tutore_telefono")?.trim();
-    const tutoreEmail = form.get("tutore_email")?.trim().toLowerCase();
-    const tutoreResidenza = form.get("tutore_residenza")?.trim();
-    const gradoParentela = form.get("grado_parentela") || "Genitore";
+    // Dati Tutore
+    const nomeTutore = form.get("tutore_nome")?.trim();
+    const cognomeTutore = form.get("tutore_cognome")?.trim();
+    const cfTutore = form.get("tutore_cf")?.trim().toUpperCase();
+    const emailTutore = form.get("tutore_email")?.trim().toLowerCase();
+    const telefonoTutore = form.get("tutore_telefono")?.trim();
+    const indirizzoTutore = form.get("tutore_indirizzo")?.trim();
+    const cittaTutore = form.get("tutore_citta")?.trim();
+    const capTutore = form.get("tutore_cap")?.trim();
 
-    const delega1Nome = form.get("delega1_nome")?.trim();
-    const delega1Cognome = form.get("delega1_cognome")?.trim();
-    const delega1Tel = form.get("delega1_telefono")?.trim();
-    const delega1Rel = form.get("delega1_relazione")?.trim();
+    // Deleghe facoltative
+    const delega1Nome = form.get("delega_1_nome")?.trim();
+    const delega1Cognome = form.get("delega_1_cognome")?.trim();
+    const delega1Telefono = form.get("delega_1_telefono")?.trim();
+    const delega1Doc = form.get("delega_1_documento")?.trim();
 
-    const accStatuto = form.get("accettazione_statuto") ? 1 : 0;
-    const consPrivacy = form.get("consenso_privacy") ? 1 : 0;
-    const consFoto = form.get("consenso_foto_video") ? 1 : 0;
-
-    if (!minoreNome || !minoreCognome || !minoreCF || !tutoreNome || !tutoreCognome || !tutoreEmail || !tutoreTelefono) {
-      return new Response("Campi anagrafici obbligatori mancanti.", { status: 400 });
-    }
-    if (!accStatuto || !consPrivacy) {
-      return new Response("Accettazione dello statuto e consenso privacy obbligatori.", { status: 400 });
+    if (!nomeMinore || !cognomeMinore || !cfMinore || !nomeTutore || !cognomeTutore || !emailTutore || !telefonoTutore) {
+      return new Response("Dati obbligatori mancanti.", { status: 400 });
     }
 
-    let tutoreId;
+    // 1. Registra o aggiorna il tutore
+    let tutoreId = null;
     const existingTutore = await env.DB.prepare(
       "SELECT id FROM tutori WHERE codice_fiscale = ? OR email = ? LIMIT 1"
-    ).bind(tutoreCF, tutoreEmail).first();
+    ).bind(cfTutore, emailTutore).first();
 
     if (existingTutore) {
       tutoreId = existingTutore.id;
+      await env.DB.prepare(`
+        UPDATE tutori SET nome = ?, cognome = ?, telefono = ?, indirizzo_residenza = ?, citta_residenza = ?, cap = ?
+        WHERE id = ?
+      `).bind(nomeTutore, cognomeTutore, telefonoTutore, indirizzoTutore, cittaTutore, capTutore, tutoreId).run();
     } else {
       const resTutore = await env.DB.prepare(`
-        INSERT INTO tutori (nome, cognome, codice_fiscale, telefono, email, residenza, grado_parentela, creato_il)
-        VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
-      `).bind(tutoreNome, tutoreCognome, tutoreCF, tutoreTelefono, tutoreEmail, tutoreResidenza, gradoParentela).run();
+        INSERT INTO tutori (nome, cognome, codice_fiscale, email, telefono, indirizzo_residenza, citta_residenza, cap, creato_il)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+      `).bind(nomeTutore, cognomeTutore, cfTutore, emailTutore, telefonoTutore, indirizzoTutore, cittaTutore, capTutore).run();
       tutoreId = resTutore.meta.last_row_id;
     }
 
-    let socioId;
-    const existingSocio = await env.DB.prepare(
-      "SELECT id FROM soci WHERE codice_fiscale = ? LIMIT 1"
-    ).bind(minoreCF).first();
+    // 2. Registra il socio (Minore con tipologia Ordinario per delibera CD)
+    const resSocio = await env.DB.prepare(`
+      INSERT INTO soci (
+        nome, cognome, codice_fiscale, data_nascita, luogo_nascita,
+        tutore_id, tipologia, quota_dovuta, note_sanitarie, stato_ammissione, creato_il
+      ) VALUES (?, ?, ?, ?, ?, ?, 'ordinario', 20.0, ?, 'in_attesa', datetime('now'))
+    `).bind(nomeMinore, cognomeMinore, cfMinore, dataNascitaMinore, luogoNascitaMinore, tutoreId, noteSalute).run();
+    const socioId = resSocio.meta.last_row_id;
 
-    if (existingSocio) {
-      socioId = existingSocio.id;
-      await env.DB.prepare(`
-        UPDATE soci
-        SET tutore_id = ?, note_mediche = ?, aggiornato_il = datetime('now')
-        WHERE id = ?
-      `).bind(tutoreId, noteMediche, socioId).run();
-    } else {
-      const resSocio = await env.DB.prepare(`
-        INSERT INTO soci (
-          tipo_socio, stato_iscrizione, nome, cognome, codice_fiscale,
-          data_nascita, luogo_nascita, tutore_id, note_mediche, creato_il, aggiornato_il
-        ) VALUES (
-          'ordinario', 'in_attesa_delibera', ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now')
-        )
-      `).bind(minoreNome, minoreCognome, minoreCF, minoreNascita, minoreLuogo, tutoreId, noteMediche).run();
-      socioId = resSocio.meta.last_row_id;
-    }
-
+    // 3. Iscrizione al laboratorio teatrale
     await env.DB.prepare(`
-      INSERT INTO quote_sociali (socio_id, stagione, tipo_quota, importo, stato_pagamento)
-      VALUES (?, '2025/2026', 'ordinario', 20.00, 'in_attesa')
-    `).bind(socioId).run();
+      INSERT INTO iscrizioni_corsi (socio_id, corso_id, quota_frequenza, data_iscrizione, stato)
+      VALUES (?, ?, 20.0, datetime('now'), 'richiesta')
+    `).bind(socioId, corsoId).run();
 
-    await env.DB.prepare(`
-      INSERT INTO consensi_privacy (socio_id, consenso_gdpr, consenso_foto_video, data_consenso, ip_registrazione)
-      VALUES (?, ?, ?, datetime('now'), ?)
-    `).bind(socioId, consPrivacy, consFoto, request.headers.get("CF-Connecting-IP") || "0.0.0.0").run();
-
-    let corso = await env.DB.prepare(
-      "SELECT id FROM attivita_eventi WHERE tipologia = 'corso' AND attivo = 1 LIMIT 1"
-    ).first();
-
-    if (!corso) {
-      const resCorso = await env.DB.prepare(`
-        INSERT INTO attivita_eventi (titolo, tipologia, anno_sociale, attivo, creato_il)
-        VALUES ('Laboratorio Teatrale Bambini & Ragazzi', 'corso', '2025/2026', 1, datetime('now'))
-      `).run();
-      corso = { id: resCorso.meta.last_row_id };
-    }
-
-    await env.DB.prepare(`
-      INSERT INTO iscrizioni_corsi (socio_id, attivita_id, stato_frequenza, data_iscrizione)
-      VALUES (?, ?, 'confermata', datetime('now'))
-    `).bind(socioId, corso.id).run();
-
+    // 4. Deleghe di ritiro minori (se fornite)
     if (delega1Nome && delega1Cognome) {
       await env.DB.prepare(`
-        INSERT INTO deleghe_ritiro (socio_id, tutore_id, nome, cognome, telefono, relazione, creato_il)
-        VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
-      `).bind(socioId, tutoreId, delega1Nome, delega1Cognome, delega1Tel || null, delega1Rel || null).run();
+        INSERT INTO deleghe_ritiro (minore_id, nome, cognome, telefono, documento_tipo_numero, autorizzato_dal_tutore)
+        VALUES (?, ?, ?, ?, ?, 1)
+      `).bind(socioId, delega1Nome, delega1Cognome, delega1Telefono, delega1Doc).run();
     }
 
-    return renderSuccessPage(minoreNome);
+    // Invio notifica email tramite Resend (se la chiave è presente nei secret)
+    if (env.RESEND_API_KEY) {
+      ctx.waitUntil(inviaEmailConfermaIscrizione(env, emailTutore, nomeTutore, nomeMinore));
+    }
+
+    return new Response(null, {
+      status: 302,
+      headers: { Location: `/?success=1&minore=${encodeURIComponent(nomeMinore)}` }
+    });
   } catch (err) {
-    console.error("Errore salvataggio domanda:", err);
-    return new Response("Errore durante il salvataggio della domanda: " + err.message, { status: 500 });
+    console.error("Errore salvataggio domanda socio/minore:", err);
+    return new Response("Errore durante l'elaborazione della domanda: " + err.message, { status: 500 });
   }
 }
 
-function renderPublicForm(theme) {
+async function inviaEmailConfermaIscrizione(env, emailDestinatario, nomeTutore, nomeMinore) {
+  try {
+    await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${env.RESEND_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        from: "Cervelli in Affitto APS <info@cervelliinaffitto-aps.it>",
+        to: [emailDestinatario],
+        subject: `Richiesta Iscrizione Ricevuta • ${nomeMinore}`,
+        html: `
+          <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; color: #121214;">
+            <h2 style="color: #D98295;">Cervelli in Affitto APS</h2>
+            <p>Gentile <strong>${nomeTutore}</strong>,</p>
+            <p>Abbiamo acquisito con successo la richiesta di ammissione a socio e l'iscrizione al laboratorio teatrale per <strong>${nomeMinore}</strong>.</p>
+            <p>La domanda è stata inserita all'ordine del giorno del prossimo Consiglio Direttivo per la delibera formale e l'attribuzione del numero di tessera APS.</p>
+            <p style="color: #71717A; font-size: 13px; margin-top: 30px; border-top: 1px solid #E5E7EB; padding-top: 15px;">
+              Cervelli in Affitto APS • Dominio: cervelliinaffitto-aps.it • Affiliato UILT
+            </p>
+          </div>
+        `
+      })
+    });
+  } catch (e) {
+    console.error("Errore invio email Resend:", e);
+  }
+}
+
+function renderPublicWizard(step, isSuccess, searchParams) {
+  if (isSuccess) {
+    const nomeMinore = searchParams.get("minore") || "l'allievo/a";
+    return renderPublicSuccess(nomeMinore);
+  }
+
   const html = `<!DOCTYPE html>
 <html lang="it">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Iscrizione Corsi & Domanda Socio • ${theme.nome_associazione}</title>
+  <title>Iscrizione Corsi & Domanda Socio • Cervelli in Affitto APS</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
   <style>
     :root {
-      --coral: ${theme.colore_primario};
-      --silver: ${theme.colore_secondario};
-      --dark: ${theme.colore_scuro};
-      --card-bg: #FFFFFF;
-      --text: #1F2937;
-      --border: #E5E7EB;
+      --primary: #D98295;
+      --secondary: #E8E7E9;
+      --dark: #121214;
+      --bg: #F4F4F5;
+      --surface: #FFFFFF;
+      --border: #E4E4E7;
+      --text: #18181B;
+      --text-muted: #71717A;
     }
+
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
       font-family: 'Plus Jakarta Sans', sans-serif;
-      background: #F9FAFB;
+      background: var(--bg);
       color: var(--text);
       min-height: 100vh;
       display: flex;
       flex-direction: column;
     }
-    header.pub-header {
+
+    /* THEATER HEADER (SCURO) */
+    .pub-header {
       background: var(--dark);
-      color: #FFF;
+      border-bottom: 2px solid var(--primary);
       padding: 24px 20px;
       text-align: center;
-      border-bottom: 2px solid var(--coral);
     }
-    .brand-title {
-      font-size: 20px;
-      font-weight: 700;
-      letter-spacing: -0.01em;
+    .pub-logo-box {
+      display: inline-flex;
+      align-items: center;
+      gap: 12px;
+      text-decoration: none;
     }
-    .brand-sub {
-      color: var(--silver);
+    .pub-logo-img {
+      width: 44px;
+      height: 44px;
+      object-fit: contain;
+    }
+    .pub-brand-title {
+      font-size: 22px;
+      font-weight: 800;
+      color: #FFF;
+      letter-spacing: -0.3px;
+    }
+    .pub-brand-sub {
       font-size: 13px;
-      margin-top: 4px;
+      color: #A1A1AA;
+      margin-top: 2px;
     }
-    .form-container {
+
+    /* STEPPER */
+    .stepper-wrap {
       max-width: 680px;
+      margin: 28px auto 0 auto;
+      padding: 0 20px;
       width: 100%;
-      margin: 32px auto;
-      padding: 0 16px;
-      flex: 1;
-    }
-    .wizard-card {
-      background: var(--card-bg);
-      border: 1px solid var(--border);
-      border-radius: 16px;
-      padding: 32px 28px;
-      box-shadow: 0 10px 25px -5px rgba(0,0,0,0.05);
     }
     .stepper {
       display: flex;
       justify-content: space-between;
-      margin-bottom: 28px;
       position: relative;
+      margin-bottom: 24px;
     }
     .stepper::before {
-      content: "";
+      content: '';
       position: absolute;
-      top: 15px;
-      left: 20px;
-      right: 20px;
+      top: 16px;
+      left: 10%;
+      right: 10%;
       height: 2px;
-      background: #E5E7EB;
+      background: var(--border);
       z-index: 1;
     }
     .step-item {
       position: relative;
       z-index: 2;
-      background: #FFF;
+      text-align: center;
+      background: var(--bg);
+      padding: 0 8px;
+    }
+    .step-circle {
       width: 32px;
       height: 32px;
       border-radius: 50%;
-      border: 2px solid #D1D5DB;
+      background: #E4E4E7;
+      color: var(--text-muted);
       display: flex;
       align-items: center;
       justify-content: center;
       font-size: 13px;
       font-weight: 700;
-      color: #6B7280;
+      margin: 0 auto 6px auto;
+      transition: all 0.2s ease;
     }
-    .step-item.active {
-      border-color: var(--coral);
-      color: var(--coral);
-      background: #FFF;
+    .step-item.active .step-circle {
+      background: var(--primary);
+      color: var(--dark);
+      box-shadow: 0 0 0 4px rgba(217, 130, 149, 0.25);
     }
-    .step-item.completed {
-      border-color: var(--coral);
-      background: var(--coral);
-      color: #121214;
-    }
-    .step-section { display: none; }
-    .step-section.active { display: block; }
-    .step-title {
-      font-size: 18px;
+    .step-label {
+      font-size: 11px;
       font-weight: 700;
-      color: #111827;
-      margin-bottom: 8px;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.3px;
     }
-    .step-desc {
-      font-size: 13.5px;
-      color: #4B5563;
-      margin-bottom: 22px;
-      line-height: 1.5;
+    .step-item.active .step-label { color: var(--text); }
+
+    /* FORM CARD (CHIARO E LEGGIBILE) */
+    .form-container {
+      max-width: 680px;
+      margin: 0 auto 40px auto;
+      padding: 0 20px;
+      width: 100%;
+      flex: 1;
     }
-    .form-group {
-      margin-bottom: 16px;
+    .form-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 32px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.04);
     }
-    label {
-      display: block;
-      font-size: 13px;
-      font-weight: 600;
-      color: #374151;
+    .form-step-title {
+      font-size: 19px;
+      font-weight: 800;
+      color: var(--text);
       margin-bottom: 6px;
     }
-    input, select, textarea {
-      width: 100%;
-      background: #FFF;
-      border: 1px solid #D1D5DB;
-      color: #111827;
-      padding: 10px 14px;
+    .form-step-sub {
+      font-size: 13.5px;
+      color: var(--text-muted);
+      line-height: 1.5;
+      margin-bottom: 24px;
+    }
+
+    .form-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 16px;
+      margin-bottom: 20px;
+    }
+    .form-field {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .form-field label {
+      font-size: 12.5px;
+      font-weight: 700;
+      color: #3F3F46;
+    }
+    .form-field input, .form-field select, .form-field textarea {
+      padding: 11px 13px;
+      border: 1px solid var(--border);
       border-radius: 8px;
       font-size: 14px;
-      transition: border-color 0.15s;
-    }
-    input:focus, select:focus, textarea:focus {
+      font-family: inherit;
+      color: var(--text);
+      background: #FAFAFA;
       outline: none;
-      border-color: var(--coral);
+      transition: all 0.15s ease;
     }
-    .form-row {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 14px;
+    .form-field input:focus, .form-field select:focus, .form-field textarea:focus {
+      border-color: var(--primary);
+      background: #FFFFFF;
+      box-shadow: 0 0 0 3px rgba(217, 130, 149, 0.15);
     }
-    .checkbox-box {
-      background: #F9FAFB;
-      border: 1px solid #E5E7EB;
-      border-radius: 8px;
-      padding: 12px 14px;
-      margin-bottom: 14px;
-      display: flex;
-      align-items: flex-start;
-      gap: 10px;
-    }
-    .checkbox-box input[type="checkbox"] {
-      width: 18px;
-      height: 18px;
-      margin-top: 2px;
-      flex-shrink: 0;
-    }
-    .checkbox-label {
-      font-size: 13px;
-      color: #374151;
-      line-height: 1.4;
-    }
+
+    /* STEP NAVIGATION */
     .step-actions {
       display: flex;
       justify-content: space-between;
+      align-items: center;
       margin-top: 28px;
-      padding-top: 18px;
-      border-top: 1px solid #E5E7EB;
+      padding-top: 20px;
+      border-top: 1px solid var(--border);
     }
     .btn-step {
-      background: var(--coral);
-      color: #121214;
+      padding: 12px 24px;
+      border-radius: 8px;
+      font-size: 14px;
       font-weight: 700;
-      font-size: 14px;
-      padding: 11px 22px;
-      border-radius: 8px;
-      border: none;
       cursor: pointer;
-    }
-    .btn-back {
-      background: #E5E7EB;
-      color: #374151;
-      font-weight: 600;
-      font-size: 14px;
-      padding: 11px 20px;
-      border-radius: 8px;
       border: none;
-      cursor: pointer;
+      transition: all 0.15s;
     }
-    .review-row {
-      display: flex;
-      justify-content: space-between;
-      padding: 8px 0;
-      border-bottom: 1px solid #F3F4F6;
-      font-size: 13px;
-    }
-    .review-label { color: #6B7280; }
-    .review-val { font-weight: 600; color: #111827; }
-    footer.pub-footer {
+    .btn-step-prev { background: #E4E4E7; color: #27272A; }
+    .btn-step-next { background: var(--primary); color: var(--dark); margin-left: auto; }
+
+    /* FOOTER TEATRALE */
+    .pub-footer {
       background: var(--dark);
-      color: var(--silver);
-      text-align: center;
-      padding: 24px 20px;
-      font-size: 12px;
-      margin-top: auto;
       border-top: 1px solid #27272A;
+      color: #A1A1AA;
+      padding: 24px 20px;
+      text-align: center;
+      font-size: 12.5px;
+      line-height: 1.6;
     }
+    .pub-footer a { color: var(--primary); text-decoration: none; font-weight: 600; }
   </style>
 </head>
 <body>
+  <!-- HEADER TEATRALE -->
   <header class="pub-header">
-    <div class="brand-title">${theme.nome_associazione}</div>
-    <div class="brand-sub">Portale Istituzionale • Richiesta Ammissione Socio &amp; Corsi Teatrali</div>
+    <a href="/" class="pub-logo-box">
+      <img src="https://lh3.googleusercontent.com/d/1h-xfyBoxK5TuAsx-FamJIXf3nFh7FVoO" alt="Logo" class="pub-logo-img">
+      <div>
+        <div class="pub-brand-title">Cervelli in Affitto APS</div>
+        <div class="pub-brand-sub">Modulo Iscrizione Laboratori & Richiesta Ammissione Socio</div>
+      </div>
+    </a>
   </header>
 
-  <div class="form-container">
-    <div class="wizard-card">
-      <div class="stepper">
-        <div class="step-item active" id="dot1">1</div>
-        <div class="step-item" id="dot2">2</div>
-        <div class="step-item" id="dot3">3</div>
-        <div class="step-item" id="dot4">4</div>
-        <div class="step-item" id="dot5">5</div>
-      </div>
+  <!-- STEPPER -->
+  <div class="stepper-wrap">
+    <div class="stepper">
+      <div class="step-item active" id="stItem1"><div class="step-circle">1</div><div class="step-label">Minore</div></div>
+      <div class="step-item" id="stItem2"><div class="step-circle">2</div><div class="step-label">Genitore</div></div>
+      <div class="step-item" id="stItem3"><div class="step-circle">3</div><div class="step-label">Deleghe</div></div>
+      <div class="step-item" id="stItem4"><div class="step-circle">4</div><div class="step-label">Privacy</div></div>
+      <div class="step-item" id="stItem5"><div class="step-circle">5</div><div class="step-label">Riepilogo</div></div>
+    </div>
+  </div>
 
-      <form id="iscrizioneForm" method="POST" action="/iscrizione">
-        
-        <!-- STEP 1: ALLIEVO MINORE -->
-        <div class="step-section active" id="step1">
-          <h2 class="step-title">1. Dati Anagrafici del Minore (Aspirante Socio)</h2>
-          <p class="step-desc">I minori iscritti ai corsi teatrali sono soci ordinari dell'associazione con copertura assicurativa UILT.</p>
+  <!-- FORM WIZARD -->
+  <main class="form-container">
+    <div class="form-card">
+      <form id="wizardForm" method="POST" action="/iscrizione-minori">
 
-          <div class="form-row">
-            <div class="form-group">
-              <label>Nome Minore *</label>
-              <input type="text" name="minore_nome" required>
+        <!-- STEP 1: DATI MINORE -->
+        <div class="wizard-step" id="step1">
+          <div class="form-step-title">1. Dati dell'Allievo/a (Minore)</div>
+          <div class="form-step-sub">Inserisci le informazioni anagrafiche del bambino/ragazzo da iscrivere al corso teatrale.</div>
+
+          <div class="form-grid">
+            <div class="form-field">
+              <label>Nome del Minore *</label>
+              <input type="text" name="minore_nome" id="minore_nome" required>
             </div>
-            <div class="form-group">
-              <label>Cognome Minore *</label>
-              <input type="text" name="minore_cognome" required>
+            <div class="form-field">
+              <label>Cognome del Minore *</label>
+              <input type="text" name="minore_cognome" id="minore_cognome" required>
             </div>
-          </div>
-
-          <div class="form-group">
-            <label>Codice Fiscale Minore *</label>
-            <input type="text" name="minore_cf" placeholder="Es. RSSMRA15A01A944X" maxlength="16" required style="text-transform: uppercase;">
-          </div>
-
-          <div class="form-row">
-            <div class="form-group">
+            <div class="form-field">
+              <label>Codice Fiscale Minore *</label>
+              <input type="text" name="minore_cf" id="minore_cf" maxlength="16" placeholder="Es. RSSMRA14A01H501U" style="text-transform:uppercase;" required>
+            </div>
+            <div class="form-field">
               <label>Data di Nascita *</label>
-              <input type="date" name="minore_nascita" required>
+              <input type="date" name="minore_data_nascita" id="minore_data_nascita" required>
             </div>
-            <div class="form-group">
-              <label>Comune o Stato Estero di Nascita *</label>
-              <input type="text" name="minore_luogo" placeholder="Es. Bologna" required>
+            <div class="form-field">
+              <label>Luogo di Nascita *</label>
+              <input type="text" name="minore_luogo_nascita" id="minore_luogo_nascita" required>
             </div>
-          </div>
-
-          <div class="form-group">
-            <label>Eventuali allergie o note rilevanti (facoltativo)</label>
-            <textarea name="note_mediche" rows="2" placeholder="Indicazioni utili per gli operatori teatrali..."></textarea>
-          </div>
-
-          <div class="step-actions">
-            <div></div>
-            <button type="button" class="btn-step" onclick="goToStep(2)">Avanti: Dati Genitore &rsaquo;</button>
-          </div>
-        </div>
-
-        <!-- STEP 2: GENITORE / TUTORE -->
-        <div class="step-section" id="step2">
-          <h2 class="step-title">2. Dati del Genitore o Legale Rappresentante</h2>
-          <p class="step-desc">Recapiti ufficiali del tutore per delibera CD, comunicazioni istituzionali ed emergenze.</p>
-
-          <div class="form-row">
-            <div class="form-group">
-              <label>Nome Genitore *</label>
-              <input type="text" name="tutore_nome" required>
-            </div>
-            <div class="form-group">
-              <label>Cognome Genitore *</label>
-              <input type="text" name="tutore_cognome" required>
-            </div>
-          </div>
-
-          <div class="form-row">
-            <div class="form-group">
-              <label>Codice Fiscale Genitore *</label>
-              <input type="text" name="tutore_cf" maxlength="16" required style="text-transform: uppercase;">
-            </div>
-            <div class="form-group">
-              <label>Grado di Parentela *</label>
-              <select name="grado_parentela">
-                <option value="Madre">Madre</option>
-                <option value="Padre">Padre</option>
-                <option value="Tutore Legale">Tutore Legale / Affidatario</option>
+            <div class="form-field">
+              <label>Laboratorio Teatrale *</label>
+              <select name="corso_id" id="corso_id" required>
+                <option value="corso-teatro-ragazzi-2026">Laboratorio Bambini &amp; Ragazzi (Quota annuale 20 €)</option>
               </select>
             </div>
           </div>
 
-          <div class="form-row">
-            <div class="form-group">
-              <label>Telefono Cellulare *</label>
-              <input type="tel" name="tutore_telefono" placeholder="Es. 340 1234567" required>
-            </div>
-            <div class="form-group">
-              <label>Email Ufficiale *</label>
-              <input type="email" name="tutore_email" placeholder="nome@email.it" required>
-            </div>
-          </div>
-
-          <div class="form-group">
-            <label>Indirizzo di Residenza *</label>
-            <input type="text" name="tutore_residenza" placeholder="Via, Numero, CAP, Città" required>
+          <div class="form-field" style="margin-bottom: 20px;">
+            <label>Allergie o Note Sanitarie Rilevanti (Facoltativo)</label>
+            <textarea name="note_salute" id="note_salute" rows="2" placeholder="Indicare eventuali intolleranze alimentari per le pause o note sanitarie"></textarea>
           </div>
 
           <div class="step-actions">
-            <button type="button" class="btn-back" onclick="goToStep(1)">&lsaquo; Indietro</button>
-            <button type="button" class="btn-step" onclick="goToStep(3)">Avanti: Deleghe Ritiro &rsaquo;</button>
+            <button type="button" class="btn-step btn-step-next" onclick="goToStep(2)">Avanti: Dati Genitore →</button>
           </div>
         </div>
 
-        <!-- STEP 3: DELEGHE DI RITIRO (FACOLTATIVO) -->
-        <div class="step-section" id="step3">
-          <h2 class="step-title">3. Deleghe per il Ritiro dell'Allievo (Facoltativo)</h2>
-          <p class="step-desc">Persone maggiorenni autorizzate a prelevare il minore al termine delle attività teatrali oltre ai genitori.</p>
+        <!-- STEP 2: DATI TUTORE -->
+        <div class="wizard-step" id="step2" style="display:none;">
+          <div class="form-step-title">2. Dati del Genitore / Tutore Legale</div>
+          <div class="form-step-sub">I recapiti del tutore verranno utilizzati per le comunicazioni istituzionali e l'ammissione a socio.</div>
 
-          <div class="form-row">
-            <div class="form-group">
-              <label>Nome Delegato</label>
-              <input type="text" name="delega1_nome" placeholder="Es. Nonno / Zio">
+          <div class="form-grid">
+            <div class="form-field">
+              <label>Nome Genitore *</label>
+              <input type="text" name="tutore_nome" id="tutore_nome">
             </div>
-            <div class="form-group">
-              <label>Cognome Delegato</label>
-              <input type="text" name="delega1_cognome">
+            <div class="form-field">
+              <label>Cognome Genitore *</label>
+              <input type="text" name="tutore_cognome" id="tutore_cognome">
+            </div>
+            <div class="form-field">
+              <label>Codice Fiscale Genitore *</label>
+              <input type="text" name="tutore_cf" id="tutore_cf" maxlength="16" style="text-transform:uppercase;">
+            </div>
+            <div class="form-field">
+              <label>Email Ufficiale Genitore *</label>
+              <input type="email" name="tutore_email" id="tutore_email" placeholder="nome@dominio.it">
+            </div>
+            <div class="form-field">
+              <label>Telefono / Cellulare *</label>
+              <input type="tel" name="tutore_telefono" id="tutore_telefono">
+            </div>
+            <div class="form-field">
+              <label>Indirizzo di Residenza *</label>
+              <input type="text" name="tutore_indirizzo" id="tutore_indirizzo">
+            </div>
+            <div class="form-field">
+              <label>Città di Residenza *</label>
+              <input type="text" name="tutore_citta" id="tutore_citta">
+            </div>
+            <div class="form-field">
+              <label>CAP *</label>
+              <input type="text" name="tutore_cap" id="tutore_cap" maxlength="5">
             </div>
           </div>
 
-          <div class="form-row">
-            <div class="form-group">
+          <div class="step-actions">
+            <button type="button" class="btn-step btn-step-prev" onclick="goToStep(1)">← Indietro</button>
+            <button type="button" class="btn-step btn-step-next" onclick="goToStep(3)">Avanti: Deleghe Ritiro →</button>
+          </div>
+        </div>
+
+        <!-- STEP 3: DELEGHE RITIRO -->
+        <div class="wizard-step" id="step3" style="display:none;">
+          <div class="form-step-title">3. Deleghe di Ritiro del Minore</div>
+          <div class="form-step-sub">Persone autorizzate a prendere in consegna il minore al termine del laboratorio teatrale (facoltativo).</div>
+
+          <div class="form-grid">
+            <div class="form-field">
+              <label>Nome Persona Delegata</label>
+              <input type="text" name="delega_1_nome" id="delega_1_nome">
+            </div>
+            <div class="form-field">
+              <label>Cognome Persona Delegata</label>
+              <input type="text" name="delega_1_cognome" id="delega_1_cognome">
+            </div>
+            <div class="form-field">
               <label>Telefono Delegato</label>
-              <input type="tel" name="delega1_telefono">
+              <input type="tel" name="delega_1_telefono" id="delega_1_telefono">
             </div>
-            <div class="form-group">
-              <label>Relazione di Parentela</label>
-              <input type="text" name="delega1_relazione" placeholder="Es. Nonna / Babysitter">
+            <div class="form-field">
+              <label>Documento di Riconoscimento</label>
+              <input type="text" name="delega_1_documento" id="delega_1_documento" placeholder="Es. CI n. CA12345XY">
             </div>
           </div>
 
           <div class="step-actions">
-            <button type="button" class="btn-back" onclick="goToStep(2)">&lsaquo; Indietro</button>
-            <button type="button" class="btn-step" onclick="goToStep(4)">Avanti: Statuto & Privacy &rsaquo;</button>
+            <button type="button" class="btn-step btn-step-prev" onclick="goToStep(2)">← Indietro</button>
+            <button type="button" class="btn-step btn-step-next" onclick="goToStep(4)">Avanti: Consensi &amp; Privacy →</button>
           </div>
         </div>
 
-        <!-- STEP 4: STATUTO & PRIVACY -->
-        <div class="step-section" id="step4">
-          <h2 class="step-title">4. Norme Sociali, Statuto e Consensi</h2>
-          <p class="step-desc">Dichiarazioni necessarie per la richiesta formale di ammissione all'APS teatrale e tutela minori.</p>
+        <!-- STEP 4: CONSENSI E PRIVACY -->
+        <div class="wizard-step" id="step4" style="display:none;">
+          <div class="form-step-title">4. Consensi Istituzionali &amp; Statuto</div>
+          <div class="form-step-sub">Presa visione dello statuto dell'APS e consensi ai sensi del Regolamento UE 2016/679 (GDPR).</div>
 
-          <div class="checkbox-box">
-            <input type="checkbox" name="accettazione_statuto" id="chkStatuto" required>
-            <label for="chkStatuto" class="checkbox-label">
-              <strong>Richiesta di Ammissione & Statuto APS *</strong><br>
-              In qualità di esercente la responsabilità genitoriale, richiedo formalmente l'ammissione a socio ordinario di Cervelli in Affitto APS per il minore, dichiarando di conoscere e rispettare lo Statuto e i regolamenti associativi.
+          <div style="display:flex; flex-direction:column; gap:16px; margin-bottom:24px;">
+            <label style="display:flex; gap:12px; align-items:flex-start; font-size:13.5px; line-height:1.5;">
+              <input type="checkbox" name="accetto_statuto" id="accetto_statuto" required style="margin-top:3px;">
+              <span>Dichiaro di aver preso visione dello <strong>Statuto di Cervelli in Affitto APS</strong> e richiedo l'ammissione a socio Ordinario per il minore ai sensi del Codice del Terzo Settore. *</span>
             </label>
-          </div>
-
-          <div class="checkbox-box">
-            <input type="checkbox" name="consenso_privacy" id="chkPrivacy" required>
-            <label for="chkPrivacy" class="checkbox-label">
-              <strong>Trattamento Dati Personali (GDPR) *</strong><br>
-              Autorizzo il trattamento dei dati personali del minore e del genitore per le finalità istituzionali dell'APS, la tenuta del Libro Soci e il tesseramento assicurativo nazionale UILT.
+            <label style="display:flex; gap:12px; align-items:flex-start; font-size:13.5px; line-height:1.5;">
+              <input type="checkbox" name="accetto_privacy" id="accetto_privacy" required style="margin-top:3px;">
+              <span>Acconsento al trattamento dei dati personali per la gestione del libro soci e la copertura assicurativa UILT. *</span>
             </label>
-          </div>
-
-          <div class="checkbox-box">
-            <input type="checkbox" name="consenso_foto_video" id="chkFoto">
-            <label for="chkFoto" class="checkbox-label">
-              <strong>Liberatoria Foto e Video (Facoltativo)</strong><br>
-              Autorizzo la ripresa di immagini e video durante i laboratori e i saggi teatrali a esclusivo uso di archivio, rassegne culturali e canali social ufficiali dell'associazione (senza cessione a terzi a scopo di lucro).
+            <label style="display:flex; gap:12px; align-items:flex-start; font-size:13.5px; line-height:1.5;">
+              <input type="checkbox" name="accetto_foto" id="accetto_foto" style="margin-top:3px;">
+              <span>Autorizzo le riprese foto/video durante le attività e il saggio di fine anno a fini esclusivamente associativi e documentari. (Facoltativo)</span>
             </label>
           </div>
 
           <div class="step-actions">
-            <button type="button" class="btn-back" onclick="goToStep(3)">&lsaquo; Indietro</button>
-            <button type="button" class="btn-step" onclick="goToStep(5)">Avanti: Riepilogo & Invia &rsaquo;</button>
+            <button type="button" class="btn-step btn-step-prev" onclick="goToStep(3)">← Indietro</button>
+            <button type="button" class="btn-step btn-step-next" onclick="goToStep(5)">Avanti: Riepilogo →</button>
           </div>
         </div>
 
-        <!-- STEP 5: RIEPILOGO & CONFERMA -->
-        <div class="step-section" id="step5">
-          <h2 class="step-title">5. Riepilogo Domanda di Ammissione</h2>
-          <p class="step-desc">Verifica la correttezza dei dati prima dell'invio formale al Consiglio Direttivo.</p>
+        <!-- STEP 5: RIEPILOGO FINALE -->
+        <div class="wizard-step" id="step5" style="display:none;">
+          <div class="form-step-title">5. Riepilogo Domanda &amp; Invio</div>
+          <div class="form-step-sub">Controlla i dati prima di inviare formalmente la richiesta di ammissione a socio.</div>
 
-          <div id="reviewContainer" style="margin-bottom: 24px;"></div>
-
-          <div style="background: #ECFDF5; border: 1px solid #A7F3D0; padding: 14px; border-radius: 8px; font-size: 13px; color: #065F46; margin-bottom: 20px;">
-            ℹ️ <strong>Cosa succede dopo:</strong> La richiesta verrà sottoposta alla delibera del Consiglio Direttivo. Riceverai conferma via email con le istruzioni per il saldo della quota sociale annuale e l'accesso all'area personale.
-          </div>
+          <div id="reviewBox" style="background:#F4F4F5; border:1px solid var(--border); border-radius:10px; padding:20px; font-size:13.5px; line-height:1.7; margin-bottom:24px;"></div>
 
           <div class="step-actions">
-            <button type="button" class="btn-back" onclick="goToStep(4)">&lsaquo; Indietro</button>
-            <button type="submit" class="btn-step" style="background: #10B981; color: #FFF;">Invia Domanda Ufficiale</button>
+            <button type="button" class="btn-step btn-step-prev" onclick="goToStep(4)">← Modifica Dati</button>
+            <button type="submit" class="btn-step btn-step-next" style="background:#10B981; color:#FFF;">Invia Domanda di Ammissione</button>
           </div>
         </div>
 
       </form>
     </div>
-  </div>
+  </main>
 
+  <!-- FOOTER -->
   <footer class="pub-footer">
-    ${theme.nome_associazione} • Sede Legale: Bologna • Dominio: ${theme.dominio_ufficiale} • Affiliato UILT
+    <p><strong>Cervelli in Affitto APS</strong> • Associazione di Promozione Sociale Teatrale</p>
+    <p>Sede Legale • Dominio: cervelliinaffitto-aps.it • Affiliata UILT (Unione Italiana Libero Teatro)</p>
+    <p style="margin-top:8px;"><a href="/admin">Accesso Riservato Amministrazione</a></p>
   </footer>
 
   <script>
-    function goToStep(s) {
-      if (s === 5) {
+    function goToStep(num) {
+      // Validazione step corrente prima di avanzare
+      if (num === 2) {
+        if (!document.getElementById('minore_nome').value || !document.getElementById('minore_cognome').value || !document.getElementById('minore_cf').value) {
+          alert('Compila tutti i campi obbligatori del minore.');
+          return;
+        }
+      }
+      if (num === 3) {
+        if (!document.getElementById('tutore_nome').value || !document.getElementById('tutore_cognome').value || !document.getElementById('tutore_email').value || !document.getElementById('tutore_telefono').value) {
+          alert('Compila tutti i campi obbligatori del genitore.');
+          return;
+        }
+      }
+      if (num === 5) {
+        if (!document.getElementById('accetto_statuto').checked || !document.getElementById('accetto_privacy').checked) {
+          alert('È necessario accettare lo Statuto e l\\'informativa Privacy per inviare la domanda.');
+          return;
+        }
         populateReview();
       }
-      const sections = document.querySelectorAll('.step-section');
-      sections.forEach((sec, idx) => {
-        sec.classList.remove('active');
-        if (idx + 1 === s) sec.classList.add('active');
-      });
 
-      const circles = document.querySelectorAll('.step-item');
-      circles.forEach((item, idx) => {
-        const num = idx + 1;
-        item.classList.remove('active', 'completed');
-        if (num === s) item.classList.add('active');
-        if (num < s) item.classList.add('completed');
-      });
+      for (let i = 1; i <= 5; i++) {
+        document.getElementById('step' + i).style.display = (i === num) ? 'block' : 'none';
+        const item = document.getElementById('stItem' + i);
+        if (i === num) item.classList.add('active');
+        else if (i < num) item.classList.add('active');
+        else item.classList.remove('active');
+      }
       window.scrollTo({ top: 0, behavior: 'smooth' });
     }
 
     function populateReview() {
-      const form = document.getElementById('iscrizioneForm');
-      const container = document.getElementById('reviewContainer');
-      const f = new FormData(form);
+      const box = document.getElementById('reviewBox');
+      const mNome = document.getElementById('minore_nome').value + ' ' + document.getElementById('minore_cognome').value;
+      const mCF = document.getElementById('minore_cf').value;
+      const tNome = document.getElementById('tutore_nome').value + ' ' + document.getElementById('tutore_cognome').value;
+      const tMail = document.getElementById('tutore_email').value;
+      const tTel = document.getElementById('tutore_telefono').value;
 
-      const items = [
-        { label: "Allievo Minore", val: (f.get("minore_nome") || "") + " " + (f.get("minore_cognome") || "") },
-        { label: "Codice Fiscale Minore", val: f.get("minore_cf") || "" },
-        { label: "Nato il", val: (f.get("minore_nascita") || "") + " a " + (f.get("minore_luogo") || "") },
-        { label: "Genitore / Tutore", val: (f.get("tutore_nome") || "") + " " + (f.get("tutore_cognome") || "") + " (" + (f.get("grado_parentela") || "") + ")" },
-        { label: "Recapiti Tutore", val: (f.get("tutore_telefono") || "") + " • " + (f.get("tutore_email") || "") },
-        { label: "Laboratorio Scelto", val: "Laboratorio Teatrale Bambini & Ragazzi (2026)" },
-        { label: "Statuto & Norme APS", val: f.get("accettazione_statuto") ? "Accettato" : "Non accettato" },
-        { label: "Trattamento Dati GDPR", val: f.get("consenso_privacy") ? "Accettato" : "Non accettato" },
-        { label: "Consenso Foto/Video", val: f.get("consenso_foto_video") ? "Autorizzato" : "Non autorizzato" }
-      ];
-
-      container.innerHTML = items.map(function(it) {
-        return "<div class=\"review-row\">" +
-          "<span class=\"review-label\">" + it.label + "</span>" +
-          "<span class=\"review-val\">" + it.val + "</span>" +
-        "</div>";
-      }).join("");
+      box.innerHTML = '<strong>Allievo/a (Socio Minore):</strong> ' + mNome + ' (CF: ' + mCF + ')<br>' +
+                      '<strong>Genitore / Tutore:</strong> ' + tNome + '<br>' +
+                      '<strong>Recapiti:</strong> ' + tMail + ' • ' + tTel + '<br>' +
+                      '<strong>Quota Associativa Richiesta:</strong> 20,00 € (Tesseramento APS e copertura assicurativa UILT inclusa)<br>' +
+                      '<p style="margin-top:10px; color:#71717A; font-size:12px;">Cliccando su "Invia Domanda" la richiesta verrà acquisita e sottoposta alla formale delibera del Consiglio Direttivo.</p>';
     }
   </script>
 </body>
@@ -2644,16 +2281,15 @@ function renderPublicForm(theme) {
   });
 }
 
-function renderSuccessPage(nomeSocio) {
+function renderPublicSuccess(nomeSocio) {
   const html = `<!DOCTYPE html>
 <html lang="it">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Richiesta Registrata • Cervelli in Affitto APS</title>
+  <title>Domanda Ricevuta • Cervelli in Affitto APS</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;700;800&display=swap" rel="stylesheet">
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
@@ -2670,9 +2306,9 @@ function renderSuccessPage(nomeSocio) {
       background: #18181B;
       border: 1px solid #27272A;
       border-radius: 16px;
-      padding: 40px 32px;
+      padding: 40px;
+      max-width: 500px;
       width: 100%;
-      max-width: 520px;
       text-align: center;
       box-shadow: 0 20px 40px -15px rgba(0,0,0,0.7);
     }
